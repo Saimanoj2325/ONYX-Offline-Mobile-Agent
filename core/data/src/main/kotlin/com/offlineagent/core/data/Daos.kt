@@ -78,7 +78,7 @@ interface DocumentDao {
     @Query("SELECT c.* FROM chunks c JOIN documents d ON d.id = c.documentId WHERE d.status = 'READY'")
     suspend fun readyChunks(): List<ChunkEntity>
 
-    @Query("SELECT c.* FROM chunks c JOIN chunks_fts f ON c.rowid = f.rowid WHERE chunks_fts MATCH :match LIMIT :limit")
+    @Query("SELECT chunks.* FROM chunks JOIN chunks_fts ON chunks.rowid = chunks_fts.rowid WHERE chunks_fts MATCH :match LIMIT :limit")
     suspend fun keywordSearch(match: String, limit: Int): List<ChunkEntity>
 
     @Query("SELECT * FROM chunks WHERE id IN (:ids)") suspend fun chunks(ids: List<Long>): List<ChunkEntity>

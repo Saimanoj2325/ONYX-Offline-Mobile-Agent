@@ -13,8 +13,8 @@ android {
         applicationId = "com.offlineagent.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-phase1"
+        versionCode = 2
+        versionName = "0.2.0-phase2"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
@@ -32,7 +32,7 @@ android {
 
     packaging {
         jniLibs { useLegacyPackaging = true } // extract .so files so ggml can dlopen CPU variants
-        resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+        resources { excludes += listOf("/META-INF/{AL2.0,LGPL2.1}", "/META-INF/versions/9/OSGI-INF/MANIFEST.MF") }
     }
 
     compileOptions {
@@ -45,6 +45,10 @@ android {
 dependencies {
     implementation(project(":core:inference"))
     implementation(project(":engine:llamacpp"))
+    implementation(project(":core:runtime"))
+    implementation(project(":core:data"))
+    implementation(project(":feature:workflow"))
+    implementation(libs.pdfbox.android)
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)

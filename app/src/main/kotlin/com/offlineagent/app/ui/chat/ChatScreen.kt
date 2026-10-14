@@ -393,7 +393,7 @@ private fun Composer(vm: ChatViewModel, ui: ChatUi, output: OutputPreference, bu
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SkillPickerSheet(vm: ChatViewModel, onPick: (Skill) -> Unit, onDismiss: () -> Unit) {
-    val skills by produceState(emptyList<Skill>()) { value = (vm.application as com.offlineagent.app.OfflineAgentApp).skills.parsed() }
+    val skills by produceState(emptyList<Skill>()) { value = vm.getApplication<com.offlineagent.app.OfflineAgentApp>().skills.parsed() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Run a skill", style = MaterialTheme.typography.titleMedium)
