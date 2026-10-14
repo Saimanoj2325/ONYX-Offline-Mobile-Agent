@@ -51,7 +51,22 @@ interface TokenEngine {
      * sampling. Returns the number of prompt tokens.
      * Throws [PromptTooLongException], [GenerationAbortedException] or [InferenceException].
      */
-    fun beginCompletion(prompt: String, sampling: SamplingParams, maxNewTokens: Int): Int
+    fun beginCompletion(
+        prompt: String,
+        sampling: SamplingParams,
+        maxNewTokens: Int,
+        grammar: String? = null,
+        images: List<ImageData> = emptyList(),
+    ): Int
+
+    /**
+     * Formats a conversation with the model's own chat template when the engine knows it (non-ChatML models).
+     * Returns null when unsupported; the adapter then falls back to ChatML.
+     */
+    fun formatChat(messages: List<ChatMessage>): String? = null
+
+    /** Placeholder the engine replaces with an image's embeddings (one per image, in order). */
+    val mediaMarker: String get() = "<__media__>"
 
     /** Samples + evaluates one token. */
     fun nextToken(): TokenStep

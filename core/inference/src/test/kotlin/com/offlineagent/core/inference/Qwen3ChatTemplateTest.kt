@@ -62,7 +62,9 @@ class Qwen3ChatTemplateTest {
 
     @Test
     fun detectsChatMl() {
-        assertTrue(Qwen3ChatTemplate.matches("{% for m in messages %}<|im_start|>{{m.role}}"))
+        assertTrue(Qwen3ChatTemplate.matches("{% for m in messages %}<|im_start|>{{m.role}}<|im_end|>"))
+        // SmolVLM uses <|im_start|> but <end_of_utterance>: not ChatML
+        assertFalse(Qwen3ChatTemplate.matches("<|im_start|>{{ role }}: <end_of_utterance>"))
         assertFalse(Qwen3ChatTemplate.matches("[INST]"))
         assertFalse(Qwen3ChatTemplate.matches(null))
     }

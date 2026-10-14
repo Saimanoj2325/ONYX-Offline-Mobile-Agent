@@ -20,13 +20,13 @@ interface PromptTemplate {
  * with an empty `<think>\n\n</think>\n\n` block, and the last user turn gets the documented
  * `/no_think` soft switch, so the model answers directly.
  */
-object Qwen3ChatTemplate : PromptTemplate {
-    override val name = "qwen3-chatml"
-
-    const val IM_START = "<|im_start|>"
-    const val IM_END = "<|im_end|>"
-    const val NO_THINK = "/no_think"
-    const val EMPTY_THINK = "<think>\n\n</think>\n\n"
+open class ChatMlTemplate(
+    /** Qwen3-style hybrid thinking: adds /no_think + empty think block when thinking is off. */
+    private val hybridThinking: Boolean,
+    /** Text placed before a user turn's content for each attached image (engine media marker). */
+    private val mediaMarker: String = "<__media__>",
+) : PromptTemplate {
+    override val name = if (hybridThinking) "qwen3-chatml" else "chatml"
 
     override fun render(messages: List<ChatMessage>, thinking: Boolean): String {
         require(messages.isNotEmpty()) { "messages must not be empty" }
@@ -41,7 +41,8 @@ object Qwen3ChatTemplate : PromptTemplate {
                 }
                 Role.USER -> {
                     var text = m.content.trim()
-                    if (!thinking && i == lastUser && !text.endsWith(NO_THINK)) text = "$text $NO_THINK"
+                    if (hybridThinking && !thinking && i == lastUser && !text.endsWith(NO_THINK)) text = "$text $NO_THINK"
+                    if (m.images.isNotEmpty()) text = mediaMarker.repeat(m.images.size) + "\n" + text
                     sb.append(IM_START).append("user\n").append(text).append(IM_END).append('\n')
                 }
                 Role.ASSISTANT -> {
@@ -52,15 +53,55 @@ object Qwen3ChatTemplate : PromptTemplate {
             }
         }
         sb.append(IM_START).append("assistant\n")
-        if (!thinking) sb.append(EMPTY_THINK)
+        if (hybridThinking && !thinking) sb.append(EMPTY_THINK)
         return sb.toString()
     }
 
-    /** True when a GGUF's embedded chat template is ChatML-style (Qwen family and many others). */
-    fun matches(chatTemplate: String?): Boolean = chatTemplate?.contains(IM_START) == true
+    companion object {
+        const val IM_START = "<|im_start|>"
+        const val IM_END = "<|im_end|>"
+        const val NO_THINK = "/no_think"
+        const val EMPTY_THINK = "<think>\n\n</think>\n\n"
+
+        /** True when a GGUF's embedded chat template is ChatML (Qwen family and many others). */
+        fun matches(chatTemplate: String?): Boolean =
+            chatTemplate != null && chatTemplate.contains(IM_START) && chatTemplate.contains(IM_END)
+
+        /** Qwen3 hybrid-thinking models mention <think> in their template; Qwen2.5 / Qwen-VL instruct models do not. */
+        fun hasHybridThinking(chatTemplate: String?): Boolean = chatTemplate == null || chatTemplate.contains("<think>")
+    }
+}
+
+/** The Phase 1 default (Qwen3 hybrid thinking, ChatML). */
+object Qwen3ChatTemplate : ChatMlTemplate(hybridThinking = true) {
+    const val IM_START = ChatMlTemplate.IM_START
+    const val IM_END = ChatMlTemplate.IM_END
+    const val NO_THINK = ChatMlTemplate.NO_THINK
+    const val EMPTY_THINK = ChatMlTemplate.EMPTY_THINK
+    fun matches(chatTemplate: String?): Boolean = ChatMlTemplate.matches(chatTemplate)
+}
+
+/** Uses the engine's built-in template matcher (llama.cpp llama_chat_apply_template) for non-ChatML models. */
+class EngineChatTemplate(private val engine: TokenEngine) : PromptTemplate {
+    override val name = "engine-builtin"
+    override fun render(messages: List<ChatMessage>, thinking: Boolean): String {
+        val withMarkers = messages.map { m ->
+            if (m.images.isEmpty()) m else m.copy(content = engine.mediaMarker.repeat(m.images.size) + "\n" + m.content)
+        }
+        return engine.formatChat(withMarkers) ?: ChatMlTemplate(false, engine.mediaMarker).render(messages, thinking)
+    }
 }
 
 object PromptTemplates {
-    /** Phase 1 ships only ChatML/Qwen3; other families get it as a best-effort fallback. */
-    fun forModel(info: ModelInfo?): PromptTemplate = Qwen3ChatTemplate
+    /** ChatML models (Qwen etc.) use the Kotlin template; others use llama.cpp's built-in templates. */
+    fun forModel(info: ModelInfo?, engine: TokenEngine? = null): PromptTemplate {
+        val t = info?.chatTemplate
+        return when {
+            t == null -> Qwen3ChatTemplate
+            ChatMlTemplate.matches(t) && ChatMlTemplate.hasHybridThinking(t) -> Qwen3ChatTemplate
+            ChatMlTemplate.matches(t) -> ChatMlTemplate(hybridThinking = false, mediaMarker = engine?.mediaMarker ?: "<__media__>")
+            engine != null -> EngineChatTemplate(engine)
+            else -> Qwen3ChatTemplate
+        }
+    }
 }

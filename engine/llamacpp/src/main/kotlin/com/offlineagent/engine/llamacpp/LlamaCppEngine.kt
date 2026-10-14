@@ -1,7 +1,10 @@
 package com.offlineagent.engine.llamacpp
 
 import android.content.Context
+import com.offlineagent.core.inference.ChatMessage
 import com.offlineagent.core.inference.EngineInferenceAdapter
+import com.offlineagent.core.inference.GrammarException
+import com.offlineagent.core.inference.ImageData
 import com.offlineagent.core.inference.GenerationAbortedException
 import com.offlineagent.core.inference.InferenceAdapter
 import com.offlineagent.core.inference.InferenceException
@@ -14,6 +17,7 @@ import com.offlineagent.core.inference.SamplingParams
 import com.offlineagent.core.inference.StopReason
 import com.offlineagent.core.inference.TokenEngine
 import com.offlineagent.core.inference.TokenStep
+import com.offlineagent.core.inference.EmbeddingService
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
 import java.io.File
@@ -41,6 +45,17 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         val h = LlamaNative.nativeLoad(file.absolutePath, config.contextLength, config.threads, config.batchSize, config.useMmap)
         if (h == 0L) throw ModelLoadException(LlamaNative.nativeLastError().ifBlank { "Unknown load error" })
         handle = h
+        var vision = false
+        val mmproj = config.mmprojPath
+        if (mmproj != null) {
+            if (!File(mmproj).isFile) { unload(); throw ModelLoadException("Vision projector file not found") }
+            if (!LlamaNative.nativeAttachMmproj(h, mmproj, config.threads)) {
+                val err = LlamaNative.nativeLastError()
+                unload()
+                throw ModelLoadException(err.ifBlank { "Could not load the vision projector" })
+            }
+            vision = true
+        }
         val f = LlamaNative.nativeModelInfo(h)
         return ModelInfo(
             path = file.absolutePath,
@@ -52,18 +67,30 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             threads = config.threads,
             chatTemplate = f[5].ifBlank { null },
             backendInfo = systemInfo().lineSequence().filter { it.startsWith("Device:") || it.startsWith("Backends:") }.joinToString("\n"),
+            supportsImages = vision,
         )
     }
 
-    override fun beginCompletion(prompt: String, sampling: SamplingParams, maxNewTokens: Int): Int {
+    override fun beginCompletion(
+        prompt: String,
+        sampling: SamplingParams,
+        maxNewTokens: Int,
+        grammar: String?,
+        images: List<ImageData>,
+    ): Int {
         val h = handle.takeIf { it != 0L } ?: throw NotLoadedException()
         val rc = LlamaNative.nativeBegin(
             h, prompt.toByteArray(Charsets.UTF_8), sampling.temperature, sampling.topK, sampling.topP,
             sampling.minP, sampling.repeatPenalty, sampling.seed, maxNewTokens,
+            grammar?.toByteArray(Charsets.UTF_8),
+            if (images.isEmpty()) null else images.map { it.rgb }.toTypedArray(),
+            if (images.isEmpty()) null else images.map { it.width }.toIntArray(),
+            if (images.isEmpty()) null else images.map { it.height }.toIntArray(),
         )
         return when (rc) {
             LlamaNative.BEGIN_ERR_TOO_LONG -> throw PromptTooLongException(-1, -1)
             LlamaNative.BEGIN_ERR_ABORTED -> throw GenerationAbortedException()
+            LlamaNative.BEGIN_ERR_GRAMMAR -> throw GrammarException(LlamaNative.nativeLastError())
             LlamaNative.BEGIN_ERR_DECODE, LlamaNative.BEGIN_ERR_TOKENIZE -> throw InferenceException(LlamaNative.nativeLastError())
             else -> rc.also { lastPromptTokens = it }
         }
@@ -82,6 +109,20 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
                 else -> StopReason.ERROR
             },
         )
+    }
+
+    override fun formatChat(messages: List<ChatMessage>): String? {
+        val h = handle.takeIf { it != 0L } ?: return null
+        val out = LlamaNative.nativeApplyTemplate(
+            h,
+            messages.map { it.role.name.lowercase() }.toTypedArray(),
+            messages.map { it.content.toByteArray(Charsets.UTF_8) }.toTypedArray(),
+        ) ?: return null
+        return String(out, Charsets.UTF_8)
+    }
+
+    override val mediaMarker: String by lazy {
+        runCatching { LlamaNative.ensureLoaded(nativeLibDir); LlamaNative.nativeMediaMarker() }.getOrDefault("<__media__>")
     }
 
     override fun requestAbort() {
@@ -104,13 +145,16 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
 
     companion object {
         /** The one thread that ever touches llama.cpp. Named for profiling/ANR traces. */
-        fun newEngineDispatcher(): CoroutineDispatcher =
+        fun newEngineDispatcher(name: String = "llm-engine"): CoroutineDispatcher =
             Executors.newSingleThreadExecutor { r ->
-                Thread(null, r, "llm-engine", 16L * 1024 * 1024).apply {
+                Thread(null, r, name, 16L * 1024 * 1024).apply {
                     isDaemon = true
                     priority = Thread.NORM_PRIORITY
                 }
             }.asCoroutineDispatcher()
+
+        fun createEmbedder(context: Context): EmbeddingService =
+            EmbeddingService(LlamaEmbeddingEngine(context.applicationInfo.nativeLibraryDir), newEngineDispatcher("embed-engine"))
 
         fun createAdapter(context: Context): InferenceAdapter =
             EngineInferenceAdapter(

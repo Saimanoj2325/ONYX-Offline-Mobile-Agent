@@ -42,10 +42,10 @@ class FakeEngine(
         record("load")
         failLoad?.let { throw ModelLoadException(it) }
         loaded = true
-        return ModelInfo(config.modelPath, "qwen3 0.6B Q8_0", 600_000_000, 600_000_000, 40960, config.contextLength, config.threads, "<|im_start|>", "CPU")
+        return ModelInfo(config.modelPath, "qwen3 0.6B Q8_0", 600_000_000, 600_000_000, 40960, config.contextLength, config.threads, "<|im_start|>{{role}}<|im_end|><think>", "CPU")
     }
 
-    override fun beginCompletion(prompt: String, sampling: SamplingParams, maxNewTokens: Int): Int {
+    override fun beginCompletion(prompt: String, sampling: SamplingParams, maxNewTokens: Int, grammar: String?, images: List<ImageData>): Int {
         record("begin")
         check(loaded)
         aborted.set(false)

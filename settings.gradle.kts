@@ -21,10 +21,10 @@ include(":app")
 include(":core:inference")
 include(":engine:llamacpp")
 
-// Reserved for later phases (see docs/ARCHITECTURE.md):
-// include(":core:runtime")    // agent loop, tool registry, workflow executor (pure Kotlin)
-// include(":core:data")       // Room persistence (chats, workflows, memory)
-// include(":feature:workflow")// visual node workflow builder UI
+// Phase 2 modules
+include(":core:runtime")      // UI schema, markdown, RAG maths, skills, tools, policy, agent loop (pure Kotlin)
+include(":core:data")         // Room + DataStore persistence
+include(":feature:workflow")  // Skills editor + agent run history UI (Compose)
 
 // Optional developer tool: runs the real JNI bridge + real GGUF on an ARM64 Linux host JVM.
 // Enabled only with -PhostHarness (see tools/host-harness/README.md). Not part of the APK.

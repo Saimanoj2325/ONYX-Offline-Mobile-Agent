@@ -33,6 +33,9 @@ android {
                 arguments += "-DLLAMA_BUILD_EXAMPLES=OFF"
                 arguments += "-DLLAMA_BUILD_TOOLS=OFF"
                 arguments += "-DLLAMA_BUILD_SERVER=OFF"
+                // libmtmd: multimodal (image) input. Standalone library build, no CLI tools, no video.
+                arguments += "-DLLAMA_BUILD_MTMD=ON"
+                arguments += "-DMTMD_VIDEO=OFF"
                 arguments += "-DLLAMA_CURL=OFF"
                 arguments += "-DLLAMA_OPENSSL=OFF"
 

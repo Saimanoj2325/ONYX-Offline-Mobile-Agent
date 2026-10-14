@@ -33,7 +33,7 @@ class EngineInferenceAdapter(
     private val engine: TokenEngine,
     private val engineDispatcher: CoroutineDispatcher,
     private val nanoTime: () -> Long = System::nanoTime,
-    private val templateFor: (ModelInfo) -> PromptTemplate = { PromptTemplates.forModel(it) },
+    private val templateFor: ((ModelInfo) -> PromptTemplate)? = null,
 ) : InferenceAdapter {
 
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded())
@@ -88,9 +88,15 @@ class EngineInferenceAdapter(
     /** The actual token loop; runs entirely on [engineDispatcher]. Caller holds [mutex]. */
     private fun generateLocked(info: ModelInfo, request: GenerationRequest): Flow<GenerationEvent> = flow {
         run {
-            val template = templateFor(info)
+            val template = templateFor?.invoke(info) ?: PromptTemplates.forModel(info, engine)
+            val images = request.messages.lastOrNull { it.role == Role.USER }?.images.orEmpty()
 
-            var messages = PromptFitter.fitByCharacters(request.messages, info.contextLength, request.maxNewTokens)
+            // Only the latest user turn keeps its images (older images are dropped from the prompt to save context).
+            val lastUser = request.messages.indexOfLast { it.role == Role.USER }
+            var messages = PromptFitter.fitByCharacters(
+                request.messages.mapIndexed { i, m -> if (i != lastUser && m.images.isNotEmpty()) m.copy(images = emptyList()) else m },
+                info.contextLength, request.maxNewTokens,
+            )
             val t0 = nanoTime()
             var promptTokens: Int
             var aborted = false
@@ -98,7 +104,7 @@ class EngineInferenceAdapter(
                 currentCoroutineContext().ensureActive()
                 val prompt = template.render(messages, request.thinking)
                 try {
-                    promptTokens = abortOnCancel { engine.beginCompletion(prompt, request.sampling, request.maxNewTokens) }
+                    promptTokens = abortOnCancel { engine.beginCompletion(prompt, request.sampling, request.maxNewTokens, request.grammar, images) }
                     break
                 } catch (e: PromptTooLongException) {
                     val shorter = PromptFitter.dropOldestTurn(messages) ?: throw e

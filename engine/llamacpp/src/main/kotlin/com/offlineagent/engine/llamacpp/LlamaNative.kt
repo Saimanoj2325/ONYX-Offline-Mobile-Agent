@@ -6,6 +6,7 @@ internal object LlamaNative {
     const val BEGIN_ERR_ABORTED = -2
     const val BEGIN_ERR_DECODE = -3
     const val BEGIN_ERR_TOKENIZE = -4
+    const val BEGIN_ERR_GRAMMAR = -5
 
     const val STOP_NONE = 0
     const val STOP_END_OF_TURN = 1
@@ -31,7 +32,15 @@ internal object LlamaNative {
     external fun nativeBegin(
         handle: Long, promptUtf8: ByteArray, temp: Float, topK: Int, topP: Float, minP: Float,
         repeatPenalty: Float, seed: Int, maxNew: Int,
+        grammarUtf8: ByteArray?, imagesRgb: Array<ByteArray>?, widths: IntArray?, heights: IntArray?,
     ): Int
+    external fun nativeAttachMmproj(handle: Long, mmprojPath: String, nThreads: Int): Boolean
+    external fun nativeMediaMarker(): String
+    external fun nativeApplyTemplate(handle: Long, roles: Array<String>, contentsUtf8: Array<ByteArray>): ByteArray?
+    external fun nativeLoadEmbedder(path: String, nCtx: Int, nThreads: Int): Long
+    external fun nativeEmbed(handle: Long, textUtf8: ByteArray): FloatArray?
+    external fun nativeEmbedderDim(handle: Long): Int
+    external fun nativeFreeEmbedder(handle: Long)
     external fun nativeNext(handle: Long): ByteArray?
     external fun nativeStopReason(handle: Long): Int
     external fun nativeAbort(handle: Long)

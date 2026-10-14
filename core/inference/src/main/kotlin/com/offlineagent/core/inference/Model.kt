@@ -1,9 +1,14 @@
 package com.offlineagent.core.inference
 
-/** Role of a chat message. Tool roles are reserved for the later agent loop (Phase 3+). */
+/** Role of a chat message. Tool results are fed back as USER turns by the agent runtime. */
 enum class Role { SYSTEM, USER, ASSISTANT }
 
-data class ChatMessage(val role: Role, val content: String)
+/** A decoded image for vision models: packed RGB, 3 bytes per pixel, row-major. */
+class ImageData(val rgb: ByteArray, val width: Int, val height: Int) {
+    init { require(width > 0 && height > 0 && rgb.size == width * height * 3) { "RGB buffer must be width*height*3" } }
+}
+
+data class ChatMessage(val role: Role, val content: String, val images: List<ImageData> = emptyList())
 
 /** How to load a model. All values are local; there is no remote option by design. */
 data class LoadConfig(
@@ -17,6 +22,8 @@ data class LoadConfig(
     val batchSize: Int = 512,
     /** Memory-map the weights instead of reading them into heap (always true in Phase 1). */
     val useMmap: Boolean = true,
+    /** Optional vision projector (mmproj GGUF) for image input. */
+    val mmprojPath: String? = null,
 ) {
     init {
         require(contextLength in 256..32768) { "contextLength out of range: $contextLength" }
@@ -40,6 +47,8 @@ data class ModelInfo(
     val threads: Int,
     val chatTemplate: String?,
     val backendInfo: String,
+    /** True when a vision projector (mmproj) is attached, i.e. the model accepts images. */
+    val supportsImages: Boolean = false,
 )
 
 /** Sampling settings. Defaults follow Qwen3's published non-thinking recommendations. */
@@ -66,6 +75,11 @@ data class GenerationRequest(
     val thinking: Boolean = false,
     val maxNewTokens: Int = 512,
     val sampling: SamplingParams = if (thinking) SamplingParams.QWEN3_THINKING else SamplingParams.QWEN3_NON_THINKING,
+    /**
+     * Optional GBNF grammar (root rule "root"). When set, the engine can only emit text the grammar accepts:
+     * used for Canvas UI JSON and agent tool calls so the output always parses.
+     */
+    val grammar: String? = null,
 )
 
 enum class StopReason { END_OF_TURN, MAX_TOKENS, CONTEXT_FULL, CANCELLED, ERROR }
@@ -116,3 +130,4 @@ class PromptTooLongException(val promptTokens: Int, val contextLength: Int) :
 class GenerationAbortedException : InferenceException("Generation aborted")
 class NotLoadedException : InferenceException("No model is loaded")
 class BusyException(message: String) : InferenceException(message)
+class GrammarException(message: String) : InferenceException(message)
