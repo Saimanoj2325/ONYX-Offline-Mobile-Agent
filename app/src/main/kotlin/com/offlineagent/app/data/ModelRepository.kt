@@ -38,7 +38,14 @@ class ModelRepository(private val context: Context) {
      * Only one model is kept; the previous one is deleted after a successful import.
      */
     suspend fun import(uri: Uri, onProgress: (copied: Long, total: Long) -> Unit): StoredModel =
+        importInto(uri, modelsDir, keepOthers = false, onProgress).also {
+            prefs.edit().putString(KEY_FILE, it.file.name).putString(KEY_DISPLAY, it.displayName).apply()
+        }
+
+    /** Phase 2: copies a GGUF into [dir] (one sub-folder per model role). [keepOthers]=true keeps other files. */
+    suspend fun importInto(uri: Uri, dir: File, keepOthers: Boolean, onProgress: (copied: Long, total: Long) -> Unit): StoredModel =
         withContext(Dispatchers.IO) {
+            val modelsDir = dir.apply { mkdirs() }
             val resolver = context.contentResolver
             var displayName = "model.gguf"
             var total = -1L
@@ -53,7 +60,7 @@ class ModelRepository(private val context: Context) {
             }
             if (total > 0) {
                 val free = modelsDir.usableSpace
-                val reclaimable = current()?.sizeBytes ?: 0
+                val reclaimable = if (keepOthers) 0 else (current()?.sizeBytes ?: 0)
                 if (total + SPACE_MARGIN > free + reclaimable) {
                     throw ModelImportException(
                         "Not enough storage: model needs ${formatBytes(total)}, only ${formatBytes(free + reclaimable)} free.",
@@ -106,9 +113,7 @@ class ModelRepository(private val context: Context) {
                 part.delete()
                 throw t
             }
-            // keep only the new model
-            modelsDir.listFiles()?.filter { it != dest }?.forEach { it.delete() }
-            prefs.edit().putString(KEY_FILE, dest.name).putString(KEY_DISPLAY, displayName).apply()
+            if (!keepOthers) modelsDir.listFiles()?.filter { it != dest && it.isFile }?.forEach { it.delete() }
             StoredModel(dest, displayName)
         }
 
@@ -119,8 +124,10 @@ class ModelRepository(private val context: Context) {
 
     /** Removes half-copied files left by a crash or kill during import. */
     fun cleanupPartials() {
-        modelsDir.listFiles { f -> f.name.endsWith(".part") }?.forEach { it.delete() }
+        modelsDir.walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.forEach { it.delete() }
     }
+
+    val root: File get() = modelsDir
 
     companion object {
         private const val KEY_FILE = "file"

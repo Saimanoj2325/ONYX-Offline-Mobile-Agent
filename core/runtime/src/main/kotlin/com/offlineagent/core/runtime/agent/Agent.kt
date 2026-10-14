@@ -159,6 +159,10 @@ class AgentLoop(
                 save(cp)
             }
             val actionGrammar = Gbnf.of(actionSchema(tools, skill))
+            // Small models like to "answer" straight away instead of using the tool their own plan names. Until the
+            // first successful tool call, if the plan/request names a tool, the grammar offers ONLY tool calls.
+            val toolOnlyGrammar by lazy { Gbnf.of(actionSchema(tools, skill, allowFinal = false)) }
+            val namedTools = mentionedTools(cp.request + "\n" + cp.plan.joinToString("\n"), tools)
             val seenCalls = HashSet<String>()
             cp.steps.filter { it.kind == StepKind.TOOL_CALL && it.error == null }.forEach { seenCalls += it.tool + it.input }
 
@@ -166,8 +170,9 @@ class AgentLoop(
                 currentCoroutineContext().ensureActive()
                 onEvent(AgentEvent.Thinking("Step ${cp.iteration + 1} of at most $maxIter"))
                 val t0 = clock()
+                val mustUseTool = namedTools.isNotEmpty() && cp.steps.none { it.kind == StepKind.TOOL_CALL && it.error == null } && cp.iteration < 2
                 val raw = withTimeout(limits.llmTimeoutMs) {
-                    llm.complete(actionSystem(skill, tools), actionUser(cp), actionGrammar, limits.actionTokens)
+                    llm.complete(actionSystem(skill, tools), actionUser(cp), if (mustUseTool) toolOnlyGrammar else actionGrammar, limits.actionTokens)
                 }
                 val action = parseAction(raw)
                 cp = cp.copy(iteration = cp.iteration + 1, updatedAt = clock())
@@ -193,8 +198,15 @@ class AgentLoop(
                 }
                 cp = executeCall(cp, call, action.thought, skill, t0)
                 if (cp.status == RunStatus.FAILED) return cp
-                if (cp.steps.last().error == null) seenCalls += key
-                if (cp.consecutiveErrors >= limits.maxConsecutiveErrors) return fail(cp, "tool calls kept failing: ${cp.steps.last().error}")
+                val ok = cp.steps.last().error == null
+                if (ok) seenCalls += key
+                // A UI skill is done once its canvas is rendered ("finish with render_ui").
+                if (ok && skill?.wantsUi == true && (call.tool == "render_ui" || call.tool == "canvas_update")) break
+                if (cp.consecutiveErrors >= limits.maxConsecutiveErrors) {
+                    // Keep what already worked: only fail when nothing useful happened.
+                    if (cp.canvasRendered || cp.steps.any { it.kind == StepKind.TOOL_CALL && it.error == null }) break
+                    return fail(cp, "tool calls kept failing: ${cp.steps.last().error}")
+                }
             }
             // Skills promise UI output: if the model never rendered it, compose the canvas from the observations.
             if (skill != null && skill.wantsUi && !cp.canvasRendered && registry["render_ui"] != null) {
@@ -324,12 +336,28 @@ class AgentLoop(
     }
 
     /** One alternative per allowed tool ({thought, tool, args}) plus {thought, final}. */
-    fun actionSchema(tools: List<ToolSpec>, skill: Skill?): Schema {
+    /** Tools the text refers to (by name, spaced name, or a few obvious keywords). render/canvas tools excluded. */
+    fun mentionedTools(text: String, tools: List<ToolSpec>): Set<String> {
+        val t = text.lowercase()
+        val keywords = mapOf(
+            "calculator" to listOf("calculat", "compute"),
+            "search_docs" to listOf("search my", "my documents", "my notes", "my pdf", "the documents", "search the doc"),
+            "read_document" to listOf("read the document", "read my"),
+            "get_datetime" to listOf("today's date", "current date", "current time", "what day"),
+            "memory_read" to listOf("my preferences", "remember about me"),
+        )
+        return tools.map { it.name }.filter { n ->
+            n != "render_ui" && n != "canvas_update" &&
+                (t.contains(n) || t.contains(n.replace('_', ' ')) || keywords[n].orEmpty().any { t.contains(it) })
+        }.toSet()
+    }
+
+    fun actionSchema(tools: List<ToolSpec>, skill: Skill?, allowFinal: Boolean = true): Schema {
         val thought = Schema.Str("one short sentence", maxLength = 300)
         val alts = tools.map { t ->
             val input = if ((t.name == "render_ui" || t.name == "canvas_update") && skill != null && skill.output.isNotEmpty()) UiSchema.docSchema(skill.output) else t.input
             Schema.Obj(listOf("thought" to thought, "tool" to Schema.Const(t.name), "args" to input))
-        } + Schema.Obj(listOf("thought" to thought, "final" to Schema.Str("answer for the user (markdown)", maxLength = 3000)))
+        } + if (allowFinal) listOf(Schema.Obj(listOf("thought" to thought, "final" to Schema.Str("answer for the user (markdown)", maxLength = 3000)))) else emptyList()
         return Schema.OneOf(alts)
     }
 

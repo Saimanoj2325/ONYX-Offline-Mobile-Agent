@@ -331,7 +331,7 @@ static jint eval_multimodal(JNIEnv * env, Session * s, const std::string & promp
         bitmaps.push_back(mtmd_bitmap_init((uint32_t) ws[i], (uint32_t) hs[i], (const unsigned char *) rgb.data()));
     }
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-    mtmd_input_text text{prompt.c_str(), /*add_special*/ true, /*parse_special*/ true};
+    mtmd_input_text text{prompt.c_str(), prompt.size(), /*add_special*/ true, /*parse_special*/ true};
     const int32_t trc = mtmd_tokenize(s->mtmd, chunks, &text, (const mtmd_bitmap **) bitmaps.data(), bitmaps.size());
     for (auto * b : bitmaps) mtmd_bitmap_free(b);
     if (trc != 0) {
@@ -503,6 +503,9 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeAttachMmproj(JNIEnv * en
     p.n_threads = n_threads;
     p.print_timings = false;
     p.warmup = false;
+    // Phones: cap the visual tokens per image. Without a cap SmolVLM/Idefics3 upscales every photo to 2048 px and
+    // encodes 16 tiles + overview (~1100 tokens, ~1 min on a mid-range CPU). 512 keeps detail for documents/charts.
+    p.image_max_tokens = 512;
     s->mtmd = mtmd_init_from_file(path.c_str(), s->model, p);
     if (!s->mtmd) { g_last_error = "Could not load the vision projector (mmproj) - wrong file for this model?"; return JNI_FALSE; }
     if (!mtmd_support_vision(s->mtmd)) {

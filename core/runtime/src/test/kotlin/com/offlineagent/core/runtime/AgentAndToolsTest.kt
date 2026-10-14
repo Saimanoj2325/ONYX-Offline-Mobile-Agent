@@ -260,6 +260,36 @@ class AgentAndToolsTest {
         assertNotNull(r.steps.firstOrNull { it.kind == StepKind.COMPOSE })
     }
 
+    @Test fun uiSkillFinishesWhenCanvasRendered() = runTest {
+        val skill = Skill("s", "S", "", emptyList(), tools = listOf("calculator", "render_ui"), output = listOf("markdown"), maxSteps = 5, instructions = "x")
+        val render = "{\"thought\":\"t\",\"tool\":\"render_ui\",\"args\":{\"v\":1,\"title\":\"R\",\"blocks\":[{\"type\":\"markdown\",\"text\":\"hi\"}]}}"
+        val llm = FakeLlm(mutableListOf(plan, render, calc("1+1")))
+        val r = loop(llm, MemStore()).start("r15", 1, "x", skill)
+        assertEquals(RunStatus.COMPLETED, r.status)
+        assertTrue(r.canvasRendered)
+        assertEquals(2, llm.calls.size) // plan + one action, then stop
+    }
+
+    @Test fun failingToolsAfterSuccessCompleteInsteadOfFail() = runTest {
+        val bad = "{\"thought\":\"t\",\"tool\":\"calculator\",\"args\":{\"expression\":\"sleep(1)\"}}"
+        val bad2 = "{\"thought\":\"t\",\"tool\":\"calculator\",\"args\":{\"expression\":\"nap(2)\"}}"
+        val r = loop(FakeLlm(mutableListOf(plan, calc("2+2"), bad, bad2)), MemStore()).start("r16", null, "x", null)
+        assertEquals(RunStatus.COMPLETED, r.status)
+        assertTrue(r.finalAnswer!!.contains("4"))
+    }
+
+    @Test fun firstActionMustBeAToolWhenPlanNamesOne() = runTest {
+        val llm = FakeLlm(mutableListOf("{\"steps\":[\"use the calculator\"]}", calc("2*3"), final("6")))
+        loop(llm, MemStore()).start("r17", null, "multiply", null)
+        val firstActionGrammar = llm.calls[1].second!!
+        assertFalse(firstActionGrammar.contains("\\\"final\\\""))
+        val secondActionGrammar = llm.calls[2].second!!
+        assertTrue(secondActionGrammar.contains("\\\"final\\\""))
+        val agent = AgentLoop(llm, registry, policy, MemStore(), { _, _, _, _ -> true })
+        assertEquals(setOf("calculator"), agent.mentionedTools("Compute the total", registry.specs))
+        assertTrue(agent.mentionedTools("say hi", registry.specs).isEmpty())
+    }
+
     @Test fun renderUiToolRejectsInvalidDocs() = runTest {
         val tool = RenderUiTool(canvas, update = false)
         val bad = tool.execute(buildJsonObject { put("v", 1); put("title", "x"); put("blocks", JsonPrimitive("nope")) }, ToolContext("r", null))
