@@ -1,4 +1,4 @@
-# Device test plan (Sai's phone)
+# Device test plan (Sai's phone) — Phase 1 + Phase 2
 
 Everything below needs a real phone; the sandbox could not run Android. Note results in the table at the end and send
 back `adb logcat` snippets for anything that fails.
@@ -8,7 +8,10 @@ back `adb logcat` snippets for anything that fails.
 1. On the phone (or PC) download **`Qwen3-0.6B-Q8_0.gguf`** (~610 MB) from
    https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/tree/main → Files → `Qwen3-0.6B-Q8_0.gguf` → download.
    (Optional second file for comparison: a Q4_K_M build, ~400 MB, e.g. from `unsloth/Qwen3-0.6B-GGUF`.)
-2. Install the APK: `adb install -r offline-agent-phase1-debug.apk` (or copy it to the phone and open it; allow "install unknown apps").
+   **Phase 2 also needs** (all optional except the chat model): `Qwen3-1.7B-Q4_K_M.gguf` (1.1 GB, unsloth/Qwen3-1.7B-GGUF) for
+   Canvas/skills, `bge-small-en-v1.5-q8_0.gguf` (37 MB) for document search, and for photos
+   `SmolVLM2-256M-Video-Instruct-Q8_0.gguf` + `mmproj-SmolVLM2-256M-Video-Instruct-Q8_0.gguf` (ggml-org, 280 MB total).
+2. Install the APK: `adb install -r offline-agent-phase2-debug.apk` (or copy it to the phone and open it; allow "install unknown apps").
 3. Note phone model, SoC, RAM, Android version.
 
 ## 1. Install & offline proof (static)
@@ -23,7 +26,7 @@ back `adb logcat` snippets for anything that fails.
 
 | # | Step | Expected |
 |---|---|---|
-| 2.1 | Open app → Model tab → **Pick .gguf file** → choose the downloaded file | Progress bar with MB copied; finishes in seconds–1 min |
+| 2.1 | Open app → **Models** tab → Chat → **Add** → choose the downloaded file | Progress bar with MB copied; finishes in seconds–1 min |
 | 2.2 | During a copy, tap **Cancel copy** | Copy stops, no model listed, no leftover space used |
 | 2.3 | Pick a non-GGUF file (e.g. a PDF/JPG) | Clear error "not a .gguf file" / "not a valid GGUF" |
 | 2.4 | Kill the app (swipe away) and reopen | Model is still listed (remembered) |
@@ -76,10 +79,82 @@ back `adb logcat` snippets for anything that fails.
 | 7.5 | Context 4096 + long conversation (~15 turns) | Keeps answering; oldest turns silently dropped when full |
 | 7.6 | Replace model with a truncated file (e.g. `head -c 100000000 model.gguf > broken.gguf`) and Load | "Could not load model: …" error, Retry button, no crash |
 
+## 9. Phase 2 — persistence
+
+| # | Step | Expected |
+|---|---|---|
+| 9.1 | Chat a few turns, swipe the app away, reopen | Same chat reopens with all messages; ☰ lists earlier chats |
+| 9.2 | Models tab: context/threads changed, kill app, reopen | Settings kept |
+| 9.3 | Upgrade from the Phase 1 APK (install over it) | The Phase 1 model appears under Models → Chat (migrated) |
+
+## 10. Rich markdown
+
+| # | Step | Expected |
+|---|---|---|
+| 10.1 | Chat mode: *"Explain Kotlin coroutines with a code example, a table of builders and the formula for speed-up"* | Headings, bold, bullet lists, a table, a highlighted code block with **Copy**, math shown with Unicode symbols |
+| 10.2 | Scroll while it streams | Smooth; code block appears as code even before the closing ``` |
+
+## 11. Canvas (use Qwen3-1.7B or 4B)
+
+| # | Step | Expected |
+|---|---|---|
+| 11.1 | Auto mode: *"Compare iPhone 15, Pixel 8 and Galaxy S24 in a table with a bar chart of battery life"* | Canvas opens and fills in component by component; chat shows a canvas card; tok/s shown |
+| 11.2 | Follow-up: *"make the table shorter"*, then *"add a pie chart of prices"* | Canvas updates in place (v2, v3) — same title, other blocks kept |
+| 11.3 | Canvas ‹ › arrows and ⋮ history | Moves between versions; chat follow-ups continue from the shown version |
+| 11.4 | *"Quiz me on the solar system"* / *"Flashcards for French greetings"* | Quiz with scoring, flashcards flip on tap |
+| 11.5 | Switch to **Chat** mode and ask for a table | Plain markdown table, no canvas |
+| 11.6 | With Qwen3-0.6B | Still valid canvases (simpler); note quality |
+| 11.7 | ⋮ → Copy as Markdown / Share as text | Markdown copied / share sheet opens |
+
+## 12. Documents (RAG)
+
+| # | Step | Expected |
+|---|---|---|
+| 12.1 | Models → Embedding → Add bge-small. Docs → Import a text PDF (10–50 pages) | Progress "Reading PDF page x/y", then "Embedding n/N"; Cancel works and leaves nothing behind |
+| 12.2 | Ask a question answered in the PDF | Answer cites [1]/[2]; source chips below; tapping shows the passage |
+| 12.3 | Import a scanned (image-only) PDF | Clear "no extractable text" error |
+| 12.4 | Remove the embedding model, ask again | Still finds passages by keywords |
+
+## 13. Skills + agent
+
+| # | Step | Expected |
+|---|---|---|
+| 13.1 | Chat: + → Run a skill → *Compare options* with text *"tea vs coffee for night study"* | Card shows Plan, live "Step n", then a canvas (comparison/chart/callout); **Steps** expands tool calls with inputs/outputs/timing |
+| 13.2 | `/study-plan exam in 5 days` (with a PDF imported) | search_docs calls, then a plan table + checklist canvas |
+| 13.3 | *"/daily-planner gym at 7, report by 3pm, call mom; add the gym to my calendar"* | Approval dialog for create_calendar_event (shows title/time) → Allow → calendar app opens pre-filled; Deny → run finishes without it |
+| 13.4 | Press Stop during a run | Run ends "cancelled"; Runs tab shows it |
+| 13.5 | Start a run, then force-stop the app (`adb shell am force-stop com.offlineagent.app`) during a step | On reopen: banner "Unfinished agent run — Resume"; Resume continues from the saved step |
+| 13.6 | Skills tab: Duplicate & edit a built-in, change the instructions, Save; Import a .md skill; disable/delete | Validation errors shown for bad front matter; edited skill runs |
+| 13.7 | Runs tab → open a run | Every step with input, output, errors, ms |
+
+## 14. Photos (vision)
+
+| # | Step | Expected |
+|---|---|---|
+| 14.1 | Models → Vision → Add SmolVLM2 gguf, then **Add projector** → mmproj | Card shows the projector name |
+| 14.2 | Chat: + → Photo from gallery → *"What is in this photo?"* | "Looking at the image…", answer about the photo; record seconds |
+| 14.3 | + → Take a photo (camera app) | Photo attaches and works the same |
+| 14.4 | Next text-only message | Chat model reloads automatically, answer works |
+
+## 15. Offline + smoothness (Phase 2)
+
+| # | Step | Expected |
+|---|---|---|
+| 15.1 | Airplane mode, repeat 11.1, 12.2, 13.1, 14.2 | All work offline |
+| 15.2 | Scroll and type while a canvas streams / documents index | No jank, no ANR |
+| 15.3 | `aapt dump permissions` / Settings → Apps → Permissions | Still **no** internet permission |
+
+## 16. Memory
+
+| # | Step | Expected |
+|---|---|---|
+| 16.1 | Qwen3-1.7B, context 4096: watch RAM (Developer options → Memory) during a canvas | Record peak |
+| 16.2 | Background the app during a run | Run continues or is resumable; no crash |
+
 ## 8. Logs to send back if something fails
 
 ```
-adb logcat -s OfflineAgentLlama llama.cpp OfflineAgent AndroidRuntime DEBUG
+adb logcat -s OfflineAgentLlama llama.cpp OfflineAgent AndroidRuntime DEBUG SQLiteLog
 ```
 
 ## Results table (fill in)
@@ -96,3 +171,10 @@ adb logcat -s OfflineAgentLlama llama.cpp OfflineAgent AndroidRuntime DEBUG
 | 5 stop | | |
 | 6 thinking | | |
 | 7 lifecycle/memory | | |
+| 9 persistence | | |
+| 10 markdown | | |
+| 11 canvas (model?) | | |
+| 12 RAG | | |
+| 13 skills/agent | | |
+| 14 vision (s per photo) | | |
+| 15/16 offline, smoothness, RAM | | |

@@ -118,3 +118,83 @@ Each entry: what was decided, why, and what it would take to revisit it.
 | AndroidX / Jetpack Compose / Kotlin / kotlinx.coroutines | Apache 2.0 | standard |
 
 An in-app "Open-source licences" screen is a Phase 8 (release) item.
+
+---
+
+# Phase 2 decisions (14 Oct 2026)
+
+## D12. One typed schema → grammar + validation + docs
+- UI documents and tool arguments are described once as a `Schema` (small JSON-schema subset, `core/runtime/schema`).
+  `Gbnf.of(schema)` produces the llama.cpp GBNF grammar used for constrained sampling, `schema.validate()` is the trusted
+  check before anything renders or executes, and `signature()` documents the tool to the model. They cannot drift apart.
+- Objects have a fixed property order and all properties required (optional data = empty string/array). Grammars stay
+  small and small models are much more reliable. String length / numeric ranges are checked in Kotlin, not in the grammar
+  (bounded repetitions blow up grammar size).
+- We did not use llama.cpp's `common/json-schema-to-grammar.cpp`: it is C++ in the unstable `common` library (needs
+  nlohmann::json); keeping the converter in Kotlin keeps it unit-testable and the JNI on the public C API only.
+
+## D13. Grammar sampling outside the sampler chain
+- `llama_sampler_init_grammar` is applied lazily: sample normally, test the one token against the grammar, and only when it
+  is rejected mask the full vocabulary and resample (same as llama.cpp `common_sampler`). Running the grammar over all
+  151k Qwen candidates for every token would cost tens of ms per token on a phone.
+- Structured sampling: temperature 0.3, top-k 20, top-p 0.9, min-p 0.05, **repeat penalty off** (JSON repeats braces and
+  quotes; a penalty corrupts it).
+
+## D14. Canvas = versioned document per chat, updated by regeneration
+- The model regenerates the whole (small, ≤12 blocks) document on every edit, given the current JSON. Patch formats
+  (JSON-patch/diffs) were rejected: small models produce invalid paths, and the full doc is only a few hundred tokens.
+- Every version is stored (`canvas_versions`); undo/redo/history move a pointer (`chats.canvasVersion`).
+- Auto mode uses keyword rules instead of an extra LLM classification call (an extra pass would add seconds per message
+  on a phone); the user can force Chat or Canvas.
+- Invalid output never shows raw JSON as the answer: valid blocks are kept, invalid ones dropped, and a total failure
+  falls back to markdown.
+
+## D15. Markdown + math + highlighting are in-house
+- A small Kotlin parser (block + inline) instead of a markdown library: no Android/WebView dependency, JVM-testable,
+  tolerant of half-streamed text (unclosed fences/emphasis), `[n]` citations as first-class inlines.
+- Math is "LaTeX-ish": TeX commands → Unicode (α, ², √, ∑, ≤ …), rendered in a serif italic. A real TeX typesetter
+  (KaTeX/MathJax) would need a WebView/JS engine.
+- Syntax highlighting is a linear-time lexer (keywords/strings/comments/numbers/types/functions) for ~15 languages.
+
+## D16. RAG: Room + brute force + FTS4; embeddings via llama.cpp
+- Vectors are stored as float32 BLOBs in Room and searched brute-force (cosine). For a few thousand chunks this is
+  milliseconds and avoids a native vector DB. FTS4 (Room `@Fts4(contentEntity)`) provides keyword search and the
+  no-embedding-model fallback; scores are blended 0.7 vector / 0.3 keyword.
+- Embeddings use llama.cpp's embedding mode (same native stack, model's own pooling, L2-normalised) on a separate model +
+  context and thread. Recommended: bge-small-en-v1.5 (MIT, 37 MB), nomic-embed-text-v1.5 (Apache-2.0), EmbeddingGemma-300M
+  (Gemma terms, multilingual).
+- PDF text: **PdfBox-Android** (`com.tom-roush:pdfbox-android`, Apache-2.0), page by page for progress/cancel.
+
+## D17. Agent loop: LLM proposes, Kotlin disposes
+- Each step is ONE JSON action under a grammar that only contains the allowed tools with their exact argument schemas
+  (or `final`). Then: schema validation → `PolicyEngine` → user approval when needed → execution with timeout →
+  truncated observation. Plans are generated first and shown.
+- Approval policy: read-only and canvas tools never ask; local writes (notes, memory) ask unless the user chose "always
+  allow"; anything that leaves the app (share sheet, calendar insert intent) asks every time. Side-effect budget 3/run.
+  No URL-opening, code, shell or file tools exist.
+- Small-model guard rails learned from host tests: (a) until the first successful tool call, if the plan names a tool, the
+  grammar has no `final` option (0.6B otherwise "answered" 17.5% of 2480 as 433.0 without calling the calculator);
+  (b) a UI skill ends when its `render_ui` succeeds (1.7B kept calling tools after rendering); (c) repeated tool errors
+  after useful work end the run as completed instead of failed; (d) if a UI skill never renders, a compose step builds the
+  canvas from the observations.
+- Checkpoint = the whole `RunCheckpoint` after every step in one Room transaction; resume restarts from the saved
+  iteration without re-planning. Runs execute in the application scope (not a foreground service, see KNOWN_ISSUES).
+
+## D18. Image input via libmtmd, one model at a time
+- `libmtmd` (llama.cpp `tools/mtmd`, built standalone with `LLAMA_BUILD_MTMD=ON`, `MTMD_VIDEO=OFF`) — b11609 supports
+  SmolVLM/Idefics3, Qwen2-VL/2.5-VL, Qwen3-VL, Gemma 3/4, InternVL, etc. Images are decoded in Kotlin (BitmapFactory,
+  ≤768 px) and passed as RGB, so no image codecs run in native code on the phone.
+- `image_max_tokens = 512`: without it SmolVLM upscales every photo to 2048 px (17 tiles, ~1100 tokens; 56 s on the
+  sandbox). With the cap the test image is 358 tokens / 14 s.
+- The chat and vision models are separate roles; the app switches automatically (one in RAM). A VLM can also be used as
+  the chat model if the user selects it in both roles.
+
+## D19. Non-ChatML templates via llama.cpp's built-in matcher
+- Qwen3 hybrid-thinking models keep the Kotlin template. ChatML models without `<think>` (Qwen2.5, Qwen3-VL-Instruct) use
+  ChatML without the empty think block. Everything else (e.g. SmolVLM) uses `llama_chat_apply_template` with the model's
+  embedded template (falls back to ChatML if unsupported).
+
+## D20. Toolchain additions
+- KSP 2.2.21-2.0.5, Room 2.7.2, DataStore 1.1.7, kotlinx-serialization-json 1.9.0 (library only, no compiler plugin —
+  JSON is handled as `JsonElement`), PdfBox-Android 2.0.27.0. All Apache-2.0.
+- Build sandbox note: JuiceFS occasionally returns EIO to long-lived Gradle daemons; builds use `--no-daemon`.

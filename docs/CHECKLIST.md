@@ -2,7 +2,7 @@
 
 Legend: ✅ done & verified in sandbox · 📱 done, needs Sai's phone to verify · ⬜ not started
 
-## Phase 1 — Offline inference foundation (this delivery)
+## Phase 1 — Offline inference foundation (delivered)
 
 - ✅ Toolchain: JDK 17, Android SDK platform 35 + build-tools 35, NDK r30, CMake 3.31.6, Gradle 8.14.3 wrapper
 - ✅ Git repo at `offline-agent/`, llama.cpp vendored at pinned tag `b11609`
@@ -28,32 +28,31 @@ Legend: ✅ done & verified in sandbox · 📱 done, needs Sai's phone to verify
 - 📱 Runs smoothly on a real mid-range phone (no jank, tok/s, memory, thermals) — DEVICE_TEST_PLAN
 - 📱 Airplane-mode end-to-end test — DEVICE_TEST_PLAN §3
 
-## Phase 2 — Inference hardening & settings
-- ⬜ Persist runtime settings (DataStore); per-model presets
-- ⬜ Model metadata pre-read (arch, quant, ctx) before load; RAM-fit check per model
-- ⬜ Foreground service for long generations (survive backgrounding)
-- ⬜ Optional KV cache quantisation (q8_0 + flash-attn) for 4096+ ctx on 4 GB phones
-- ⬜ Generic chat templates for non-Qwen GGUFs (llama.cpp Jinja or a template registry)
-- ⬜ Benchmark screen (pp/tg), instrumented tests on device
+## Phase 2 — Persistence, rich output, Canvas, RAG, skills/agent, multimodal (this delivery)
 
-## Phase 3 — Tool registry
-- ⬜ `:core:runtime` module; `Tool` interface (name, JSON schema, suspend execute), registry, permission model
-- ⬜ Built-in offline tools (calculator, date/time, notes, device info, file read within app sandbox)
-- ⬜ Qwen3 tool-call template (`<tool_call>` JSON) + parser + unit tests
+Legend as above. "host" = verified with the real JNI bridge + real GGUF on the ARM64 sandbox.
 
-## Phase 4 — Agent loop
-- ⬜ ReAct-style loop: plan → tool call → observation → answer; step limits, cancellation, streaming of intermediate steps
-- ⬜ Guardrails: max steps, timeouts, tool-argument validation
+- ✅ `:core:data` Room DB (chats, messages incl. UI JSON, canvas versions, documents, chunks+vectors, FTS4, skills, agent runs/steps, memory, notes, models) + DataStore settings — 📱 restart survival to check on phone
+- ✅ Markdown renderer: headings, emphasis, lists (nested/tasks), tables, code (highlight + copy), quotes, rules, links (not opened), math → Unicode, `[n]` citations — unit-tested parser; 📱 visual check
+- ✅ Intelligent UI schema v1 (15 components), GBNF generated from the same schema, Kotlin validation + repair + markdown fallback — unit-tested; host: grammar output always parsed
+- ✅ Canvas panel per chat: live preview while streaming, update in place (versions), undo/redo/history, copy/share — host: 1.7B update added a chart; 📱 UI
+- ✅ Auto / Chat / Canvas routing — unit-tested
+- ✅ Charts (bar/line/pie) drawn with Compose Canvas, flashcards, quiz, checklist, steps, comparison, actions — 📱 visual
+- ✅ Local RAG: SAF import (PDF via PdfBox-Android, txt, md), chunking with overlap, llama.cpp embeddings, Room vectors + FTS4 hybrid, citations as tappable chips, background indexing with progress + cancel — host: retrieval 5/5, grounded answer; 📱 PDF import
+- ✅ Skills: markdown + front matter, 5 built-ins, create/edit/import/enable/delete in-app, suggestion chip, /skill-id — unit-tested parser
+- ✅ Tool registry with typed schemas, permissions, side effects, timeouts: search_docs, read_document, summarize, calculator, get_datetime, create_note, memory_read/write, render_ui, canvas_update, share_text, create_calendar_event (no URL/code/shell tools)
+- ✅ Policy engine + approval dialog (allow once / always for local writes / deny)
+- ✅ Agent loop: plan → grammar tool call → validation → policy → execute → observe; max iterations, timeouts, retries, cancellation, checkpoint every step, resume after restart, run history screen — unit-tested (fake engine) + host (0.6B and 1.7B tool calls)
+- ✅ Image input via libmtmd (photo picker / camera), vision model role with mmproj — host: SmolVLM2-256M answered "red circle"; 📱 on phone
+- ✅ Multiple models with roles (chat / embedding / vision), RAM guidance + recommendations in-app
+- ✅ 79 JVM unit tests pass; host harness ALL PASS with Qwen3-1.7B (0.6B: all but "canvas update adds a chart")
+- ✅ assembleDebug, no INTERNET permission, arm64 libs incl. libmtmd, 16 KB aligned
+- 📱 Everything UI/Android-side: DEVICE_TEST_PLAN §9–§16
 
-## Phase 5 — Persistence (Room)
-- ⬜ `:core:data`: conversations, messages, workflows, runs; migrations; repository interfaces in core
-
-## Phase 6 — Visual workflow builder
-- ⬜ `:feature:workflow`: node graph editor (Compose canvas), node types (LLM, tool, condition, loop, input/output)
-- ⬜ Serialisation (JSON), validation, executor in `:core:runtime`
-
-## Phase 7 — Memory
-- ⬜ Long-term memory store (Room + on-device embeddings via a small GGUF embedding model), retrieval into prompts
-
-## Phase 8 — Release
-- ⬜ Release build (R8, signing), in-app licences screen, crash-free offline diagnostics export, device report
+## Later phases (re-planned)
+- ⬜ Visual node workflow builder (`:feature:workflow` graph editor, executor in `:core:runtime`)
+- ⬜ Foreground service for long agent runs / indexing; WorkManager indexing
+- ⬜ KV cache quantisation (q8_0 + flash-attn) for 8k context on 4–6 GB phones
+- ⬜ OCR for scanned PDFs; ANN index for very large libraries
+- ⬜ Canvas interactions persisted (checklist ticks, quiz progress) as new versions
+- ⬜ Release build (R8, signing), licences screen, instrumented UI/Room tests, benchmark screen

@@ -267,7 +267,8 @@ private fun MessageItem(m: MessageEntity, vm: ChatViewModel, actions: UiActions,
 @Composable
 private fun AgentRunCard(m: MessageEntity, vm: ChatViewModel, live: String?, onOpenCanvas: (Int?) -> Unit) {
     var expanded by rememberSaveable(m.id) { mutableStateOf(false) }
-    val steps by (m.runId?.let { vm.observeSteps(it) } ?: kotlinx.coroutines.flow.flowOf(emptyList())).collectAsState(initial = emptyList())
+    val stepsFlow = remember(m.runId) { m.runId?.let { vm.observeSteps(it) } ?: kotlinx.coroutines.flow.flowOf(emptyList()) }
+    val steps by stepsFlow.collectAsState(initial = emptyList())
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {

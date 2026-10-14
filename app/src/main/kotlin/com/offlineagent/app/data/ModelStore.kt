@@ -78,9 +78,9 @@ object ModelAdvice {
             "Better English retrieval, 8k context."),
         Rec(ModelRole.EMBEDDING, "EmbeddingGemma-300M", "embeddinggemma-300M-Q8_0.gguf", "330 MB", "any", "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF", "Gemma Terms of Use",
             "Multilingual (Hindi, Telugu…); licence is not OSI."),
-        Rec(ModelRole.VISION, "SmolVLM2-256M", "SmolVLM2-256M-Video-Instruct-Q8_0.gguf + mmproj", "0.4 GB", "4 GB phone", "https://huggingface.co/ggml-org/SmolVLM2-256M-Video-Instruct-GGUF", "Apache-2.0",
+        Rec(ModelRole.VISION, "SmolVLM2-256M", "SmolVLM2-256M-Video-Instruct-Q8_0.gguf + mmproj-SmolVLM2-256M-Video-Instruct-Q8_0.gguf", "0.28 GB", "4 GB phone", "https://huggingface.co/ggml-org/SmolVLM2-256M-Video-Instruct-GGUF", "Apache-2.0",
             "Very fast, basic descriptions."),
-        Rec(ModelRole.VISION, "Qwen3-VL-2B-Instruct", "Qwen3-VL-2B-Instruct-Q4_K_M.gguf + mmproj", "1.9 GB", "6 GB+ phone", "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF", "Apache-2.0",
+        Rec(ModelRole.VISION, "Qwen3-VL-2B-Instruct", "Qwen3VL-2B-Instruct-Q4_K_M.gguf + mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "1.55 GB", "6 GB+ phone", "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF", "Apache-2.0",
             "Much better reading of text/charts in photos."),
     )
 

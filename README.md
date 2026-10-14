@@ -1,96 +1,110 @@
-# Offline-First Android Agent Platform — Phase 1
+# Offline-First Android Agent — Phase 2
 
-A native Android app (Kotlin + Jetpack Compose, Material 3) that loads a local **GGUF** model and streams answers
-**fully offline** on the phone's CPU. Phase 1 is the inference foundation for the later agent loop, tool registry,
-workflow builder and memory (see `docs/CHECKLIST.md`).
+A native Android app (Kotlin + Jetpack Compose, Material 3) that runs local **GGUF** models **fully offline** on the
+phone's CPU, with:
 
-- Engine: **llama.cpp `b11609`** (vendored in `third_party/llama.cpp`) via a small JNI bridge, behind an `InferenceAdapter`
-  interface so another engine (e.g. QVAC, once it has an Android SDK) can be swapped in. Why: `docs/DECISIONS.md`.
-- Test model: **Qwen3-0.6B** GGUF (Q8_0 recommended, Q4_K_M also fine). The model is **not** bundled in the APK.
-- **No INTERNET permission at all.** No cloud fallback. The only time you need internet is to download the `.gguf` onto the phone beforehand.
+- **Rich answers**: proper Markdown (headings, lists, tables, highlighted code with Copy, quotes, math), streamed without jank.
+- **Intelligent UI / Canvas**: for structured requests the model emits a typed JSON UI document (tables, charts, checklists,
+  timelines, flashcards, quizzes, comparisons, callouts, action buttons…) under a **llama.cpp grammar**, Kotlin validates
+  it and renders native Compose components in a full-screen Canvas that is **updated in place** on follow-ups
+  ("make the table shorter", "add a chart") with version history and undo.
+- **Local RAG**: import PDFs/txt/md, on-device embeddings, hybrid vector + keyword search, answers with tappable citations.
+- **Skills + agent**: markdown skills drive a bounded, checkpointed agent loop with grammar-constrained tool calls,
+  Kotlin validation, a policy engine and user approval for consequential actions. Run history shows every step.
+- **Photos in**: attach a photo (gallery/camera) and ask about it via llama.cpp **libmtmd** + a small vision model.
+- **Persistence**: chats, canvases, documents, skills, runs and settings survive restarts (Room + DataStore).
+- **No INTERNET permission. No cloud fallback. No telemetry.** The only online step is downloading model files beforehand.
+
+Docs: `docs/ARCHITECTURE.md` (how it works), `docs/DECISIONS.md` (why), `docs/CHECKLIST.md`, `docs/DEVICE_TEST_PLAN.md`,
+`docs/KNOWN_ISSUES.md`, `docs/verification/phase2-host-harness.txt` (real-model test output).
 
 ## Repository layout
 
 ```
-app/                 Compose UI (Model + Chat screens), ViewModel, SAF model import, lifecycle (onTrimMemory → unload)
-core/inference/      Pure Kotlin: InferenceAdapter/TokenEngine, state machine, Qwen3 template, UTF-8 streaming, thread policy (+ JVM tests)
-engine/llamacpp/     Android library: LlamaCppEngine (Kotlin) + llama_jni.cpp + CMake build of llama.cpp
-third_party/         llama.cpp source at a pinned tag (LLAMA_CPP_VERSION)
-tools/host-harness/  Dev-only: runs the real JNI bridge + real GGUF on an ARM64/x86 Linux JVM
-docs/                ARCHITECTURE, DECISIONS, CHECKLIST, DEVICE_TEST_PLAN, KNOWN_ISSUES
+app/                 Compose UI: Chat (+Canvas), Docs, Skills, Runs, Models; ViewModels; ports; DI root
+core/inference/      Pure Kotlin: InferenceAdapter/TokenEngine, templates, grammar/images in requests, EmbeddingService
+core/runtime/        Pure Kotlin: UI schema+GBNF+validation, markdown, RAG maths, skills, tools, policy, agent loop (+ tests)
+core/data/           Room database + DataStore settings + agent checkpoint store
+feature/workflow/    Skills editor and agent run history screens
+engine/llamacpp/     JNI bridge (chat, grammar sampling, embeddings, libmtmd images) + CMake build of llama.cpp
+third_party/         llama.cpp b11609 (vendored)
+tools/host-harness/  Dev-only: runs the real JNI bridge + real GGUFs on an ARM64/x86 Linux JVM
 ```
 
 ## Build
 
-Requirements: JDK 17, Android SDK (platform 35, build-tools 35), **NDK 30.0.16248370 (r30)**, CMake 3.31.6. Android Studio
-(Ladybug or newer) installs all of these from SDK Manager.
+Requirements: JDK 17, Android SDK 35, **NDK 30.0.16248370**, CMake 3.31.6 (Android Studio installs them).
 
 ```bash
-# point Gradle at your SDK (Android Studio does this automatically)
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-
-./gradlew :core:inference:test      # JVM unit tests (fast, no device)
-./gradlew :app:assembleDebug        # → app/build/outputs/apk/debug/app-debug.apk
+./gradlew :core:inference:test :core:runtime:test   # 79 JVM unit tests
+./gradlew :app:assembleDebug                         # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Notes
-- The native code is always built **Release / -O3** (also in the debug APK). First native build takes a few minutes
-  (llama.cpp + 7 CPU variants); later builds are incremental.
-- If Gradle runs out of memory: `gradle.properties` already uses `org.gradle.jvmargs=-Xmx3g` and `org.gradle.workers.max=2`.
-- Only `arm64-v8a` is built (all modern phones). The APK won't install on an x86_64 emulator.
+Native code is always built Release/-O3 (also in the debug APK). `gradle.properties` limits Gradle to `-Xmx3g`, 2 workers.
 
-Verify the offline guarantee yourself:
+Verify the offline guarantee:
 
 ```bash
 $ANDROID_HOME/build-tools/35.0.0/aapt dump permissions app/build/outputs/apk/debug/app-debug.apk
 # package: com.offlineagent.app
 # permission: com.offlineagent.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION   ← androidx internal, signature-only
-# (no android.permission.INTERNET)
-unzip -l app/build/outputs/apk/debug/app-debug.apk | grep lib/arm64-v8a
+# (no android.permission.INTERNET, no camera/storage permissions either)
 ```
 
-## Install the APK
+## Install & provision models (only step needing internet)
 
-- USB: enable Developer options → USB debugging, then `adb install -r offline-agent-phase1-debug.apk`
-- Or copy the APK to the phone and tap it (allow "Install unknown apps" for your file manager).
+1. `adb install -r offline-agent-phase2-debug.apk` (or copy to the phone and open it).
+2. Download GGUFs on the phone/PC, then in the app: **Models → (role) → Add**. Files are copied into app storage.
 
-## Provision the model (the only step that needs internet)
+| role | recommended | size | phone RAM | licence | link |
+|---|---|---|---|---|---|
+| Chat (Canvas + skills) | **Qwen3-1.7B-Q4_K_M.gguf** | 1.1 GB | 6 GB+ | Apache-2.0 | https://huggingface.co/unsloth/Qwen3-1.7B-GGUF |
+| Chat (best quality) | Qwen3-4B-Q4_K_M.gguf | 2.5 GB | 8 GB+ | Apache-2.0 | https://huggingface.co/Qwen/Qwen3-4B-GGUF |
+| Chat (fast, weak structure) | Qwen3-0.6B-Q8_0.gguf | 0.6 GB | 4 GB | Apache-2.0 | https://huggingface.co/Qwen/Qwen3-0.6B-GGUF |
+| Embedding | bge-small-en-v1.5-q8_0.gguf | 37 MB | any | MIT | https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf |
+| Embedding (better EN) | nomic-embed-text-v1.5.Q8_0.gguf | 146 MB | any | Apache-2.0 | https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF |
+| Embedding (multilingual) | embeddinggemma-300M-Q8_0.gguf | 334 MB | any | Gemma Terms of Use | https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF |
+| Vision (fast) | SmolVLM2-256M-Video-Instruct-Q8_0.gguf **+** mmproj-SmolVLM2-256M-Video-Instruct-Q8_0.gguf | 280 MB | 4 GB | Apache-2.0 | https://huggingface.co/ggml-org/SmolVLM2-256M-Video-Instruct-GGUF |
+| Vision (better) | Qwen3VL-2B-Instruct-Q4_K_M.gguf **+** mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf | 1.55 GB | 6 GB+ | Apache-2.0 | https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF |
 
-1. On the phone, download **`Qwen3-0.6B-Q8_0.gguf`** (~610 MB) from
-   https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/tree/main (or download on a PC and copy it to the phone's `Download/` folder).
-2. Open **Offline Agent → Model → Pick .gguf file** and select it. The app copies it into its private storage
-   (progress bar; you can cancel). It is remembered across restarts. You may delete the downloaded copy afterwards.
-3. Tap **Load model**. Status turns **Ready**; the app switches to **Chat**.
+Tool calling and Canvas work best with Qwen3-1.7B or 4B; **0.6B is weak at structured output** (valid but simple JSON,
+shaky tool choice). RAM ≈ model file + KV cache (≈ 448 MiB at the default 4096 context for 0.6B/1.7B) + ~150 MB; on 4 GB
+phones set context 2048. For a vision model, tap **Add projector** on its card and pick the matching mmproj file.
 
 ## Use
 
-- Type a message → the answer streams token by token; **tokens/sec** is shown live and under each reply.
-- Red square = **Stop** (stops within a fraction of a second, model stays loaded).
-- **Thinking** switch: OFF (default) = fast direct answers (`/no_think`); ON = Qwen3 reasoning, shown in a collapsible "Show reasoning".
-- Refresh icon = new chat. Model tab: context length (1024/2048/4096), CPU threads (defaults to your phone's performance cores),
-  Unload, model info, and ⓘ for the CPU features llama.cpp detected.
+- **Chat**: type and send; the model loads automatically. Above the composer: **Auto / Chat / Canvas**. Auto opens the
+  Canvas for tables, charts, plans, comparisons, checklists, quizzes…; follow-ups such as "add a chart" edit it in place.
+  Canvas: ‹ › = undo/redo, ⋮ = history, copy/share as Markdown. Red square = Stop.
+- **Documents**: Docs → Import (PDF/txt/md). With "Use my documents" on (chat ⋮ menu), answers cite `[1]`, `[2]`; tap a
+  chip to read the passage.
+- **Skills**: + → *Run a skill…*, or type `/study-plan …`, `/flashcards …`, `/compare-options …`, `/daily-planner …`,
+  `/explain-concept …`. Skills tab: create, duplicate & edit, import .md, enable/disable, delete. Writes (notes, memory)
+  and anything leaving the app (share sheet, calendar) ask for approval.
+- **Runs**: every agent run with plan, tool inputs/outputs, approvals, errors and timings; unfinished runs can be resumed.
+- **Photos**: + → Photo from gallery / Take a photo, then ask about it (needs a Vision model + projector).
 
-## Offline test (airplane mode)
-
-1. Provision the model as above.
-2. Turn on **Airplane mode** and switch **Wi-Fi and Bluetooth off**.
-3. Force-stop and reopen the app → Model → Load → Chat → ask *"What is the capital of India?"*, then *"And of Telangana?"*.
-4. Both answers stream with no network. Full checklist: `docs/DEVICE_TEST_PLAN.md`.
-
-## Verification done in the build sandbox (no phone available)
+## Verified in the build sandbox (no phone available)
 
 | check | result |
 |---|---|
-| `:core:inference:test` (26 JVM tests: template, UTF-8, think splitting, thread policy, GGUF header, prompt fitting, adapter state machine/threading/cancel with a fake engine) | **26/26 pass** |
-| Host harness: real `llama_jni.cpp` + llama.cpp `b11609` + **Qwen3-0.6B-Q8_0** on ARM64 Linux, 2 threads, through the app's `EngineInferenceAdapter` | **all checks pass**: correct answers ("New Delhi", multi-turn "Hyderabad"), no template-token leaks, multi-byte Telugu output intact, Stop → CANCELLED in **5 ms**, thinking mode emits `<think>`, corrupt GGUF → clean `ModelLoadException`, reload after failure |
-| Host harness speed (2 sandbox server cores; **not** a phone number) | decode ≈ 40–74 tok/s (shared VM, varies run to run), prompt ≈ 230–600 tok/s |
-| APK | `lib/arm64-v8a/` has libllama, libggml, libggml-base, 7 × libggml-cpu-android_armv*, liboffline_agent_llama, libc++_shared; all 16 KB-aligned |
-| Permissions (`aapt dump permissions`) | **no INTERNET**; only androidx's signature-level dynamic-receiver permission |
+| JVM unit tests | **79/79 pass** (26 `:core:inference`, 53 `:core:runtime`: UI schema parsing/validation/repair/fallback + GBNF well-formedness, partial-JSON streaming, router, markdown/math/highlighting, chunker, cosine/BM25/hybrid ranking, skill parser/matcher/built-ins, tool argument validation, calculator, policy engine, agent loop happy path / iteration bound / invalid output / approvals / allow-list / tool timeout / repeated calls / cancellation checkpoint / resume / compose fallback) |
+| Host harness, **Qwen3-1.7B-Q8_0** (real JNI + llama.cpp b11609) | **ALL PASS**: grammar-constrained canvases (heading+callouts+chart+actions; checklist), in-place update added a chart, agent called `calculator` with `2480 * 0.175` → 434 → final "434", compare-options skill rendered a canvas |
+| Host harness, **Qwen3-0.6B-Q8_0** | all pass except "canvas update adds a chart" (0.6B kept only the table). Agent tool call passes after the plan-driven grammar fix |
+| Embeddings + RAG (bge-small-en-v1.5 via llama.cpp) | 384-d vectors; top-1 correct for 4/4 queries + a pure-vector paraphrase query; grounded answer "four books … [1]" |
+| Image input (SmolVLM2-256M + mmproj via libmtmd) | answered "red circle" for a synthetic image; 358 image tokens in 14 s on 2 sandbox cores (capped at 512 tokens/image); text turn after an image works |
+| APK | `lib/arm64-v8a/` libllama, libggml, libggml-base, libmtmd, 7 × CPU variants, liboffline_agent_llama, libc++_shared; 16 KB-aligned |
+| Permissions | **no INTERNET** (only androidx's signature-level dynamic-receiver permission) |
 
-Real-phone speed, smoothness, memory behaviour and the UI are still to be checked by Sai (DEVICE_TEST_PLAN.md).
+Not verified (needs a phone): all UI, Room on device, SAF/photo picker/camera, PdfBox on real PDFs, intents, real speed and
+memory → `docs/DEVICE_TEST_PLAN.md` §9–§16.
+
+Host harness: `tools/host-harness/build-native.sh <dir>`, `./gradlew :engine:llamacpp:assembleDebug`, then
+`MODEL=… EMBED=… VLM=… MMPROJ=… ./gradlew -PhostHarness :tools:host-harness:runPhase2 -PnativeDir=<dir>/llama/bin`.
 
 ## Licences
 
-- llama.cpp / ggml: **MIT** — `third_party/llama.cpp/LICENSE`
-- Qwen3 model weights (downloaded by the user, not distributed with the app): **Apache 2.0** — https://huggingface.co/Qwen/Qwen3-0.6B
-- AndroidX, Jetpack Compose, Kotlin, kotlinx.coroutines: Apache 2.0
+llama.cpp / ggml / libmtmd: MIT (`third_party/llama.cpp/LICENSE`). PdfBox-Android: Apache-2.0. AndroidX (Compose, Room,
+DataStore), Kotlin, kotlinx.coroutines, kotlinx.serialization: Apache-2.0. Models are downloaded by the user (licences in
+the table above); none are bundled.

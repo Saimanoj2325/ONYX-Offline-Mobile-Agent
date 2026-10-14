@@ -1,0 +1,110 @@
+Phase 2 host harness (tools/host-harness Phase2Harness.kt): real JNI bridge + llama.cpp b11609 on the ARM64 build sandbox (2 cores, NOT phone speed).
+Times are sandbox wall-clock.
+
+### Run A: Qwen3-0.6B-Q8_0, all sections (canvas, agent, RAG with bge-small, vision with SmolVLM2-256M before the image-token cap)
+== loaded qwen3 0.6B Q8_0 (Qwen3-0.6B-Q8_0.gguf)
+== 1. Canvas (grammar-constrained UI JSON)
+  PASS canvas JSON parses+validates (9070 ms, 253 chars): Compare Python, Java and JavaScript for 
+   blocks: table
+{"v":1,"title":"4-step checklist to prepare for a job interview","blocks":[{"type": "table", "title":"Steps to Prepare for a Job Interview","columns":["Step","Details"],"rows":[["1. Research the company and job requirements","Research the company's mission, values, and culture to understand what you're looking for in a job."],["2. Prepare a resume and cover letter","Create a strong resume highlighting your skills and experience, and tailor the cover letter to the job description."],["3. Practice your interview skills","Prepare for common interview questions and practice answering them confidently."],["4. Get ready for the interview","Bring your resume, a portfolio, and any relevant experience to the interview."]]}]}
+  PASS canvas JSON parses+validates (6998 ms, 725 chars): Make a 4-step checklist to prepare for a
+   blocks: table
+  FAIL canvas update adds a chart
+   updated blocks: table
+== 2. Agent loop (plan -> grammar tool call -> observe -> final)
+   status=COMPLETED iterations=2 in 6736 ms
+   plan=[Use the calculator tool to compute 17.5% of 2480, Answer with the result.]
+   step 0 PLAN  in= out=Use the calculator tool to compute 17.5% of 2480
+   step 1 TOOL_CALL calculator in={"expression":"2480 * 0.175"} out={"expression":"2480 * 0.175","result":"434"} err=
+   step 2 FINAL  in= out=434 err=
+  PASS agent made a valid calculator tool call
+  PASS calculator returned 434
+  PASS agent run completed
+  PASS final answer contains 434
+== 2b. Skill run (compare-options -> canvas)
+   step 0 PLAN  err= out=Identify criteria (time, cost, quality, caffeine content) for tea and coffee
+   step 1 TOOL_CALL render_ui err= out={"rendered":true,"version":1,"blocks":2}
+   step 2 FINAL  err= out=answer for the user
+  PASS skill run rendered a canvas (table, table)
+== 3. Embeddings + hybrid retrieval + grounded answer
+   embedding dim=384
+   embedded 4 chunks in 48 ms
+  PASS retrieval top-1 for 'How many books can I take out and what is the fine?'
+  PASS retrieval top-1 for 'When can I eat lunch?'
+  PASS retrieval top-1 for 'Which colours of light do leaves absorb?'
+  PASS retrieval top-1 for 'Where is the physics lab?'
+  PASS pure vector similarity finds the library hours
+   answer: Students can borrow up to four books at a time for fourteen days.
+  PASS grounded answer says four
+== 4. Image input (libmtmd)
+  PASS vision projector attached
+   answer: A red circle.  (image+prompt 55766 ms, total 55845 ms)
+  PASS VLM sees a red circle
+  PASS text turn after image works: What a lovely day!
+== RESULT: FAILURES: [canvas update adds a chart]
+> Task :tools:host-harness:runPhase2 FAILED
+BUILD FAILED in 2m 43s
+
+### Run B: Qwen3-1.7B-Q8_0, canvas + agent (before the "UI skill ends after render_ui" fix)
+== loaded qwen3 1.7B Q8_0 (Qwen3-1.7B-Q8_0.gguf)
+== 1. Canvas (grammar-constrained UI JSON)
+  PASS canvas JSON parses+validates (32895 ms, 1191 chars): Compare Python, Java and JavaScript for 
+   blocks: heading, callout, callout, callout, chart
+  PASS canvas JSON parses+validates (11469 ms, 435 chars): Make a 4-step checklist to prepare for a
+   blocks: heading, checklist
+  PASS canvas update adds a chart
+   updated blocks: table, chart
+== 2. Agent loop (plan -> grammar tool call -> observe -> final)
+   status=COMPLETED iterations=2 in 15310 ms
+   plan=[use calculator to compute 17.5% of 2480, result: 43.4]
+   step 0 PLAN  in= out=use calculator to compute 17.5% of 2480
+   step 1 TOOL_CALL calculator in={"expression":"2480 * 0.175"} out={"expression":"2480 * 0.175","result":"434"} err=
+   step 2 FINAL  in= out=434 err=
+  PASS agent made a valid calculator tool call
+  PASS calculator returned 434
+  PASS agent run completed
+  PASS final answer contains 434
+== 2b. Skill run (compare-options -> canvas)
+   step 0 PLAN  err= out=Identify the options: Tea and Coffee.
+   step 1 TOOL_CALL render_ui err= out={"rendered":true,"version":1,"blocks":1}
+   step 2 TOOL_CALL render_ui err= out={"rendered":true,"version":2,"blocks":2}
+   step 3 TOOL_CALL calculator err=calculator: unknown name 'sleep' out={"error":"calculator: unknown name 'sleep'"}
+   step 4 TOOL_CALL calculator err=calculator: unknown name 'sleep' out={"error":"calculator: unknown name 'sleep'"}
+  FAIL skill run rendered a canvas (table, table)
+== RESULT: FAILURES: [skill run rendered a canvas (table, table)]
+> Task :tools:host-harness:runPhase2 FAILED
+BUILD FAILED in 3m 6s
+
+### Run C: Qwen3-1.7B-Q8_0, canvas + agent (final code)
+== loaded qwen3 1.7B Q8_0 (Qwen3-1.7B-Q8_0.gguf)
+== 1. Canvas (grammar-constrained UI JSON)
+  PASS canvas JSON parses+validates (41206 ms, 1397 chars): Compare Python, Java and JavaScript for 
+   blocks: heading, callout, callout, callout, chart, actions
+  PASS canvas JSON parses+validates (11686 ms, 421 chars): Make a 4-step checklist to prepare for a
+   blocks: heading, checklist
+  PASS canvas update adds a chart
+   updated blocks: table, chart
+== 2. Agent loop (plan -> grammar tool call -> observe -> final)
+   status=COMPLETED iterations=2 in 15433 ms
+   plan=[use calculator to compute 17.5% of 2480, result: 43.4]
+   step 0 PLAN  in= out=use calculator to compute 17.5% of 2480
+   step 1 TOOL_CALL calculator in={"expression":"2480 * 0.175"} out={"expression":"2480 * 0.175","result":"434"} err=
+   step 2 FINAL  in= out=434 err=
+  PASS agent made a valid calculator tool call
+  PASS calculator returned 434
+  PASS agent run completed
+  PASS final answer contains 434
+== 2b. Skill run (compare-options -> canvas)
+   step 0 PLAN  err= out=Identify the options: Tea and Coffee.
+   step 1 TOOL_CALL render_ui err= out={"rendered":true,"version":1,"blocks":1}
+  PASS skill run rendered a canvas (table)
+== RESULT: ALL PASS
+
+### Run D: vision only, SmolVLM2-256M + mmproj, with image_max_tokens=512 (final code)
+== loaded qwen3 0.6B Q8_0 (Qwen3-0.6B-Q8_0.gguf)
+== 4. Image input (libmtmd)
+  PASS vision projector attached
+   answer: Circle and Red  (image+prompt 358 tokens in 14332 ms, total 14392 ms)
+  PASS VLM sees a red circle
+  PASS text turn after image works: Hello! I'm here to help you get started 
+== RESULT: ALL PASS

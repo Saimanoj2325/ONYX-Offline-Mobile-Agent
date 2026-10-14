@@ -58,7 +58,8 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun DocumentsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modifier = Modifier) {
-    val docs by app.db.documents().observeDocuments().collectAsStateWithLifecycle(emptyList())
+    val docsFlow = remember { app.db.documents().observeDocuments() }
+    val docs by docsFlow.collectAsStateWithLifecycle(emptyList())
     val progress by app.indexer.progress.collectAsStateWithLifecycle()
     val models by app.models.models.collectAsStateWithLifecycle(emptyList())
     val hasEmbedder = models.any { it.role == ModelRole.EMBEDDING.name && it.active }

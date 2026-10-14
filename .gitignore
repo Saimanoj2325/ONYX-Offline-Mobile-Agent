@@ -10,3 +10,4 @@ local.properties
 *.apk
 *.gguf
 captures/
+hs_err_pid*.log

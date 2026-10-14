@@ -166,7 +166,8 @@ fun RunsScreen(host: RunsHost, notify: (String) -> Unit, modifier: Modifier = Mo
     val scope = rememberCoroutineScope()
     open?.let { r ->
         val current = runs.firstOrNull { it.runId == r.runId } ?: r
-        RunDetail(current, host.steps(r.runId), onBack = { open = null }, onResume = { if (!host.resume(r.runId)) notify("Another run is in progress") })
+        val stepsFlow = remember(r.runId) { host.steps(r.runId) }
+        RunDetail(current, stepsFlow, onBack = { open = null }, onResume = { if (!host.resume(r.runId)) notify("Another run is in progress") })
         return
     }
     LazyColumn(modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

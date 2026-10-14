@@ -1,107 +1,131 @@
-# Architecture
+# Architecture (Phase 2)
 
-Phase 1 delivers the on-device inference foundation. Module boundaries are already drawn for the
-agent runtime, tools, workflow builder and persistence that come later.
-
-```
-┌───────────────────────────── :app (Android, Compose M3) ─────────────────────────────┐
-│ MainActivity ── ModelScreen / ChatScreen ── MainViewModel (StateFlow<UiState>)         │
-│ OfflineAgentApp (manual DI root, onTrimMemory → unload) · data/ModelRepository (SAF)   │
-└──────────────┬───────────────────────────────────────────────┬────────────────────────┘
-               │ InferenceAdapter (interface)                   │ (Phase 3+) AgentRuntime
-┌──────────────▼──────────────── :core:inference (pure Kotlin/JVM) ──────────────────────┐
-│ InferenceAdapter · TokenEngine · EngineInferenceAdapter (state machine, threading)     │
-│ Qwen3ChatTemplate · ThinkSplitter · Utf8StreamDecoder · ThreadPolicy · PromptFitter    │
-│ GgufFile · data types (LoadConfig, ModelInfo, GenerationRequest/Event/Stats, EngineState)│
-└──────────────▲─────────────────────────────────────────────────────────────────────────┘
-               │ implements TokenEngine
-┌──────────────┴──────── :engine:llamacpp (Android library + NDK) ───────────────────────┐
-│ LlamaCppEngine (Kotlin) → LlamaNative (JNI decls) → llama_jni.cpp → llama.cpp/ggml      │
-│ libllama.so · libggml*.so · libggml-cpu-android_armv*.so (runtime-selected CPU variant)│
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-third_party/llama.cpp (vendored, pinned b11609)   tools/host-harness (dev-only JVM smoke test)
-```
-
-## Modules
-
-| module | type | depends on | responsibility |
-|---|---|---|---|
-| `:core:inference` | Kotlin/JVM | coroutines | Engine-agnostic contracts + all logic that can be unit-tested without a phone |
-| `:engine:llamacpp` | Android lib + CMake | `:core:inference` | The only place that knows llama.cpp exists |
-| `:app` | Android app | both above | UI, model provisioning, lifecycle, DI |
-| `:tools:host-harness` | Kotlin/JVM (opt-in, `-PhostHarness`) | `:core:inference`, engine classes | Real-model smoke test on an ARM64/x86 Linux host |
-
-Reserved (commented in `settings.gradle.kts`), so later phases slot in without reshuffling:
-
-| future module | phase | notes |
-|---|---|---|
-| `:core:runtime` | 3–4 | Agent loop, tool registry, workflow executor. Pure Kotlin; talks only to `InferenceAdapter`. |
-| `:core:data` | 5 | Room DB: conversations, workflows, memory. `app` will swap its in-memory chat list for a repository. |
-| `:feature:workflow` | 6 | Visual node workflow builder (Compose). Depends on `:core:runtime` models, never on an engine. |
-
-Rule: **nothing above `:core:inference` may import from an `:engine:*` module** except the DI root (`OfflineAgentApp`).
-
-## Key contracts (`core/inference`)
-
-```kotlin
-interface InferenceAdapter {
-    val state: StateFlow<EngineState>          // Unloaded(reason) | Loading | Ready(model) | Generating | Failed
-    suspend fun load(config: LoadConfig): ModelInfo
-    fun generate(request: GenerationRequest): Flow<GenerationEvent>  // PromptProcessed, Token*, Completed(stats)
-    fun cancel()                               // Stop button; any thread
-    suspend fun unload(reason: UnloadReason)
-    suspend fun systemInfo(): String
-}
-interface TokenEngine {                        // what an engine binding provides; blocking, single-threaded
-    fun load(config): ModelInfo
-    fun beginCompletion(prompt, sampling, maxNewTokens): Int   // returns prompt tokens; reuses KV prefix
-    fun nextToken(): TokenStep                 // Piece(bytes) | End(reason)
-    fun requestAbort()                         // thread-safe
-    fun unload(); fun systemInfo(): String
-}
-```
-
-`EngineInferenceAdapter` turns any `TokenEngine` into an `InferenceAdapter`: it owns the state machine, the single engine
-dispatcher, the mutex, cancellation, prompt rendering (`PromptTemplate`), context-overflow trimming, UTF-8 reassembly and
-tokens/sec timing. That is why a fake engine is enough to unit-test nearly all behaviour.
-
-### State machine
+Phase 1 was the on-device inference layer. Phase 2 adds persistence, rich Markdown, the Intelligent-UI **Canvas**, local
+RAG, skills + an agent loop with tools, and image input. Everything still runs on the phone with **no INTERNET permission**.
 
 ```
-Unloaded ──load──▶ Loading ──ok──▶ Ready ──generate──▶ Generating ──done/stop/error──▶ Ready
-   ▲                  └──fail──▶ Failed ──load──▶ Loading                                 │
-   └──────────────────────────── unload(USER | LOW_MEMORY | SHUTDOWN) ◀────────────────────┘
+┌──────────────────────────────── :app (Compose M3) ─────────────────────────────────┐
+│ MainActivity (5 tabs + approval dialog + share/calendar intents)                    │
+│ Chat ─ ChatViewModel ─ MarkdownView · Canvas (UiComponents, CanvasPanel, charts)     │
+│ Docs (DocumentIndexer, Retriever) · Models (ModelStore, EngineController) · Settings │
+│ AgentService (runs, approvals, resume) · Ports: DocumentPort, CanvasPort, Memory…    │
+│ OfflineAgentApp = manual DI root                                                    │
+└──────┬─────────────────────┬───────────────────────────┬────────────────────────────┘
+       │                     │ :feature:workflow         │
+       │                     │ SkillsScreen, RunsScreen  │
+┌──────▼──────── :core:data (Android lib) ──────────────▼─┐
+│ Room: chats, messages(+ui json), canvas_versions, documents, chunks(+vectors), chunks_fts │
+│       (FTS4), skills, agent_runs, agent_steps, memory, notes, models · DataStore settings  │
+│ RoomRunStore (agent checkpoints)                                                        │
+└──────┬───────────────────────────────────────────────────────────────────────────────┘
+┌──────▼──────────────── :core:runtime (pure Kotlin/JVM, unit-tested) ───────────────────┐
+│ schema/  Schema (typed JSON-schema subset) → Gbnf (llama.cpp grammar) + validate()       │
+│ ui/      UiSchema v1, UiParser (validate/repair/fallback), UiSerializer, UiMarkdown,     │
+│          CanvasRouter (auto mode), CanvasPrompts, PartialJson (streaming preview)        │
+│ markdown/ Markdown parser (blocks+inlines), MathText (TeX→Unicode), SyntaxHighlighter    │
+│ rag/     Chunker, VectorMath, KeywordScorer (BM25-ish), HybridRanker, RagPrompt          │
+│ skills/  SkillParser (front matter), SkillMatcher, BuiltinSkills (resources/skills/*.md) │
+│ tools/   ToolSpec/Tool/ToolRegistry, PolicyEngine, built-in tools, Calculator            │
+│ agent/   AgentLoop (plan→act→validate→policy→execute→observe, checkpoints), InferenceAgentLlm │
+└──────┬───────────────────────────────────────────────────────────────────────────────┘
+┌──────▼──────── :core:inference (pure Kotlin) ───────┐   ┌──── :engine:llamacpp ─────────────────┐
+│ InferenceAdapter/TokenEngine, EngineInferenceAdapter │◀──│ LlamaCppEngine, LlamaEmbeddingEngine    │
+│ (grammar + images in GenerationRequest), templates,  │   │ llama_jni.cpp → llama.cpp b11609 + mtmd │
+│ EmbeddingService/EmbeddingEngine                     │   │ (grammar sampler, embeddings, images)   │
+└──────────────────────────────────────────────────────┘   └─────────────────────────────────────────┘
 ```
 
-## Threading
+Rules: nothing above `:core:inference` imports an `:engine:*` module except the DI root and `DeviceInfo`. `:core:runtime`
+has no Android dependency (all logic JVM-testable). The LLM **proposes**; Kotlin **validates and executes**.
 
-| thread | does |
+## Native layer (`engine/llamacpp/src/main/cpp/llama_jni.cpp`)
+
+| function | what |
 |---|---|
-| main | Compose only. Never calls into JNI. |
-| `llm-engine` (single, 16 MB stack) | every JNI call: load, tokenize, decode, sample, unload |
-| ggml worker threads (n_threads − 1) | matmuls inside `llama_decode`, spawned by ggml's threadpool |
-| `Dispatchers.IO` | SAF copy of the GGUF into internal storage |
-| any | `cancel()` → atomic flags (Kotlin + native) |
+| `nativeBegin(…, grammar, images, w, h)` | sampler chain + optional **GBNF grammar** sampler; text prompts reuse the KV prefix; prompts with images go through **libmtmd** (`mtmd_tokenize` + `mtmd_helper_eval_chunks`), after which the KV is marked dirty (next turn re-evaluates). |
+| `sample_token` | samples normally, checks the token against the grammar (cheap), and only on rejection masks the whole vocab with the grammar and resamples (llama.cpp `common` trick). |
+| `nativeAttachMmproj` | loads the vision projector for the loaded model (`mtmd_init_from_file`), `image_max_tokens = 512` (phone budget). |
+| `nativeApplyTemplate` | llama.cpp built-in chat templates for non-ChatML models (e.g. SmolVLM). |
+| `nativeLoadEmbedder / nativeEmbed` | separate model + context with `embeddings=true`, model's own pooling, L2-normalised output. |
 
-## Generation data flow
+Threads: `llm-engine` (chat/vision, single thread, all JNI), `embed-engine` (embeddings), ggml worker threads.
 
-1. `ChatScreen` → `MainViewModel.send()` builds `[system] + history + user` as `ChatMessage`s.
-2. `EngineInferenceAdapter.generate()` renders with `Qwen3ChatTemplate` (thinking on/off), on `llm-engine`.
-3. `llama_jni.cpp nativeBegin`: tokenize (parse special tokens) → find common prefix with KV mirror →
-   `llama_memory_seq_rm` the rest → `llama_decode` the suffix in 512-token batches (abortable).
-4. Loop `nativeNext`: sample (penalties → top-k → top-p → min-p → temp → dist) → EOG? stop : piece bytes → decode 1 token.
-5. Kotlin `Utf8StreamDecoder` joins partial multi-byte pieces; `ThinkSplitter` separates `<think>` from the answer.
-6. `GenerationEvent.Token` carries running tokens/sec; `Completed` carries `GenerationStats` (decode tok/s excludes prompt time).
+## Intelligent UI / Canvas
+
+1. **Routing** (`CanvasRouter`): composer toggle Auto / Chat / Canvas. Auto = deterministic keyword rules (table, chart,
+   compare, plan, checklist, quiz…) and “edit verbs” when the chat already has a canvas (→ update in place).
+2. **Generation**: system prompt lists the component catalogue (`UiSchema.promptCatalogue`), user prompt carries the
+   request (+ RAG passages, + current canvas JSON for updates). Sampling uses the grammar from
+   `Gbnf.of(UiSchema.docSchema())`: the model can only emit `{"v":1,"title":…,"blocks":[…]}` with known block types,
+   exact property names, enum values and bounded array sizes. Temperature 0.3, no repeat penalty.
+3. **Streaming**: every ~300 ms `PartialJson.close()` cuts the prefix back to the last closed object and the canvas shows
+   finished components while the rest streams.
+4. **Validation**: `UiParser` (trusted) validates each block against its schema, repairs safe things (ragged table rows,
+   chart series length, quiz answer index, missing simple fields), drops bad blocks with warnings, and returns
+   `Failure(fallbackMarkdown)` if nothing usable is left → shown as normal markdown.
+5. **Persistence + versions**: each successful canvas is a new row in `canvas_versions`; `chats.canvasVersion` points at the
+   current one. Undo/redo/history move the pointer; follow-ups create the next version from the *current* one.
+
+Components (v1): markdown, heading, callout, keyvalue, table, list, checklist, steps (timeline), chart (bar/line/pie drawn
+with Compose `Canvas` + `TextMeasurer`), code (highlighted, copy), flashcards (flip), quiz (scored), image (only photos the
+user attached, `attachment:N`), comparison grid, actions (buttons that send a follow-up prompt).
+
+## Markdown
+
+`core/runtime/markdown/Markdown.kt` parses headings, paragraphs, emphasis/strike, inline code, links (rendered, never
+opened), `[n]` citations (tappable), lists (nested, tasks), GFM tables (alignment), block quotes, fenced code (unterminated
+fences render as code while streaming), rules, `$…$`/`$$…$$` math (TeX → Unicode). The chat re-parses the text at most
+20×/s while streaming (≈<1 ms per parse).
+
+## Local RAG
+
+Import (SAF, multi-select) → text (PdfBox-Android for PDF page by page; UTF-8 for txt/md) → `Chunker` (≈900 chars, 150
+overlap, paragraph/sentence boundaries) → embeddings (active embedding model, `embed-engine` thread) → Room (`chunks.embedding`
+BLOB float32 LE) + FTS4 via Room triggers. Query: embed query → brute-force cosine over READY chunks (fine for a few
+thousand) blended 0.7/0.3 with keyword scores (`HybridRanker`); without an embedding model, FTS4 keyword search only.
+Top passages are injected as `[n] (title) text`; the answer's `[n]` become tappable source chips showing the passage.
+Indexing reports progress and can be cancelled (partial rows removed).
+
+## Skills + agent
+
+A **skill** is markdown with front matter (`id, name, description, triggers, tools, output, max_steps`) + instructions.
+Five built-ins ship in `core/runtime/src/main/resources/skills/`; users create/edit/import/enable/delete in the Skills tab
+(validated by `SkillParser`; unknown tools/components are dropped with warnings).
+
+`AgentLoop`:
+1. **Plan** (grammar `{"steps":[…≤5]}`) → shown in the chat card and stored as step 0.
+2. **Act**: each iteration samples one JSON action under a grammar that is a `oneOf` of `{thought, tool:"<name>", args:<that
+   tool's exact schema>}` for every *allowed* tool, plus `{thought, final}`. Until the first successful tool call, if the
+   plan/request names a tool, `final` is removed from the grammar (small models otherwise skip tools).
+3. **Validate** args with the same `Schema` (ranges, lengths, enums, unknown keys) → **Policy** (`PolicyEngine`):
+   read-only/UI → allow; WRITE_LOCAL (notes, memory) → ask unless “always allow”; EXTERNAL_INTENT (share sheet, calendar
+   insert) → ask every time; skill allow-list; side-effect budget 3/run. Approval dialog shows tool, effect and arguments.
+4. **Execute** with per-tool timeout → observation (truncated) → next iteration.
+5. Bounds: max iterations (min(skill.max_steps, 6)), 2 consecutive errors (fail only if nothing useful happened),
+   repeated identical call blocked, LLM timeout, coroutine cancellation (Stop button). A UI skill finishes when its
+   `render_ui` succeeds; if the model never renders, a **compose** step builds the canvas from the observations.
+6. **Checkpoint** after every step (`RoomRunStore`, one transaction). On restart the chat shows “Unfinished agent run —
+   Resume / Discard”; resume continues from the saved iteration with the saved observations (no re-planning).
+
+Tools: `search_docs`, `read_document`, `summarize`, `calculator`, `get_datetime`, `create_note`, `memory_read`,
+`memory_write`, `render_ui`, `canvas_update`, `share_text`, `create_calendar_event`. There is **no** tool that opens URLs,
+runs code or shell commands, or touches files outside the app.
+
+## Multimodal
+
+Input: photo picker (no permission) or camera via `ACTION_IMAGE_CAPTURE` + FileProvider (no CAMERA permission). Photos are
+copied/downscaled into app storage, decoded to RGB ≤768 px and passed to `nativeBegin`; the vision model (role VISION, with
+its mmproj) is loaded automatically when a message has a photo. Output: Canvas components (charts, tables, the attached
+photo via `image` blocks). No on-device image generation.
+
+## Persistence
+
+`offline-agent.db` (Room, WAL). Chats/messages/canvas versions survive restarts; the last open chat is restored. Settings in
+DataStore (`settings`). Model files in `filesDir/models/<role>/`, mmproj in `filesDir/models/mmproj/`, document text in
+`filesDir/docs/`, photos in `filesDir/attachments/`. Schema JSON exported to `core/data/schemas/` (version 1).
 
 ## Memory & lifecycle
 
-- One adapter per process (`OfflineAgentApp`). Model weights mmapped; KV cache f16 (≈ 224 MiB for Qwen3-0.6B at 2048 ctx: 28 layers × 8 KV heads × 128 dims × K+V × 2 bytes = 112 KiB per token).
-- `onTrimMemory(RUNNING_CRITICAL | ≥ BACKGROUND)` and `onLowMemory()` → `unload(LOW_MEMORY)`; UI shows a snackbar and a Load button.
-  `UI_HIDDEN` (brief app switch) does not unload.
-- Load failure → `EngineState.Failed(message)` shown inline on the Model screen with "Retry load".
-- `android:largeHeap` is set only to give the Java side headroom; native allocations are not limited by it.
-
-## Offline guarantee
-
-No `INTERNET` permission (explicitly removed in the manifest), no networking code, no cloud fallback. See DECISIONS D9 and
-DEVICE_TEST_PLAN §3 for the airplane-mode test.
+One chat/vision model in memory at a time (switching is automatic and costs a reload); the embedding model (tens of MB)
+is separate. `onTrimMemory`/`onLowMemory` unload the models unless an agent run or indexing job is active. Agent runs and
+indexing live in the application scope (they survive leaving the screen, not process death → resume).
