@@ -276,4 +276,13 @@ class ReportWriterTest {
         assertTrue(noCanvas is ToolResult.Error)
         assertNotNull(CreatePdfTool.safeFileName(""))
     }
+
+    @Test fun cleanSectionDropsRepeatedHeadingsButKeepsInlineBody() {
+        val w = ReportWriter(object : AgentLlm { override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int) = "" })
+        assertEquals("A solid record matters.\nMore.", w.cleanSection("2. **Build a Strong Academic Profile** A solid record matters.\nMore.", "2. Build a Strong Academic Profile"))
+        assertEquals("Building a network helps.", w.cleanSection("4. Network and Prepare: Building a network helps.", "4. Network and Prepare"))
+        assertEquals("Body.", w.cleanSection("## Skills\nBody.", "Skills"))
+        assertEquals("Body.", w.cleanSection("**Skills**\nBody.", "3. Skills"))
+        assertEquals("Unrelated first line.\nBody.", w.cleanSection("Unrelated first line.\nBody.", "Skills"))
+    }
 }

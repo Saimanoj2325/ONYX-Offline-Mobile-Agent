@@ -210,14 +210,20 @@ fun main(args: Array<String>): Unit = runBlocking {
         }
         val counter = TokenCounter { engine.countTokens(it) ?: TokenCounter.estimate(it) }
         val facts = listOf("My name is Sai and I study at CBIT in Hyderabad.", "My exam is on 12 November.", "I prefer Telugu movies.", "My laptop is a ThinkPad.")
-        val turns = facts.flatMapIndexed { i, f -> listOf(Turn(i * 2L + 1, Role.USER, f + " " + "Some extra chatter about the day. ".repeat(40)), Turn(i * 2L + 2, Role.ASSISTANT, "Noted. " + "Happy to help with that. ".repeat(30))) }
+        // Varied, realistic assistant replies (a copy-paste reply repeated 30x made the 1.7B model loop under greedy decoding).
+        val replies = listOf(
+            "Nice to meet you, Sai! CBIT is a good college. Tell me what you are working on and I will help you plan it.",
+            "Got it, your exam is on 12 November. We can make a revision timetable that leaves the last two days for practice papers.",
+            "Telugu movies, noted. If you want, I can suggest a few classics for a weekend break after the exam.",
+            "A ThinkPad is a solid choice for coding. Keep it updated and back up your notes regularly.")
+        val turns = facts.flatMapIndexed { i, f -> listOf(Turn(i * 2L + 1, Role.USER, f + " " + "Some extra chatter about the day. ".repeat(40)), Turn(i * 2L + 2, Role.ASSISTANT, replies[i])) }
         val cm = ContextManager(counter, summarizer, null, ContextConfig(summaryWords = 80))
         val t0 = System.nanoTime()
         val plan = cm.build("You are helpful.", turns, null, "When is my exam and where do I study?", contextLength = 2048, maxOutputTokens = 256)
         println("   summary (${ms(t0)} ms): ${plan.summary?.text?.take(300)}")
         check(plan.summaryChanged, "old turns were folded into a summary")
         check(plan.promptTokens <= plan.budget, "prompt fits the window (${plan.promptTokens}/${plan.budget})")
-        val ans = gen(plan.messages, 60, cache = false)
+        val ans = gen(plan.messages, 60, sampling = SamplingParams(seed = 42), cache = false) // app default sampling
         println("   answer: ${ans.text.trim().take(200)}")
         check(ans.text.contains("12") || ans.text.contains("November", true), "answer still knows the exam date from the summary/history")
     }

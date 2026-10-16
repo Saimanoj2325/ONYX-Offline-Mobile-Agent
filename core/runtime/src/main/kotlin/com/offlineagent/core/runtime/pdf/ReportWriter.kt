@@ -99,11 +99,22 @@ class ReportWriter(
         return "# ${outline.title}\n\n" + sb.toString().trim() + "\n"
     }
 
-    /** Drops a repeated heading line and chatter the model sometimes adds. */
+    /**
+     * Drops a repeated heading the model sometimes puts first ("## 2. Skills", "**Skills**", or inline as
+     * "2. **Skills** A solid record…" / "Skills: A solid record…"), keeping any body text that follows it on that line.
+     */
     fun cleanSection(text: String, heading: String): String {
         var t = text.trim()
         val first = t.lineSequence().firstOrNull()?.trim().orEmpty()
-        if (first.startsWith("#") || first.trim('*', ' ').equals(heading, ignoreCase = true)) t = t.substringAfter('\n', "").trim()
+        val rest = t.substringAfter('\n', "").trim()
+        fun norm(x: String) = x.replace(Regex("^\\s*(#+\\s*)?(\\d+[.)]\\s*)?"), "").replace("*", "").trim()
+        val h = norm(heading)
+        if (first.startsWith("#")) return rest
+        val f = norm(first)
+        if (h.isNotEmpty() && f.startsWith(h, ignoreCase = true)) {
+            val tail = f.substring(h.length).trimStart(':', ' ', '-', '—', '.')
+            t = if (tail.isBlank()) rest else (tail + if (rest.isNotEmpty()) "\n" + rest else "").trim()
+        }
         return t
     }
 
