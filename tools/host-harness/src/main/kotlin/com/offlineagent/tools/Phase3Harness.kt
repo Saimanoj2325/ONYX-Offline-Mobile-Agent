@@ -150,9 +150,13 @@ fun main(args: Array<String>): Unit = runBlocking {
     // ---------------------------------------------------------------- 3. long context needle
     if (want("long")) {
         val target = (System.getenv("LONG_TOKENS")?.toIntOrNull() ?: (ctx * 3 / 4))
-        println("\n== 3. Long context: ~$target-token document at ctx $ctx (q8_0 KV, flash attention)")
-        load(ctx, KvCacheType.Q8_0)
-        val filler = (1..4000).joinToString(" ") { i -> "Section $i of the logistics manual describes routine warehouse procedure number $i, inventory checks and safety drills." }
+        val longKv = System.getenv("LONG_KV")?.let { KvCacheType.valueOf(it) } ?: KvCacheType.Q8_0
+        println("\n== 3. Long context: ~$target-token document at ctx $ctx ($longKv KV, flash attention)")
+        load(ctx, longKv)
+        // Digit-free filler, so the only number in the document is the needle's code.
+        val topics = listOf("inventory checks", "safety drills", "loading dock rules", "visitor badges", "night shift handover", "fire exits",
+            "forklift training", "cold storage", "returns handling", "packing standards", "cleaning rota", "first aid kits")
+        val filler = (0 until 4000).joinToString(" ") { i -> "This part of the logistics manual explains ${topics[i % topics.size]} for the ${listOf("north", "south", "east", "west")[i % 4]} warehouse in plain language." }
         val words = filler.split(' ')
         var doc = ""; var n = 0
         val needle = "IMPORTANT: The locker code for the Hyderabad office is 4719."

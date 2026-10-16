@@ -49,10 +49,33 @@ Legend as above. "host" = verified with the real JNI bridge + real GGUF on the A
 - ✅ assembleDebug, no INTERNET permission, arm64 libs incl. libmtmd, 16 KB aligned
 - 📱 Everything UI/Android-side: DEVICE_TEST_PLAN §9–§16
 
+## Phase 3 — speed, long context, PDF, MCP, phone actions, form filling & automation (this delivery)
+
+- ✅ Context 8K/16K/32K + experimental 64K/128K (YaRN) with RAM-based Auto (16K on 8 GB); planner unit-tested; 📱 real RAM
+- ✅ KV cache F16/q8_0/q4_0, flash attention Auto/On/Off, mmap, warm-up, batch/ubatch presets, threads pinned to big cores — host: all KV types generate
+- ✅ Prompt-prefix KV cache in memory + on disk across reloads — host: reuse in memory and after reload
+- ✅ Speculative decoding with a draft model (Qwen3-0.6B) — host-checked (see verification file)
+- ✅ Context shifting past the window — host-checked
+- ✅ ContextManager: stable system prompt, rolling auto-summary, long-term memory paging (incremental embedding) — unit-tested + host
+- ✅ Token counter + memory estimate in Settings → Performance; max output up to 8192
+- ✅ Streaming UI throttled (≤20 updates/s), lazy services, baseline profile, R8 config for release
+- ✅ create_pdf tool + PDF layout engine (title page, TOC, headings, lists, tables, code, images, page numbers) — unit-tested + host PDF
+- ✅ PdfDocument renderer, MediaStore/SAF save, preview, share, chat/canvas export; Write-a-report skill (section by section) — 📱
+- ✅ MCP JSON-RPC client/server (tools, resources, prompts), McpHub → ToolRegistry, built-in servers — unit-tested
+- ✅ Binder/AIDL MCP transport (`:mcp-aidl`) + sample server app; Streamable HTTP/SSE transport only in `connected` flavor — HTTP unit-tested; 📱 binder
+- ✅ Offline flavor has no INTERNET (aapt verified); connected flavor adds INTERNET only
+- ✅ Phone actions: alarms/timers/reminders, calendar/contacts, apps/deep links, SMS/WhatsApp/email/call drafts, camera, flashlight, volume/ringer/DND, quick settings, device info, clipboard, SAF files, notifications — typed + approval-gated, Settings → Phone actions with permission groups — tools unit-tested with fakes; 📱 intents
+- ✅ Foreground service (specialUse) with Cancel for long runs / reports / automation — 📱
+- ✅ AutofillService + Keystore-encrypted profile vault (biometric/PIN unlock) — field mapping unit-tested; 📱
+- ✅ AccessibilityService screen agent (view tree + optional vision screenshot), overlay with steps / pause / stop / approve-before-submit — agent unit-tested + host on a fake form; 📱
+- ✅ Record/replay macros saved as skills, params, WorkManager schedules (never auto-submit) — unit-tested; 📱
+- ✅ Safety: CAPTCHA stop, OTP only from the user, banking/payment apps blocked by default, password fields untouched, action log, opt-in disclosure, kill switch — unit-tested policy
+- ✅ Docs: PHASE3.md (incl. Play policy notes), DEVICE_TEST_PLAN §17–§23, KNOWN_ISSUES §30+
+- 📱 Everything on a real 8 GB phone: speed, RAM, heat, 16K/32K, autofill/automation in real apps
+
 ## Later phases (re-planned)
 - ⬜ Visual node workflow builder (`:feature:workflow` graph editor, executor in `:core:runtime`)
-- ⬜ Foreground service for long agent runs / indexing; WorkManager indexing
-- ⬜ KV cache quantisation (q8_0 + flash-attn) for 8k context on 4–6 GB phones
+- ⬜ WorkManager-based document indexing (agent runs already use a foreground service)
 - ⬜ OCR for scanned PDFs; ANN index for very large libraries
 - ⬜ Canvas interactions persisted (checklist ticks, quiz progress) as new versions
 - ⬜ Release build (R8, signing), licences screen, instrumented UI/Room tests, benchmark screen

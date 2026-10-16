@@ -66,7 +66,7 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         if (handle != 0L) unload()
         val opts = intArrayOf(
             config.contextLength, config.threads, config.batchSize, config.ubatchSize, if (config.useMmap) 1 else 0,
-            config.kvCacheType.ggmlType, config.kvCacheType.ggmlType, config.flashAttention.native, config.ropeScaling.native,
+            config.kvCacheType.ggmlType, config.kvCacheType.vGgmlType, config.flashAttention.native, config.ropeScaling.native,
             config.yarnOriginalContext, config.pollLevel, if (config.warmup) 1 else 0,
         )
         val h = LlamaNative.nativeLoad(file.absolutePath, opts, floatArrayOf(0f), config.cpuIds.toIntArray())

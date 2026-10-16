@@ -21,7 +21,7 @@ data class ModelArch(
 ) {
     /** KV-cache bytes per token for K+V at [type]. */
     fun kvBytesPerToken(type: KvCacheType): Double =
-        layers.toDouble() * kvHeads * (keyLength + valueLength) * type.bytesPerElement
+        layers.toDouble() * kvHeads * (keyLength * type.kBytes + valueLength * type.vBytes)
 }
 
 /**

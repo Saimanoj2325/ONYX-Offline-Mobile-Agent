@@ -1,4 +1,4 @@
-# Known issues & limitations (Phase 2)
+# Known issues & limitations (Phase 2 + Phase 3)
 
 ## Not yet verified (needs a physical phone)
 1. **Nothing Android-side has run on a device.** The sandbox has no emulator/phone. Verified in sandbox: 79 JVM unit tests,
@@ -36,7 +36,7 @@
     half-indexed document is then marked FAILED/removed and must be imported again.
 
 ## Agent / skills
-15. Agent runs live in the application scope, not a foreground service: if Android kills the process mid-run, the run is
+15. *(Phase 3: long agent runs, reports and automation now run under a foreground service with Cancel.)* Agent runs live in the application scope: if Android kills the process mid-run, the run is
     checkpointed and offered for **Resume** at next launch, but a pending approval must be answered again.
 16. Only one generation at a time (chat, canvas or agent). Sending while an agent runs is blocked with a notice.
 17. Skill triggers only *suggest* a skill (chip above the composer); skills run when chosen (chip, + menu, /skill-id or
@@ -53,7 +53,7 @@
 23. Audio input (mtmd supports some audio models) is not wired up.
 
 ## Performance / memory
-24. Default context is now **4096** (Canvas and agent prompts are long): KV ≈ 448 MiB for Qwen3-0.6B/1.7B, ≈ 576 MiB for 4B.
+24. *(Superseded in Phase 3: context is Auto by RAM — 16K on 8 GB with q8_0 KV.)* Phase 2 default context was **4096** (Canvas and agent prompts are long): KV ≈ 448 MiB for Qwen3-0.6B/1.7B, ≈ 576 MiB for 4B.
     On 4 GB phones choose 2048 in Models → Settings.
 25. Debug APK is ~48 MB (un-minified Compose + Room + PdfBox resources + 7 CPU variants + libmtmd). Release with R8 will be much smaller.
 26. PdfBox-Android is pure Java: a 300-page PDF can take a minute to extract on a mid-range phone (progress + cancel shown).
@@ -63,3 +63,32 @@
     — the expected abort path.
 28. SmolVLM2 logs `control-looking token … was not control-type` at load — harmless model metadata warning.
 29. Links in answers are rendered but never opened (no browser intents); tapping copies the URL.
+
+## Phase 3 (speed, long context, PDF, MCP, phone actions, automation)
+30. **Still nothing verified on a phone.** Speed, RAM, heat/throttling, 16K/32K behaviour, autofill in real apps,
+    accessibility automation on real UIs, overlay, foreground service, WorkManager schedules, PdfDocument output,
+    MediaStore/SAF saving, binder MCP between two apps — all compile and are covered by JVM tests or the host harness
+    where possible, but need DEVICE_TEST_PLAN §17–§23.
+31. **Host numbers are not phone numbers.** The harness ran on 2 ARM64 server cores with Qwen3-1.7B **Q8_0** (the only
+    1.7B file in the sandbox); a phone with Q4_K_M and 4 big cores will differ (likely faster decode, similar or faster
+    prompt reading). See docs/verification/phase3-host-harness.txt.
+32. **Long prompts are slow on CPU.** Reading a full 16K window takes minutes on 2 cores (and likely 1–3 min on a phone).
+    The prompt-prefix cache, rolling summaries and memory paging exist so normal chats never re-read that much.
+33. **32K context** is allowed on 8 GB phones with a warning; **64K/128K** need YaRN (beyond Qwen3's 40K trained
+    context) and more RAM than an 8 GB phone can spare for a 1.7B model — the planner disables them there. Untested.
+34. **q4_0 KV was slower than q8_0** on the host (dequant cost on the CPU path) with only a small RAM saving at 4K; it is
+    offered for 32K on tight RAM, q8_0 stays the default.
+35. **Speculative decoding** only helps when the target is much bigger than the draft (e.g. Qwen3-4B/8B + 0.6B). With a
+    1.7B target on a CPU it can be slower; it is off by default and should be judged per phone (§18.8).
+36. **Screen agent quality depends on the model.** 1.7B can follow simple forms; complex apps (custom-drawn UIs,
+    WebViews without accessibility info, games) may fail. Vision screenshots need API 30+ and a vision model, and are slow.
+37. **Autofill** maps fields with hints/labels/rules (+ optional local LLM for unknown labels). Password, OTP, card,
+    CVV, Aadhaar/PAN fields are never filled. Some apps/browsers ignore third-party autofill datasets.
+38. **Banking/payment block list** is a known-package list + name heuristics; an unknown payment app could slip
+    through, so approval is still required before any pay/send/submit-like tap.
+39. **Accessibility service on Google Play**: `isAccessibilityTool=false`; a Play release needs the prominent disclosure
+    (implemented), the Accessibility declaration form, a privacy policy and Data-safety entries. Sideload builds only for now.
+40. **Connected flavor** allows cleartext HTTP so LAN MCP servers work; use HTTPS + a token for anything remote.
+41. **Binder MCP servers** must declare the `com.offlineagent.mcp.SERVER` action and hold/require
+    `com.offlineagent.permission.USE_MCP_SERVERS`; third-party tools always ask for approval.
+42. **Release build (R8 + baseline profile)** is configured but only the debug APKs were built and checked here.

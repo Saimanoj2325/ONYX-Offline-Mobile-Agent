@@ -11,10 +11,21 @@ class ImageData(val rgb: ByteArray, val width: Int, val height: Int) {
 data class ChatMessage(val role: Role, val content: String, val images: List<ImageData> = emptyList())
 
 /** KV-cache element type. ids are ggml_type values passed straight to llama.cpp. */
-enum class KvCacheType(val ggmlType: Int, val bytesPerElement: Double, val label: String) {
-    F16(1, 2.0, "f16 (largest, exact)"),
-    Q8_0(8, 34.0 / 32.0, "q8_0 (default: half the memory, ~lossless)"),
-    Q4_0(2, 18.0 / 32.0, "q4_0 (smallest, slight quality loss)"),
+/**
+ * KV cache precision. [ggmlType] is the K cache type, [vGgmlType] the V cache type. On ARM CPUs llama.cpp's flash
+ * attention has to dequantise a quantised V cache for every query, which made long prompts ~4x slower on the host
+ * (q8_0 K+V: 15 tok/s vs f16: 60 tok/s at 5-8K tokens); quantising only K keeps most of the speed and saves ~25 %.
+ */
+enum class KvCacheType(val ggmlType: Int, val vGgmlType: Int, val kBytes: Double, val vBytes: Double, val label: String) {
+    F16(1, 1, 2.0, 2.0, "f16 (largest, fastest prompt reading)"),
+    Q8K_F16V(8, 1, 34.0 / 32.0, 2.0, "q8_0 K + f16 V (balanced)"),
+    Q8_0(8, 8, 34.0 / 32.0, 34.0 / 32.0, "q8_0 (half the memory, ~lossless, slower long prompts)"),
+    Q4_0(2, 2, 18.0 / 32.0, 18.0 / 32.0, "q4_0 (smallest, slight quality loss)"),
+    ;
+    /** Average bytes per K/V element (for estimates that treat K and V alike). */
+    val bytesPerElement: Double get() = (kBytes + vBytes) / 2
+    val quantisedV: Boolean get() = vGgmlType != 1
+    val quantised: Boolean get() = ggmlType != 1 || vGgmlType != 1
 }
 
 enum class FlashAttention(val native: Int) { AUTO(-1), OFF(0), ON(1) }
