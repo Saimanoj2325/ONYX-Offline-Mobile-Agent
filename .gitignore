@@ -11,3 +11,11 @@ local.properties
 *.gguf
 captures/
 hs_err_pid*.log
+# native/host build outputs & caches
+**/cmake-build-*/
+**/CMakeFiles/
+CMakeCache.txt
+*.so
+*.o
+*.a
+/out/
