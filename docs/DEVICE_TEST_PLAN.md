@@ -1,4 +1,4 @@
-# Device test plan (Sai's phone) — Phase 1 + Phase 2
+# Device test plan (Sai's phone) — Phase 1 + Phase 2 + Phase 3
 
 Everything below needs a real phone; the sandbox could not run Android. Note results in the table at the end and send
 back `adb logcat` snippets for anything that fails.
@@ -150,6 +150,74 @@ back `adb logcat` snippets for anything that fails.
 |---|---|---|
 | 16.1 | Qwen3-1.7B, context 4096: watch RAM (Developer options → Memory) during a canvas | Record peak |
 | 16.2 | Background the app during a run | Run continues or is resumable; no crash |
+
+## 17. Phase 3 — install both builds
+
+| # | Step | Expected |
+|---|---|---|
+| 17.1 | Install `offline-agent-phase3-offline-debug.apk` (package `com.offlineagent.app`, upgrades Phase 2 in place) | Opens; old chats still there (DB migration) |
+| 17.2 | Optional: install `…-connected-debug.apk` (package `com.offlineagent.app.connected`, separate app) | Both apps coexist |
+| 17.3 | Settings → Apps → Offline Agent → Permissions on the offline build | No "Network access" listed |
+
+## 18. Long context & speed (8 GB phone, Qwen3-1.7B Q4_K_M recommended)
+
+| # | Step | Expected |
+|---|---|---|
+| 18.1 | Settings → Performance | Shows RAM class "8 GB", Auto = 16K, memory estimate per size, 64K/128K disabled or marked experimental |
+| 18.2 | Auto (16K), q8_0 KV, flash attention Auto; ask a short question | Record prompt tok/s and gen tok/s from the stats line |
+| 18.3 | Same with q4_0 KV and with F16 KV | Note speed + RAM differences (host: q4_0 was slower) |
+| 18.4 | Paste a ~10K-token text (e.g. a long article) and ask a question about its middle | Correct answer; record time to first token and peak RAM |
+| 18.5 | Kill the app, reopen, ask anything | First answer noticeably faster than a cold first answer (prompt-prefix cache from disk) |
+| 18.6 | Long chat (> 40 turns) | "Summarising older messages…" appears once in a while; the chat keeps working; earlier facts recalled via memory |
+| 18.7 | Max answer 8192, ask for a long essay | Keeps writing past the window (context shift) without crashing |
+| 18.8 | With Qwen3-4B as chat model, enable speculative decoding with Qwen3-0.6B | Record gen tok/s with/without; keep whichever is faster |
+| 18.9 | 32K context | Works but first answer of a long chat is slow; watch heat and RAM (record) |
+| 18.10 | 10 minutes continuous use | Record temperature feel / throttling (tok/s drop) |
+
+## 19. PDF
+
+| # | Step | Expected |
+|---|---|---|
+| 19.1 | "Write a 4-page report on solar energy in India as a PDF" (Write report skill) | Notification with progress + Cancel; PDF has title page, headings, lists, a table, page numbers |
+| 19.2 | Open the PDF preview, Share, Save as… | Preview pages render; share sheet; file saved where picked |
+| 19.3 | Canvas → Export PDF; chat menu → Export chat as PDF | Both produce readable PDFs in Downloads/OfflineAgent |
+
+## 20. MCP
+
+| # | Step | Expected |
+|---|---|---|
+| 20.1 | Settings → MCP servers | Built-in servers listed (files, notes, clipboard, calendar/contacts, share, phone groups) |
+| 20.2 | Install `mcp-server-sample-debug.apk` ("MCP Study Tools"), Scan again, Connect | Its tools appear; calling one asks for approval |
+| 20.3 | Connected build only: add a LAN Streamable-HTTP MCP server URL | Connects; tools listed; offline build shows "not available" |
+
+## 21. Phone actions (enable each group in Settings → Phone actions)
+
+| # | Step | Expected |
+|---|---|---|
+| 21.1 | "Set an alarm for 6:30 am", "timer 5 minutes", "remind me at 9 pm to call home" | Approval → Clock app alarm/timer; reminder notification fires |
+| 21.2 | "What's on my calendar tomorrow?", "find Ravi's number" (grant permissions) | Correct data; nothing leaves the phone |
+| 21.3 | "Open YouTube", "draft a WhatsApp to +91… saying I'm late", "email draft to …" | App opens / draft prefilled; you press Send |
+| 21.4 | Flashlight on/off, volume 30 %, DND on, battery/storage info, clipboard read | Works; DND asks for access first |
+| 21.5 | Grant a folder; "find PDFs about internships in my folder and move them to a new folder Applications" | Approval per change; files moved |
+| 21.6 | Notification access on; "summarise my notifications" | Summary; nothing stored |
+
+## 22. Form filling & automation
+
+| # | Step | Expected |
+|---|---|---|
+| 22.1 | Settings → Profile: fill name, email, phone, college, CGPA, LinkedIn; Save | Saved encrypted; asks fingerprint/PIN to unlock later |
+| 22.2 | Make Offline Agent the autofill service; open a Google Form / internship form in Chrome | Autofill suggestion "Fill from Offline Agent profile" → unlock → fields filled; password/OTP/card fields left empty |
+| 22.3 | Enable screen automation (read the disclosure); in chat: "fill this internship form in Chrome" with the form open | Overlay shows steps; Pause/Stop work; asks approval before Submit |
+| 22.4 | Open a banking/UPI app and ask the agent to tap something | Refused (blocked by default) |
+| 22.5 | A page with a CAPTCHA | Agent stops and asks you to solve it |
+| 22.6 | OTP field | Agent asks you for the code; types it only if you give it |
+| 22.7 | Record a macro (e.g. open an app and search a fixed term), save, mark the term as a value, run by name; schedule daily | Replays; scheduled run never presses submit/pay/send |
+| 22.8 | Settings → Automation → action log; "Stop everything"; turn the service off | Every step logged; everything stops |
+
+## 23. Phase 3 results to record
+
+Phone model / SoC / RAM; 16K prompt tok/s, gen tok/s, peak RAM; 32K feasible?; heat after 10 min; autofill works in
+Chrome + one app; screen agent success on one real form; any crash logs (§8).
 
 ## 8. Logs to send back if something fails
 
