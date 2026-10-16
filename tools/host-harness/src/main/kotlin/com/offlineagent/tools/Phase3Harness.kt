@@ -157,7 +157,9 @@ fun main(args: Array<String>): Unit = runBlocking {
         val topics = listOf("inventory checks", "safety drills", "loading dock rules", "visitor badges", "night shift handover", "fire exits",
             "forklift training", "cold storage", "returns handling", "packing standards", "cleaning rota", "first aid kits")
         val filler = (0 until 4000).joinToString(" ") { i -> "This part of the logistics manual explains ${topics[i % topics.size]} for the ${listOf("north", "south", "east", "west")[i % 4]} warehouse in plain language." }
-        val words = filler.split(' ')
+        // HAYSTACK=<text file>: use real, varied prose (e.g. the project docs) instead of the repetitive filler.
+        val hay = System.getenv("HAYSTACK")?.let { File(it).readText().replace(Regex("\\s+"), " ").trim() }
+        val words = if (hay != null) generateSequence { hay.split(' ') }.take(20).flatten().toList() else filler.split(' ')
         var doc = ""; var n = 0
         val needle = "IMPORTANT: The locker code for the Hyderabad office is 4719."
         val sb = StringBuilder()

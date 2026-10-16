@@ -151,8 +151,8 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
     val chatModel = models.firstOrNull { it.role == ModelRole.CHAT.name && it.active }
     val plan = remember(chatModel?.path, s.ubatchSize) { app.engineController.planFor(chatModel?.path, s) }
     val arch = remember(chatModel?.path) { chatModel?.path?.let { app.engineController.archOf(it) } }
-    val kv = runCatching { KvCacheType.valueOf(s.kvCache) }.getOrDefault(KvCacheType.Q8_0)
     val ctx = app.engineController.effectiveContext(s, plan)
+    val kv = app.engineController.kvFor(s, chatModel?.path, ctx)
     fun upd(f: (AppSettings) -> AppSettings) = scope.launch { app.settings.update(f) }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -166,7 +166,7 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             FilterChip(selected = s.contextLength == 0, onClick = { upd { it.copy(contextLength = 0) } }, label = { Text("Auto (${plan.recommendedContext / 1024}K)") })
         }
         items(plan.options) { o ->
-            val est = arch?.let { ContextPlanner.estimate(it, o.tokens, kv, s.ubatchSize) } ?: o.estimate
+            val est = arch?.let { ContextPlanner.estimate(it, o.tokens, if (s.kvCache == "AUTO") ContextPlanner.kvFor(DeviceInfo.totalRamBytes(), it, o.tokens, s.ubatchSize) else kv, s.ubatchSize) } ?: o.estimate
             val selected = s.contextLength == o.tokens
             Card(Modifier.fillMaxWidth().clickable(enabled = !o.blocked && (!o.needsYarn || s.yarn)) { upd { it.copy(contextLength = o.tokens) } },
                 colors = if (selected) CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer) else CardDefaults.cardColors()) {
@@ -183,11 +183,12 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             SwitchRow("YaRN rope scaling (experimental)", "Stretches the model beyond its trained context (64K/128K). Quality and speed on phones are untested.", s.yarn) { v -> upd { it.copy(yarn = v) } }
             Section("KV cache precision")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = s.kvCache == "AUTO", onClick = { upd { it.copy(kvCache = "AUTO") } }, label = { Text("Auto (now ${kv.name.lowercase()})") })
                 KvCacheType.entries.forEach { t ->
-                    FilterChip(selected = kv == t, onClick = { upd { it.copy(kvCache = t.name) } }, label = { Text(t.label) })
+                    FilterChip(selected = s.kvCache == t.name, onClick = { upd { it.copy(kvCache = t.name) } }, label = { Text(t.label) })
                 }
             }
-            Text("q8_0 halves KV memory with no visible quality loss (default). q4_0 quarters it, slightly lower quality. Quantised KV needs flash attention.", style = MaterialTheme.typography.bodySmall)
+            Text("Auto uses f16 when it fits (prompts are read ~3x faster on phone CPUs) and q8_0 for windows that would not fit otherwise. q8_0 halves KV memory with no visible quality loss; q4_0 quarters it, slightly lower quality. Quantised KV needs flash attention.", style = MaterialTheme.typography.bodySmall)
             Section("Speed")
             Text("Flash attention", style = MaterialTheme.typography.bodyLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("AUTO", "ON", "OFF").forEach { v -> FilterChip(selected = s.flashAttention == v, onClick = { upd { it.copy(flashAttention = v) } }, label = { Text(v.lowercase()) }) } }

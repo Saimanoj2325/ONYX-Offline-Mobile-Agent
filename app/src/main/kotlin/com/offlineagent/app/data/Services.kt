@@ -100,6 +100,12 @@ class EngineController(
         com.offlineagent.core.inference.ContextPlanner.plan(DeviceInfo.totalRamBytes(), path?.let { archOf(it) }, s.ubatchSize)
             .also { if (path != null) _plan.value = it }
 
+    /** Effective KV precision: the user's choice, or Auto = f16 when it fits in RAM at [ctx], else q8_0. */
+    fun kvFor(s: AppSettings, modelPath: String?, ctx: Int): com.offlineagent.core.inference.KvCacheType =
+        runCatching { com.offlineagent.core.inference.KvCacheType.valueOf(s.kvCache) }.getOrNull()
+            ?: modelPath?.let { archOf(it) }?.let { com.offlineagent.core.inference.ContextPlanner.kvFor(DeviceInfo.totalRamBytes(), it, ctx, s.ubatchSize) }
+            ?: com.offlineagent.core.inference.KvCacheType.Q8_0
+
     /** Effective context: the user's choice, or the RAM-based default. */
     fun effectiveContext(s: AppSettings, plan: com.offlineagent.core.inference.ContextPlan) = if (s.contextLength > 0) s.contextLength else plan.recommendedContext
 
@@ -111,7 +117,7 @@ class EngineController(
         val plan = planFor(model.path, s)
         val ctx = effectiveContext(s, plan)
         val trained = archOf(model.path)?.trainedContext ?: 0
-        val kv = runCatching { com.offlineagent.core.inference.KvCacheType.valueOf(s.kvCache) }.getOrDefault(com.offlineagent.core.inference.KvCacheType.Q8_0)
+        val kv = kvFor(s, model.path, ctx)
         val fa = runCatching { com.offlineagent.core.inference.FlashAttention.valueOf(s.flashAttention) }.getOrDefault(com.offlineagent.core.inference.FlashAttention.AUTO)
         val draft = if (s.speculative && role == ModelRole.CHAT) models.active(ModelRole.DRAFT)?.path?.takeIf { it != model.path } else null
         val yarn = s.yarn && trained > 0 && ctx > trained

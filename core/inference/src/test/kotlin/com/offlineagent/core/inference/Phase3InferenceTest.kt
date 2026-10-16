@@ -61,7 +61,9 @@ class GgufAndContextPlannerTest {
         assertEquals(RamTier.SMALL, ContextPlanner.tier((3.7 * gb).toLong()))
         val p8 = ContextPlanner.plan((7.4 * gb).toLong(), qwen17)
         assertEquals(16384, p8.recommendedContext)
-        assertEquals(KvCacheType.Q8_0, p8.recommendedKv)
+        // f16 KV (fastest on CPU) fits at 16K for a 1.7B Q4 model on an 8 GB phone; 32K needs q8_0.
+        assertEquals(KvCacheType.F16, p8.recommendedKv)
+        assertEquals(KvCacheType.Q8_0, ContextPlanner.kvFor((7.4 * gb).toLong(), qwen17, 32768))
         assertEquals(8192, p8.maxOutputTokens)
         val o32 = p8.options.first { it.tokens == 32768 }
         assertFalse(o32.blocked); assertNotNull(o32.warning); assertFalse(o32.needsYarn)
@@ -93,6 +95,16 @@ class GgufAndContextPlannerTest {
     @Test fun loadConfigAllowsLongContext() {
         LoadConfig("/x", contextLength = 131072, kvCacheType = KvCacheType.Q4_0, ropeScaling = RopeScaling.YARN)
         try { LoadConfig("/x", contextLength = 262144); throw AssertionError("accepted") } catch (e: IllegalArgumentException) { }
+    }
+    @Test fun autoKvFallsBackToQ8ForBigModelsAndQ4OnTinyPhones() {
+        val gb = 1024L * 1024 * 1024
+        val qwen4b = ModelArch("qwen3", 36, 8, 32, 2560, 128, 128, 40960, 151936, 2_500_000_000L)
+        assertEquals(KvCacheType.Q8_0, ContextPlanner.kvFor((7.4 * gb).toLong(), qwen4b, 16384))
+        assertEquals(KvCacheType.Q8_0, ContextPlanner.plan((7.4 * gb).toLong(), qwen4b).recommendedKv)
+        assertEquals(KvCacheType.Q4_0, ContextPlanner.kvFor((2.8 * gb).toLong(), qwen17, 2048))
+        // Mixed K/V types are accounted separately.
+        assertEquals(114688.0, qwen17.kvBytesPerToken(KvCacheType.F16), 0.1)
+        assertTrue(qwen17.kvBytesPerToken(KvCacheType.Q4_0) < qwen17.kvBytesPerToken(KvCacheType.Q8_0))
     }
 }
 
@@ -154,4 +166,5 @@ class AdapterPhase3Test {
         assertTrue(Qwen3ChatTemplate.render(m, false).startsWith(p))
         assertNull(Qwen3ChatTemplate.systemPrefix(listOf(ChatMessage(Role.USER, "x"))))
     }
+
 }

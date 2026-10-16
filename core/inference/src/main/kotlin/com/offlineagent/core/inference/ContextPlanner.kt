@@ -182,9 +182,8 @@ object ContextPlanner {
         val tier = tier(totalRamBytes)
         val budget = (totalRamBytes * APP_RAM_FRACTION).toLong()
         val trained = arch?.trainedContext?.takeIf { it > 0 } ?: 32768
-        val kvDefault = if (tier == RamTier.TINY) KvCacheType.Q4_0 else KvCacheType.Q8_0
         val options = STEPS.map { ctx ->
-            val est = arch?.let { estimate(it, ctx, kvDefault, ubatch) }
+            val est = arch?.let { estimate(it, ctx, kvFor(totalRamBytes, it, ctx, ubatch), ubatch) }
             val yarn = ctx > trained
             val tooBig = est != null && est.totalBytes > budget
             val warning = when {
@@ -200,11 +199,23 @@ object ContextPlanner {
         var rec = defaultContext(tier).coerceAtMost(trained)
         // Never recommend something that does not fit.
         while (rec > 2048 && options.firstOrNull { it.tokens == rec }?.blocked == true) rec /= 2
+        val kvDefault = arch?.let { kvFor(totalRamBytes, it, rec, ubatch) } ?: if (tier == RamTier.TINY) KvCacheType.Q4_0 else KvCacheType.Q8_0
         return ContextPlan(tier, rec, kvDefault, maxOutputTokens(tier), options)
+    }
+
+    /**
+     * "Auto" KV precision for [ctx] tokens: f16 (fastest prompt reading on CPU) when the whole estimate stays within
+     * [F16_HEADROOM] of the app's RAM budget, otherwise q8_0 (half the KV memory); q4_0 only on < 4 GB phones.
+     */
+    fun kvFor(totalRamBytes: Long, arch: ModelArch, ctx: Int, ubatch: Int = 512): KvCacheType {
+        if (tier(totalRamBytes) == RamTier.TINY) return KvCacheType.Q4_0
+        val budget = totalRamBytes * APP_RAM_FRACTION
+        return if (estimate(arch, ctx, KvCacheType.F16, ubatch, flashAttention = true).totalBytes <= budget * F16_HEADROOM) KvCacheType.F16 else KvCacheType.Q8_0
     }
 
     fun gb(b: Long) = "%.1f GB".format(b / (1024.0 * 1024 * 1024))
 
     const val APP_RAM_FRACTION = 0.55
+    const val F16_HEADROOM = 0.8
     const val OVERHEAD = 180L * 1024 * 1024
 }

@@ -104,8 +104,8 @@ data class AppSettings(
     val alwaysAllowedTools: Set<String> = emptySet(),
     val lastChatId: Long = 0,
     // ---- Phase 3: performance & long context
-    /** KV cache precision: F16 | Q8_0 | Q4_0 */
-    val kvCache: String = "Q8_0",
+    /** KV cache precision: AUTO (f16 when it fits, else q8_0) | F16 | Q8_0 | Q4_0 */
+    val kvCache: String = "AUTO",
     /** AUTO | ON | OFF */
     val flashAttention: String = "AUTO",
     val batchSize: Int = 512,
@@ -181,7 +181,7 @@ class SettingsRepository(context: Context) {
         useDocuments = p[K.useDocs] ?: true,
         alwaysAllowedTools = p[K.allowed] ?: emptySet(),
         lastChatId = p[K.lastChat]?.toLongOrNull() ?: 0,
-        kvCache = p[K.kv] ?: "Q8_0", flashAttention = p[K.fa] ?: "AUTO", batchSize = p[K.batch] ?: 512, ubatchSize = p[K.ubatch] ?: 512,
+        kvCache = p[K.kv] ?: "AUTO", flashAttention = p[K.fa] ?: "AUTO", batchSize = p[K.batch] ?: 512, ubatchSize = p[K.ubatch] ?: 512,
         maxOutputTokens = p[K.maxOut] ?: 0, yarn = p[K.yarn] ?: false, speculative = p[K.spec] ?: false, draftTokens = p[K.draftTokens] ?: 6,
         prefixCache = p[K.prefix] ?: true, keepWarm = p[K.warm] ?: true, autoSummarize = p[K.summarize] ?: true, longTermMemory = p[K.ltm] ?: true,
         pollLevel = p[K.poll] ?: 50, phoneGroups = p[K.groups] ?: AppSettings.DEFAULT_PHONE_GROUPS,
