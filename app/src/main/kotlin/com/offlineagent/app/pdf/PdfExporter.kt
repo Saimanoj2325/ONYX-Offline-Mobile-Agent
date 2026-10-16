@@ -92,7 +92,7 @@ class PdfExporter(private val ctx: Context, private val chats: ChatDao) : PdfPor
         val id = chatId ?: return null
         val chat = chats.chat(id) ?: return null
         val json = chats.canvasVersion(id, chat.canvasVersion)?.docJson ?: return null
-        val doc = (UiParser.parse(json) as? UiParseResult.Ok)?.doc ?: return null
+        val doc = (UiParser.parse(json) as? UiParseResult.Success)?.doc ?: return null
         return doc.title to PdfContent.fromCanvas(doc, ::imageResolver)
     }
 
