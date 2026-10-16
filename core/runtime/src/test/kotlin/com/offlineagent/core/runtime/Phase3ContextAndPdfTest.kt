@@ -284,5 +284,7 @@ class ReportWriterTest {
         assertEquals("Body.", w.cleanSection("## Skills\nBody.", "Skills"))
         assertEquals("Body.", w.cleanSection("**Skills**\nBody.", "3. Skills"))
         assertEquals("Unrelated first line.\nBody.", w.cleanSection("Unrelated first line.\nBody.", "Skills"))
+        // A sentence that merely starts with the heading words is kept intact.
+        assertEquals("Research and Self-Assessment is a crucial first step.", w.cleanSection("Research and Self-Assessment is a crucial first step.", "Research and Self-Assessment"))
     }
 }

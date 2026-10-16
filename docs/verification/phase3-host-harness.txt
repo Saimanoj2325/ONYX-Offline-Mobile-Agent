@@ -1,0 +1,276 @@
+Phase 3 host harness — real JNI bridge + llama.cpp b11609 (KleidiAI-enabled CPU variants) on an ARM64 Linux sandbox
+Host: 2 vCPU (aarch64, NEON/DOTPROD/FP16, no i8mm), 7.9 GB RAM, THREADS=2. Model: Qwen3-1.7B **Q8_0** (1.83 GB) — the
+only 1.7B file in the sandbox; draft model Qwen3-0.6B Q8_0. These are NOT phone numbers (see KNOWN_ISSUES §31).
+Generated 2026-10-16 from the logs below (h3b, kv4k_*, kv5k_*, h3rest, h3sumpdf, h3long16k).
+
+===== 1-2. speed by KV type (ctx 4096) + prompt-prefix cache (ctx 16384, q8_0)  [h3b]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.1 GB (KV 0.1 GB)
+     4096 tokens: 2.2 GB (KV 0.2 GB)
+     8192 tokens: 2.4 GB (KV 0.5 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 1. Speed by KV-cache type (ctx 4096, greedy, 96 new tokens)
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=1/1 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=F16 draft=false canShift=true in 18434 ms
+   kv=F16                             TTFT    275 ms | prompt    37 tok @  180.5 tok/s | decode   33 tok @ 28.70 tok/s | prefix=-1 shifts=0
+  PASS generation works with KV F16
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q8_0 draft=false canShift=true in 8600 ms
+   kv=Q8_0                            TTFT    236 ms | prompt    37 tok @  186.9 tok/s | decode   35 tok @ 26.60 tok/s | prefix=-1 shifts=0
+  PASS generation works with KV Q8_0
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=2/2 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q4_0 draft=false canShift=true in 8919 ms
+   kv=Q4_0                            TTFT    454 ms | prompt    37 tok @   96.9 tok/s | decode   27 tok @ 14.02 tok/s | prefix=-1 shifts=0
+  PASS generation works with KV Q4_0
+
+== 2. Prompt-prefix KV cache (system prompt ~1660 tokens)
+[OfflineAgentLlama] Model loaded: ctx=16384 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=16384 kv=Q8_0 draft=false canShift=true in 14797 ms
+   cold (evaluate + save)             TTFT  26053 ms | prompt  1534 tok @   59.3 tok/s | decode   24 tok @  6.41 tok/s | prefix=2 shifts=0
+   warm (KV already holds prefix)     TTFT    920 ms | prompt  1529 tok @ 1864.6 tok/s | decode   24 tok @  9.98 tok/s | prefix=0 shifts=0
+[OfflineAgentLlama] Model loaded: ctx=16384 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=16384 kv=Q8_0 draft=false canShift=true in 12433 ms
+   after reload (loaded from disk)    TTFT   1688 ms | prompt  1529 tok @  962.8 tok/s | decode   24 tok @  9.20 tok/s | prefix=1 shifts=0
+  PASS cold run evaluated and saved the prefix (state=2)
+  PASS second run reused the in-memory prefix
+  PASS after reload the prefix KV was loaded from disk
+  PASS first token after reload is faster than cold (1688 vs 26053 ms)
+   prefix cache files: eed226ad… 89631 KB
+
+== 3. Long context: ~12288-token document at ctx 16384 (q8_0 KV, flash attention)
+[OfflineAgentLlama] Model loaded: ctx=16384 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=16384 kv=Q8_0 draft=false canShift=true in 13103 ms
+
+===== KV precision vs long-prompt speed (kv4k_F16; needle answers wrong here because of the old repetitive numbered filler / digit-free filler, see text)  [kv4k_F16]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.1 GB (KV 0.1 GB)
+     4096 tokens: 2.2 GB (KV 0.2 GB)
+     8192 tokens: 2.4 GB (KV 0.5 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 3. Long context: ~4000-token document at ctx 8192 (F16 KV, flash attention)
+[OfflineAgentLlama] Model loaded: ctx=8192 batch=512 ubatch=512 threads=2 mmap=1 kv=1/1 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=8192 kv=F16 draft=false canShift=true in 10738 ms
+   needle @ 5687 doc tokens           TTFT  95690 ms | prompt  5733 tok @   60.0 tok/s | decode    3 tok @  7.59 tok/s | prefix=-1 shifts=0
+  FAIL found the needle in a 5687-token prompt (answer: 123)
+  PASS prompt really was long (5733 tokens)
+
+== FAILURES: 1
+   - found the needle in a 5687-token prompt (answer: 123)
+EXIT=1 Fri Oct 16 18:44:02 UTC 2026
+
+===== KV precision vs long-prompt speed (kv4k_Q8_0; needle answers wrong here because of the old repetitive numbered filler / digit-free filler, see text)  [kv4k_Q8_0]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.1 GB (KV 0.1 GB)
+     4096 tokens: 2.2 GB (KV 0.2 GB)
+     8192 tokens: 2.4 GB (KV 0.5 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 3. Long context: ~4000-token document at ctx 8192 (Q8_0 KV, flash attention)
+[OfflineAgentLlama] Model loaded: ctx=8192 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=8192 kv=Q8_0 draft=false canShift=true in 10013 ms
+   needle @ 5687 doc tokens           TTFT 287183 ms | prompt  5733 tok @   20.0 tok/s | decode    4 tok @  9.48 tok/s | prefix=-1 shifts=0
+  FAIL found the needle in a 5687-token prompt (answer: 8719)
+  PASS prompt really was long (5733 tokens)
+
+== FAILURES: 1
+   - found the needle in a 5687-token prompt (answer: 8719)
+EXIT=1 Fri Oct 16 18:49:00 UTC 2026
+
+===== KV precision vs long-prompt speed (kv5k_Q8K_F16V; needle answers wrong here because of the old repetitive numbered filler / digit-free filler, see text)  [kv5k_Q8K_F16V]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.1 GB (KV 0.1 GB)
+     4096 tokens: 2.2 GB (KV 0.2 GB)
+     8192 tokens: 2.4 GB (KV 0.5 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 3. Long context: ~5000-token document at ctx 16384 (Q8K_F16V KV, flash attention)
+[OfflineAgentLlama] Model loaded: ctx=16384 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=16384 kv=Q8K_F16V draft=false canShift=true in 10142 ms
+   needle @ 6510 doc tokens           TTFT 314239 ms | prompt  6556 tok @   20.9 tok/s | decode    2 tok @  7.07 tok/s | prefix=-1 shifts=0
+  FAIL found the needle in a 6510-token prompt (answer: 9.)
+  FAIL prompt really was long (6556 tokens)
+
+== FAILURES: 2
+   - found the needle in a 6510-token prompt (answer: 9.)
+   - prompt really was long (6556 tokens)
+EXIT=1 Fri Oct 16 18:57:10 UTC 2026
+
+===== KV precision vs long-prompt speed (kv5k_F16; needle answers wrong here because of the old repetitive numbered filler / digit-free filler, see text)  [kv5k_F16]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.1 GB (KV 0.1 GB)
+     4096 tokens: 2.2 GB (KV 0.2 GB)
+     8192 tokens: 2.4 GB (KV 0.5 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 3. Long context: ~5000-token document at ctx 16384 (F16 KV, flash attention)
+[OfflineAgentLlama] Model loaded: ctx=16384 batch=512 ubatch=512 threads=2 mmap=1 kv=1/1 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=16384 kv=F16 draft=false canShift=true in 10003 ms
+   needle @ 6510 doc tokens           TTFT 122043 ms | prompt  6556 tok @   53.8 tok/s | decode    3 tok @ 10.27 tok/s | prefix=-1 shifts=0
+  FAIL found the needle in a 6510-token prompt (answer: 819)
+  FAIL prompt really was long (6556 tokens)
+
+== FAILURES: 2
+   - found the needle in a 6510-token prompt (answer: 819)
+   - prompt really was long (6556 tokens)
+EXIT=1 Fri Oct 16 18:59:23 UTC 2026
+
+===== 4-9. context shift, speculative decoding, summary (old version), phone tools, screen agent, report PDF  [h3rest]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.2 GB (KV 0.2 GB)
+     4096 tokens: 2.5 GB (KV 0.4 GB)
+     8192 tokens: 3.1 GB (KV 0.9 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 4. Context shifting (ctx 1024, generate 1400 tokens)
+[OfflineAgentLlama] Model loaded: ctx=1024 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=1024 kv=Q8_0 draft=false canShift=true in 10203 ms
+[OfflineAgentLlama] context shift: discarded 506 tokens (keep=11, now 517)
+   shift run                          TTFT    548 ms | prompt    47 tok @  106.8 tok/s | decode 1400 tok @ 19.52 tok/s | prefix=-1 shifts=1
+  PASS window slid 1x instead of stopping at the context limit
+  PASS generated past the context size (1400 tokens)
+
+== 5. Speculative decoding (target Qwen3-1.7B-Q8_0.gguf, draft Qwen3-0.6B-Q8_0.gguf, 6 draft tokens, greedy)
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q8_0 draft=false canShift=true in 8431 ms
+   target only                        TTFT    230 ms | prompt    40 tok @  205.1 tok/s | decode  160 tok @ 29.26 tok/s | prefix=-1 shifts=0
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+[OfflineAgentLlama] draft model attached, n_draft=6
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q8_0 draft=true canShift=true in 16863 ms
+   target + draft                     TTFT    473 ms | prompt    40 tok @  180.2 tok/s | decode  160 tok @ 18.22 tok/s | prefix=-1 shifts=0 | draft acc 40% (112/282)
+  PASS draft model proposed tokens
+  PASS greedy output identical with speculation (first 200 chars)
+   speed-up: 0.62x (29.26 -> 18.22 tok/s)
+
+== 6. ContextManager: rolling summary with the real model
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q8_0 draft=false canShift=true in 9304 ms
+   summary (12539 ms): Sai, 12 November exam date. Repeated mentions of day-related chatter. Assistant responds consistently with "Noted. Happy to help with that." No additional information or questions noted.
+  PASS old turns were folded into a summary
+  PASS prompt fits the window (1080/1728)
+   answer: Noted. Happy to help with that. Happy to help with that. Happy to help with that. Happy to help with that. Happy to help with that. Happy to help with that. Happy to help with that. Happy to help with
+  FAIL answer still knows the exam date from the summary/history
+
+== 7. Phone tools through built-in MCP servers (agent loop, real model)
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q8_0 draft=false canShift=true in 10777 ms
+   "Set an alarm for 6:30 in the morning" -> COMPLETED in 35879 ms; calls=[set_alarm {"hour":6,"minute":30,"label":"6:30 AM","days":[1]}, set_volume {"stream":"media","percent":1}]
+  PASS "Set an alarm for 6:30 in the morning" performed 'alarm 6:30' (approval asked: set_volume)
+   "Turn on the flashlight" -> COMPLETED in 9988 ms; calls=[flashlight {"on":true}]
+  PASS "Turn on the flashlight" performed 'torch true' (approval asked: flashlight)
+   "Start a timer for 5 minutes" -> COMPLETED in 5078 ms; calls=[set_timer {"seconds":300,"label":"5 minutes"}]
+  PASS "Start a timer for 5 minutes" performed 'timer 300' (approval asked: set_timer)
+   battery -> {"battery_percent":42,"charging":false}
+  PASS device_info read without approval and answered 42%
+
+== 8. Screen agent on a simulated internship form (real model chooses actions)
+     step 1: Type "Sai Manoj Kura" into "Full name" [2]
+     step 2: Type "CBIT Hyderabad" into "College" [4]
+     step 3: Needs your OK: Type "sai@example.com" into "Email" [3] and press Enter
+     step 4: Needs your OK: Tap "Submit" [5]
+   result in 12544 ms: Application submitted successfully. (5 steps); fields={2=Sai Manoj Kura, 3=sai@example.com, 4=CBIT Hyderabad}
+  PASS agent typed the name and email into the right fields
+  PASS submit only happened after approval
+  PASS form was submitted (after approval)
+
+== 9. Write a report section by section, render to PDF
+   outline: Preparing for Campus Placements: A Student's Guide / [1. Research and Understand the Process, 2. Build a Strong Academic Profile, 3. Develop Practical Skills, 4. Network and Prepare for Interviews]
+     1/4 Writing "1. Research and Understand the Process"
+     2/4 Writing "2. Build a Strong Academic Profile"
+     3/4 Writing "3. Develop Practical Skills"
+     4/4 Writing "4. Network and Prepare for Interviews"
+   7269 chars of Markdown -> 4 pages, 7 KB in 67732 ms -> /workspace/work/out/phase3/phase3-report.pdf
+  PASS outline has sections
+  PASS multi-page PDF (title + contents + body)
+
+== FAILURES: 1
+   - answer still knows the exam date from the summary/history
+EXIT=1 Fri Oct 16 19:19:40 UTC 2026
+
+===== 6 + 9 re-run: summary with realistic turns + report PDF  [h3sumpdf]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.2 GB (KV 0.2 GB)
+     4096 tokens: 2.5 GB (KV 0.4 GB)
+     8192 tokens: 3.1 GB (KV 0.9 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 6. ContextManager: rolling summary with the real model
+[OfflineAgentLlama] Model loaded: ctx=4096 batch=512 ubatch=512 threads=2 mmap=1 kv=8/8 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=4096 kv=Q8_0 draft=false canShift=true in 10257 ms
+   summary (9786 ms): Sai studies at CBIT Hyderabad and has an exam on 12 November. Assistant helps create a revision timetable with two days left for practice papers. User prefers structured planning. Open question: What specific subjects or topics need focus?
+  PASS old turns were folded into a summary
+  PASS prompt fits the window (764/1728)
+   answer: Your exam is on **12 November**, and you will be studying at **CBIT Hyderabad**. Let me know if you need help with anything else!
+  PASS answer still knows the exam date from the summary/history
+
+== 9. Write a report section by section, render to PDF
+   outline: How Students Can Prepare for Campus Placements / [Research and Self-Assessment, Network and Engage, Prepare for Interviews, Leverage Resources]
+     1/4 Writing "Research and Self-Assessment"
+     2/4 Writing "Network and Engage"
+     3/4 Writing "Prepare for Interviews"
+     4/4 Writing "Leverage Resources"
+   7024 chars of Markdown -> 4 pages, 6 KB in 97544 ms -> /workspace/work/out/phase3/phase3-report.pdf
+  PASS outline has sections
+  PASS multi-page PDF (title + contents + body)
+
+== ALL PASS
+EXIT=0 Fri Oct 16 19:29:39 UTC 2026
+
+===== 3. LONG CONTEXT at 16K: ~16K-token prompt (project docs as haystack, needle in the middle), f16 KV, flash attention  [h3long16k]
+== system: CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | KLEIDIAI = 1 | REPACK = 1 |  | Backends: CPU | Device: CPU - CPU
+== GGUF: ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+== 8 GB phone plan: default ctx 16384, KV Q8_0, max output 8192
+     2048 tokens: 2.2 GB (KV 0.2 GB)
+     4096 tokens: 2.5 GB (KV 0.4 GB)
+     8192 tokens: 3.1 GB (KV 0.9 GB)
+    16384 tokens: 2.9 GB (KV 0.9 GB)
+    32768 tokens: 3.8 GB (KV 1.9 GB) — large: first answer in a long chat can take minutes on a phone CPU
+    65536 tokens: 5.7 GB (KV 3.7 GB) — needs ~5.7 GB — more than this phone can spare
+   131072 tokens: 9.4 GB (KV 7.4 GB) — needs ~9.4 GB — more than this phone can spare
+
+== 3. Long context: ~12000-token document at ctx 16384 (F16 KV, flash attention)
+[OfflineAgentLlama] Model loaded: ctx=16384 batch=512 ubatch=512 threads=2 mmap=1 kv=1/1 fa=1 yarn=0 shift=1
+== loaded qwen3 1.7B Q8_0 ctx=16384 kv=F16 draft=false canShift=true in 12029 ms
+   needle @ 15859 doc tokens          TTFT 622463 ms | prompt 15905 tok @   25.6 tok/s | decode    4 tok @  5.48 tok/s | prefix=-1 shifts=0
+  PASS found the needle in a 15859-token prompt (answer: 4719)
+  PASS prompt really was long (15905 tokens)
+
+== ALL PASS
+EXIT=0 Fri Oct 16 19:40:15 UTC 2026
+

@@ -104,16 +104,26 @@ class ReportWriter(
      * "2. **Skills** A solid record…" / "Skills: A solid record…"), keeping any body text that follows it on that line.
      */
     fun cleanSection(text: String, heading: String): String {
-        var t = text.trim()
+        val t = text.trim()
         val first = t.lineSequence().firstOrNull()?.trim().orEmpty()
         val rest = t.substringAfter('\n', "").trim()
-        fun norm(x: String) = x.replace(Regex("^\\s*(#+\\s*)?(\\d+[.)]\\s*)?"), "").replace("*", "").trim()
-        val h = norm(heading)
         if (first.startsWith("#")) return rest
-        val f = norm(first)
-        if (h.isNotEmpty() && f.startsWith(h, ignoreCase = true)) {
-            val tail = f.substring(h.length).trimStart(':', ' ', '-', '—', '.')
-            t = if (tail.isBlank()) rest else (tail + if (rest.isNotEmpty()) "\n" + rest else "").trim()
+        val numbering = Regex("^\\s*(\\d+[.)]\\s*)?")
+        val h = heading.replace(numbering, "").replace("*", "").trim()
+        if (h.isEmpty()) return t
+        val raw = first.replace(numbering, "")
+        if (raw.replace("*", "").trim().equals(h, ignoreCase = true)) return rest
+        fun join(tail: String) = (tail.trim() + if (rest.isNotEmpty()) "\n" + rest else "").trim()
+        // "**Heading** body…" / "**Heading:** body…"
+        if (raw.startsWith("**") && raw.substring(2).startsWith(h, ignoreCase = true)) {
+            val after = raw.substring(2 + h.length)
+            val close = after.indexOf("**")
+            if (close >= 0 && after.substring(0, close).trim(':', ' ', '.').isEmpty()) return join(after.substring(close + 2).trimStart(':', ' ', '-', '—', '.'))
+        }
+        // "Heading: body…" / "Heading — body…" (but NOT "Heading is a crucial step…", which is a real sentence)
+        if (raw.startsWith(h, ignoreCase = true)) {
+            val after = raw.substring(h.length)
+            if (after.startsWith(":") || after.startsWith(" —") || after.startsWith(" - ") || after.startsWith("—")) return join(after.trimStart(':', ' ', '-', '—'))
         }
         return t
     }

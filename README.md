@@ -1,4 +1,4 @@
-# Offline-First Android Agent — Phase 2
+# Offline-First Android Agent — Phase 3
 
 A native Android app (Kotlin + Jetpack Compose, Material 3) that runs local **GGUF** models **fully offline** on the
 phone's CPU, with:
@@ -13,10 +13,22 @@ phone's CPU, with:
   Kotlin validation, a policy engine and user approval for consequential actions. Run history shows every step.
 - **Photos in**: attach a photo (gallery/camera) and ask about it via llama.cpp **libmtmd** + a small vision model.
 - **Persistence**: chats, canvases, documents, skills, runs and settings survive restarts (Room + DataStore).
-- **No INTERNET permission. No cloud fallback. No telemetry.** The only online step is downloading model files beforehand.
+- **Phase 3 — faster & longer**: RAM-based context Auto (16K on 8 GB phones, up to 32K; 64K/128K YaRN experimental),
+  Auto KV precision (f16 when it fits, q8_0 otherwise), flash attention, big-core pinning, prompt-prefix KV cache saved
+  to disk, context shifting, rolling summaries + long-term memory paging, optional speculative decoding, up to 8K-token answers.
+- **PDF**: `create_pdf` tool, multi-page reports (title page, contents, tables, code, images, page numbers), preview/share/save,
+  "Write a report" skill that writes section by section.
+- **MCP**: JSON-RPC client/server, on-device servers over binder/AIDL, built-in servers (files, notes, clipboard, calendar,
+  contacts, share, phone actions); Streamable HTTP/SSE only in the separate **connected** build.
+- **Phone actions**: alarms, timers, reminders, calendar, contacts, apps/deep links, message/call drafts, camera, flashlight,
+  volume/DND, quick settings, device info, clipboard, files, notifications — typed tools behind approvals.
+- **Form filling & automation**: AutofillService + encrypted Keystore profile vault, AccessibilityService screen agent with
+  overlay (pause/stop/approve before submit), record/replay macros with schedules; CAPTCHA/OTP/banking safeguards.
+- **Offline build: no INTERNET permission. No cloud fallback. No telemetry.** The only online step is downloading model files beforehand.
 
 Docs: `docs/ARCHITECTURE.md` (how it works), `docs/DECISIONS.md` (why), `docs/CHECKLIST.md`, `docs/DEVICE_TEST_PLAN.md`,
-`docs/KNOWN_ISSUES.md`, `docs/verification/phase2-host-harness.txt` (real-model test output).
+`docs/KNOWN_ISSUES.md`, `docs/PHASE3.md` (Phase 3 features + Play policy notes), `docs/verification/phase3-host-harness.txt`
+and `phase2-host-harness.txt` (real-model test output).
 
 ## Repository layout
 
@@ -28,6 +40,10 @@ core/data/           Room database + DataStore settings + agent checkpoint store
 feature/workflow/    Skills editor and agent run history screens
 engine/llamacpp/     JNI bridge (chat, grammar sampling, embeddings, libmtmd images) + CMake build of llama.cpp
 third_party/         llama.cpp b11609 (vendored)
+core/mcp-http/       Streamable HTTP/SSE MCP transport (connected flavor only)
+mcp-aidl/            Binder/AIDL MCP contract + server base Service
+samples/mcp-server-sample/  Example third-party on-device MCP server app
+third_party/kleidiai KleidiAI v1.31.0 (vendored, pruned) for ggml-cpu ARM kernels
 tools/host-harness/  Dev-only: runs the real JNI bridge + real GGUFs on an ARM64/x86 Linux JVM
 ```
 
@@ -37,8 +53,10 @@ Requirements: JDK 17, Android SDK 35, **NDK 30.0.16248370**, CMake 3.31.6 (Andro
 
 ```bash
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew :core:inference:test :core:runtime:test   # 79 JVM unit tests
-./gradlew :app:assembleDebug                         # → app/build/outputs/apk/debug/app-debug.apk
+./gradlew :core:inference:test :core:runtime:test :core:mcp-http:test   # 136 JVM unit tests
+./gradlew :app:assembleOfflineDebug     # → app/build/outputs/apk/offline/debug/app-offline-debug.apk (no INTERNET)
+./gradlew :app:assembleConnectedDebug   # → app/build/outputs/apk/connected/debug/app-connected-debug.apk (+INTERNET for MCP)
+./gradlew :samples:mcp-server-sample:assembleDebug
 ```
 
 Native code is always built Release/-O3 (also in the debug APK). `gradle.properties` limits Gradle to `-Xmx3g`, 2 workers.
@@ -46,15 +64,16 @@ Native code is always built Release/-O3 (also in the debug APK). `gradle.propert
 Verify the offline guarantee:
 
 ```bash
-$ANDROID_HOME/build-tools/35.0.0/aapt dump permissions app/build/outputs/apk/debug/app-debug.apk
+$ANDROID_HOME/build-tools/35.0.0/aapt dump permissions app/build/outputs/apk/offline/debug/app-offline-debug.apk
 # package: com.offlineagent.app
-# permission: com.offlineagent.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION   ← androidx internal, signature-only
-# (no android.permission.INTERNET, no camera/storage permissions either)
+# uses-permission: SET_ALARM, POST_NOTIFICATIONS, FOREGROUND_SERVICE(+SPECIAL_USE), READ_CONTACTS, READ_CALENDAR,
+#   ACCESS_NOTIFICATION_POLICY, USE_BIOMETRIC/USE_FINGERPRINT, WAKE_LOCK, RECEIVE_BOOT_COMPLETED, USE_MCP_SERVERS (own)
+# (no android.permission.INTERNET / ACCESS_NETWORK_STATE, no SMS/call/camera/storage permissions)
 ```
 
 ## Install & provision models (only step needing internet)
 
-1. `adb install -r offline-agent-phase2-debug.apk` (or copy to the phone and open it).
+1. `adb install -r offline-agent-phase3-offline-debug.apk` (or copy to the phone and open it).
 2. Download GGUFs on the phone/PC, then in the app: **Models → (role) → Add**. Files are copied into app storage.
 
 | role | recommended | size | phone RAM | licence | link |
