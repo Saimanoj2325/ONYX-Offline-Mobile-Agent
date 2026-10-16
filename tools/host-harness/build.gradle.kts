@@ -32,3 +32,13 @@ tasks.register<JavaExec>("runPhase2") {
     jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
     args(nativeDir)
 }
+
+// Phase 3: speed, KV types, long context, prefix cache, context shift, speculative decoding, summarisation,
+// phone tools via built-in MCP servers, screen agent, report -> PDF. Env: MODEL, DRAFT, THREADS, CTX, ONLY, OUT.
+tasks.register<JavaExec>("runPhase3") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.offlineagent.tools.Phase3HarnessKt")
+    val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
+    jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
+    args(nativeDir)
+}

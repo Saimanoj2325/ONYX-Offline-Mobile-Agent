@@ -34,6 +34,8 @@ class EngineInferenceAdapter(
     private val engineDispatcher: CoroutineDispatcher,
     private val nanoTime: () -> Long = System::nanoTime,
     private val templateFor: ((ModelInfo) -> PromptTemplate)? = null,
+    /** Where the system-prompt KV cache for (model, prefix) is stored; null = in-memory reuse only. */
+    private val prefixCacheFile: ((ModelInfo, String) -> String?)? = null,
 ) : InferenceAdapter {
 
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded())
@@ -93,18 +95,28 @@ class EngineInferenceAdapter(
 
             // Only the latest user turn keeps its images (older images are dropped from the prompt to save context).
             val lastUser = request.messages.indexOfLast { it.role == Role.USER }
-            var messages = PromptFitter.fitByCharacters(
-                request.messages.mapIndexed { i, m -> if (i != lastUser && m.images.isNotEmpty()) m.copy(images = emptyList()) else m },
-                info.contextLength, request.maxNewTokens,
-            )
+            val original = request.messages.mapIndexed { i, m -> if (i != lastUser && m.images.isNotEmpty()) m.copy(images = emptyList()) else m }
+            var messages = PromptFitter.fitByCharacters(original, info.contextLength, request.maxNewTokens)
+            // Exact fit with the real tokenizer (cheap: tokenizing 16K tokens takes milliseconds).
+            messages = PromptFitter.fitByTokens(messages, info.contextLength, request.maxNewTokens) { m ->
+                engine.countTokens(template.render(m, request.thinking))
+            }
             val t0 = nanoTime()
             var promptTokens: Int
             var aborted = false
+            var prefixState = -1
+            val prefix = template.systemPrefix(messages)
+            val nKeep = prefix?.let { engine.countTokens(it) } ?: 0
+            if (request.cachePrefix && prefix != null && images.isEmpty() && nKeep >= PREFIX_CACHE_MIN_TOKENS) {
+                prefixState = try {
+                    abortOnCancel { engine.prefixCache(prefix, prefixCacheFile?.invoke(info, prefix)) }
+                } catch (e: GenerationAbortedException) { -1 }
+            }
             while (true) {
                 currentCoroutineContext().ensureActive()
                 val prompt = template.render(messages, request.thinking)
                 try {
-                    promptTokens = abortOnCancel { engine.beginCompletion(prompt, request.sampling, request.maxNewTokens, request.grammar, images) }
+                    promptTokens = abortOnCancel { engine.beginCompletion(prompt, request.sampling, request.maxNewTokens, request.grammar, images, nKeep) }
                     break
                 } catch (e: PromptTooLongException) {
                     val shorter = PromptFitter.dropOldestTurn(messages) ?: throw e
@@ -116,6 +128,7 @@ class EngineInferenceAdapter(
                     break
                 }
             }
+            val dropped = original.size - messages.size
             val promptMillis = (nanoTime() - t0) / 1_000_000
             if (!aborted) emit(GenerationEvent.PromptProcessed(promptTokens, promptMillis))
 
@@ -143,6 +156,7 @@ class EngineInferenceAdapter(
             val tail = decoder.flush()
             val genMillis = (nanoTime() - genStart) / 1_000_000
             if (tail.isNotEmpty()) emit(GenerationEvent.Token(tail, generated, genMillis))
+            val rs = runCatching { engine.runtimeStats() }.getOrDefault(IntArray(6))
             emit(
                 GenerationEvent.Completed(
                     GenerationStats(
@@ -151,6 +165,13 @@ class EngineInferenceAdapter(
                         promptMillis = promptMillis,
                         generationMillis = if (aborted) 0 else genMillis,
                         stopReason = reason,
+                        contextUsed = rs.getOrElse(0) { 0 },
+                        contextLength = info.contextLength,
+                        contextShifts = rs.getOrElse(2) { 0 },
+                        draftedTokens = rs.getOrElse(3) { 0 },
+                        acceptedTokens = rs.getOrElse(4) { 0 },
+                        droppedMessages = dropped,
+                        prefixCache = prefixState,
                     ),
                 ),
             )
@@ -176,6 +197,17 @@ class EngineInferenceAdapter(
     }
 
     override suspend fun systemInfo(): String = withContext(engineDispatcher) { engine.systemInfo() }
+
+    /** Exact token count with the loaded model's tokenizer (null when no model is loaded or the engine is busy). */
+    override suspend fun countTokens(text: String): Int? {
+        if (loaded == null || !mutex.tryLock()) return null
+        return try { withContext(engineDispatcher) { engine.countTokens(text) } } finally { mutex.unlock() }
+    }
+
+    companion object {
+        /** Below this the system prompt is cheaper to evaluate than to load from disk. */
+        const val PREFIX_CACHE_MIN_TOKENS = 64
+    }
 
     /**
      * Runs a blocking engine call; if the calling coroutine is cancelled meanwhile, asks the engine to
@@ -211,6 +243,20 @@ object PromptFitter {
             current = dropOldestTurn(current) ?: break
         }
         return current
+    }
+
+    /**
+     * Exact fit: drops the oldest turns until the rendered prompt (counted by [count]) leaves room for the reply.
+     * [count] returns null when exact counting is unavailable; the messages are then returned unchanged.
+     */
+    fun fitByTokens(messages: List<ChatMessage>, contextLength: Int, maxNewTokens: Int, count: (List<ChatMessage>) -> Int?): List<ChatMessage> {
+        val budget = (contextLength - maxNewTokens - 16).coerceAtLeast(64)
+        var current = messages
+        while (true) {
+            val n = count(current) ?: return current
+            if (n <= budget) return current
+            current = dropOldestTurn(current) ?: return current
+        }
     }
 
     /**

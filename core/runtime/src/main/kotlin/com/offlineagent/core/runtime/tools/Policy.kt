@@ -18,10 +18,13 @@ class PolicyEngine(
     private val registry: ToolRegistry,
     private val alwaysAllowed: () -> Set<String> = { emptySet() },
     private val maxSideEffectsPerRun: Int = 3,
+    /** Tools switched off by the user (Phone actions screen); denied outright. */
+    private val disabled: () -> Set<String> = { emptySet() },
 ) {
     fun decide(call: ToolCall, allowedTools: Set<String>?, sideEffectsSoFar: Int): PolicyDecision {
         val tool = registry[call.tool] ?: return PolicyDecision.Deny("unknown tool '${call.tool}'")
         if (allowedTools != null && call.tool !in allowedTools) return PolicyDecision.Deny("tool '${call.tool}' is not allowed by this skill")
+        if (call.tool in disabled()) return PolicyDecision.Deny("'${call.tool}' is switched off in Settings → Phone actions")
         return when (tool.spec.permission) {
             Permission.READ_ONLY, Permission.UI -> PolicyDecision.Allow
             Permission.WRITE_LOCAL -> when {
@@ -29,11 +32,16 @@ class PolicyEngine(
                 call.tool in alwaysAllowed() -> PolicyDecision.Allow
                 else -> PolicyDecision.NeedsApproval(tool.spec.sideEffects)
             }
-            Permission.EXTERNAL_INTENT -> if (sideEffectsSoFar >= maxSideEffectsPerRun) PolicyDecision.Deny("side-effect budget for this run used up")
+            Permission.EXTERNAL_INTENT, Permission.SCREEN_ACTION -> if (sideEffectsSoFar >= maxSideEffectsPerRun) PolicyDecision.Deny("side-effect budget for this run used up")
                 else PolicyDecision.NeedsApproval(tool.spec.sideEffects)
+            Permission.SENSITIVE_READ -> if (call.tool in alwaysAllowed()) PolicyDecision.Allow else PolicyDecision.NeedsApproval(tool.spec.sideEffects)
+            Permission.DEVICE_CONTROL -> when {
+                sideEffectsSoFar >= maxSideEffectsPerRun -> PolicyDecision.Deny("side-effect budget for this run used up")
+                call.tool in alwaysAllowed() -> PolicyDecision.Allow
+                else -> PolicyDecision.NeedsApproval(tool.spec.sideEffects)
+            }
         }
     }
 
-    fun hasSideEffects(tool: String): Boolean =
-        registry[tool]?.spec?.permission.let { it == Permission.WRITE_LOCAL || it == Permission.EXTERNAL_INTENT }
+    fun hasSideEffects(tool: String): Boolean = registry[tool]?.spec?.permission?.hasSideEffects == true
 }

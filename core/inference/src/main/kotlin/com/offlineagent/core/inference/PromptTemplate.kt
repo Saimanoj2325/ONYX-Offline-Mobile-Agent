@@ -4,6 +4,13 @@ package com.offlineagent.core.inference
 interface PromptTemplate {
     val name: String
     fun render(messages: List<ChatMessage>, thinking: Boolean): String
+
+    /**
+     * The exact text the rendered prompt starts with for the leading system message (identical for every request that
+     * shares this system prompt), or null if the template cannot say. Used for prompt-prefix KV caching and as the
+     * part context shifting must keep.
+     */
+    fun systemPrefix(messages: List<ChatMessage>): String? = null
 }
 
 /**
@@ -27,6 +34,11 @@ open class ChatMlTemplate(
     private val mediaMarker: String = "<__media__>",
 ) : PromptTemplate {
     override val name = if (hybridThinking) "qwen3-chatml" else "chatml"
+
+    override fun systemPrefix(messages: List<ChatMessage>): String? {
+        val sys = messages.firstOrNull()?.takeIf { it.role == Role.SYSTEM } ?: return null
+        return IM_START + "system\n" + sys.content.trim() + IM_END + "\n"
+    }
 
     override fun render(messages: List<ChatMessage>, thinking: Boolean): String {
         require(messages.isNotEmpty()) { "messages must not be empty" }

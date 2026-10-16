@@ -114,6 +114,8 @@ class AgentLoop(
     private val limits: AgentLimits = AgentLimits(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val onEvent: (AgentEvent) -> Unit = {},
+    /** Narrows the tools offered for a free-form request (null = offer all). Skills always get exactly their tools. */
+    private val toolSelector: ((String, List<ToolSpec>) -> List<ToolSpec>)? = { req, specs -> com.offlineagent.core.runtime.tools.ToolSelector.select(req, specs) },
 ) {
     private val json = Json { isLenient = true }
 
@@ -137,14 +139,15 @@ class AgentLoop(
         onEvent(AgentEvent.Status(cp))
     }
 
-    private fun allowedTools(skill: Skill?): List<ToolSpec> {
+    private fun allowedTools(skill: Skill?, request: String = ""): List<ToolSpec> {
         val names = skill?.tools?.toSet()
-        return registry.specs.filter { names == null || it.name in names }
+        val all = registry.specs.filter { names == null || it.name in names }
+        return if (skill == null && toolSelector != null) toolSelector.invoke(request, all) else all
     }
 
     private suspend fun drive(start: RunCheckpoint, skill: Skill?): RunCheckpoint {
         var cp = start
-        val tools = allowedTools(skill)
+        val tools = allowedTools(skill, start.request)
         val maxIter = minOf(limits.maxIterations, skill?.maxSteps ?: limits.maxIterations)
         try {
             if (cp.status == RunStatus.PLANNING) {

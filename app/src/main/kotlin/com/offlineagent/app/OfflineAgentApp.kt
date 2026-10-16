@@ -3,29 +3,58 @@ package com.offlineagent.app
 import android.app.Application
 import android.content.ComponentCallbacks2
 import android.util.Log
+import com.offlineagent.app.automation.AutomationController
+import com.offlineagent.app.automation.FileAutomationLog
 import com.offlineagent.app.data.AgentService
 import com.offlineagent.app.data.AppIntents
+import com.offlineagent.app.data.ChatMemory
 import com.offlineagent.app.data.DocumentIndexer
 import com.offlineagent.app.data.EngineController
 import com.offlineagent.app.data.ModelRepository
 import com.offlineagent.app.data.ModelStore
 import com.offlineagent.app.data.Retriever
 import com.offlineagent.app.data.SkillRepository
+import com.offlineagent.app.mcp.McpManager
+import com.offlineagent.app.pdf.PdfExporter
+import com.offlineagent.app.phone.ActivityLauncher
+import com.offlineagent.app.phone.AndroidAppsPort
+import com.offlineagent.app.phone.AndroidClipboardPort
+import com.offlineagent.app.phone.AndroidCommsPort
+import com.offlineagent.app.phone.AndroidDevicePort
+import com.offlineagent.app.phone.AndroidNotificationsPort
+import com.offlineagent.app.phone.AndroidPimPort
+import com.offlineagent.app.phone.Notifications
+import com.offlineagent.app.phone.RoomNotesStore
+import com.offlineagent.app.phone.SafFilesPort
+import com.offlineagent.app.phone.WorkManagerReminders
+import com.offlineagent.app.vault.ProfileVault
+import com.offlineagent.app.work.LongTask
+import com.offlineagent.app.work.LongTasks
 import com.offlineagent.core.data.AppDatabase
+import com.offlineagent.core.data.AppSettings
 import com.offlineagent.core.data.SettingsRepository
 import com.offlineagent.core.inference.EmbeddingService
 import com.offlineagent.core.inference.EngineState
 import com.offlineagent.core.inference.InferenceAdapter
 import com.offlineagent.core.inference.UnloadReason
+import com.offlineagent.core.runtime.agent.AgentLlm
+import com.offlineagent.core.runtime.agent.InferenceAgentLlm
+import com.offlineagent.core.runtime.pdf.CreatePdfTool
+import com.offlineagent.core.runtime.phone.AutomationPolicy
+import com.offlineagent.core.runtime.phone.PhonePorts
+import com.offlineagent.core.runtime.phone.PhoneServers
 import com.offlineagent.engine.llamacpp.LlamaCppEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 
 /**
  * Manual DI root. One [InferenceAdapter] per process (a model is hundreds of MB; never two chat models), one embedding
  * service, one Room database. Agent runs and indexing live in [appScope] so they survive screen changes.
+ * Phase 3 services (MCP, automation, vault, PDF, long-term memory) are created lazily for a fast cold start.
  */
 class OfflineAgentApp : Application() {
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -41,6 +70,42 @@ class OfflineAgentApp : Application() {
     lateinit var skills: SkillRepository private set
     lateinit var agents: AgentService private set
     val intents = AppIntents()
+    val launcher = ActivityLauncher()
+
+    /** Last known settings (kept current by a collector) for code that cannot suspend. */
+    @Volatile var cachedSettings: AppSettings = AppSettings()
+        private set
+
+    private val _cameraRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    /** take_photo tool -> MainActivity opens the camera; the photo is attached to the current chat. */
+    val cameraRequests: SharedFlow<Unit> = _cameraRequests
+
+    val vault by lazy { ProfileVault(this) }
+    val automationLog by lazy { FileAutomationLog(this) }
+    val automation by lazy { AutomationController(this) }
+    val pdf by lazy { PdfExporter(this, db.chats()) }
+    val chatMemory by lazy { ChatMemory(this, db.documents(), embeddings, models, retriever) }
+    val mcp by lazy {
+        McpManager(this, PhonePorts(
+            device = AndroidDevicePort(this, launcher) { _cameraRequests.emit(Unit); "Camera opened — take the photo and it will be attached to this chat." },
+            reminders = WorkManagerReminders(this), apps = AndroidAppsPort(this, launcher), comms = AndroidCommsPort(launcher),
+            pim = AndroidPimPort(this, launcher), files = SafFilesPort(this), clipboard = AndroidClipboardPort(this),
+            notifications = AndroidNotificationsPort(this), notes = RoomNotesStore(db.misc()), screen = automation,
+        ))
+    }
+    private val createPdfTool by lazy { CreatePdfTool(pdf) }
+
+    fun automationPolicy() = AutomationPolicy(userAllowed = { cachedSettings.automationAllowedApps }, userBlocked = { cachedSettings.automationBlockedApps })
+
+    /** The loaded chat model as an [AgentLlm], or null (never loads one: used where latency matters, e.g. autofill). */
+    fun readyLlmOrNull(): AgentLlm? = if (inference.state.value is EngineState.Ready && engineController.loaded.value?.role == "CHAT") InferenceAgentLlm(inference) else null
+
+    /** Notification "Cancel": stops every long task (agent run, report, automation). */
+    fun cancelAllLongTasks() {
+        agents.cancel()
+        inference.cancel()
+        runCatching { automation.stopAll() }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -55,13 +120,28 @@ class OfflineAgentApp : Application() {
         retriever = Retriever(db.documents(), embeddings, models)
         val toolNames = setOf(
             "search_docs", "read_document", "summarize", "calculator", "get_datetime", "create_note", "memory_read",
-            "memory_write", "share_text", "create_calendar_event", "render_ui", "canvas_update",
-        )
+            "memory_write", "share_text", "create_calendar_event", "render_ui", "canvas_update", "create_pdf", "notes_search",
+        ) + PhoneServers(PhonePorts()).apply { build() }.toolGroups.keys
         skills = SkillRepository(db.skills(), toolNames)
-        agents = AgentService(appScope, inference, engineController, db.agent(), db.chats(), db.misc(), retriever, db.documents(), intents, skills, settings)
+        agents = AgentService(
+            appScope, inference, engineController, db.agent(), db.chats(), db.misc(), retriever, db.documents(), intents, skills, settings,
+            extraTools = { mcp.tools + createPdfTool },
+            disabledTools = { mcp.disabledTools(cachedSettings.phoneGroups) },
+            onLongTask = { runId, progress ->
+                if (progress == null) LongTasks.finish(this, runId)
+                else if (LongTasks.current.value?.id == runId) LongTasks.update(this, LongTask(runId, "Assistant is working", progress))
+                else LongTasks.start(this, LongTask(runId, "Assistant is working", progress))
+            },
+        )
+        Notifications.ensureChannels(this)
+        appScope.launch { settings.settings.collect { cachedSettings = it } }
         appScope.launch {
             runCatching { models.migrateLegacy() }.onFailure { Log.w(TAG, "legacy model migration failed", it) }
             runCatching { skills.seedBuiltins() }.onFailure { Log.w(TAG, "seeding skills failed", it) }
+            runCatching { mcp.startBuiltIns() }.onFailure { Log.w(TAG, "MCP start failed", it) }
+            // Re-connect on-device MCP servers the user enabled earlier.
+            val enabled = settings.current().mcpServers
+            if (enabled.isNotEmpty()) mcp.discoverOnDevice().filter { it.id in enabled }.forEach { s -> mcp.connectOnDevice(s) }
         }
         appScope.launch {
             inference.state.collect { if (it is EngineState.Unloaded || it is EngineState.Failed) engineController.markUnloaded() }
@@ -69,14 +149,17 @@ class OfflineAgentApp : Application() {
     }
 
     /**
-     * Low memory: free the models rather than get the whole app killed. On Android 14+ only UI_HIDDEN / BACKGROUND /
-     * COMPLETE are delivered. UI_HIDDEN alone (user switched apps briefly) does NOT unload.
+     * Memory management on 8 GB phones. Keep-warm (default): the model stays loaded while the app is in the background
+     * and is freed only on real pressure (RUNNING_CRITICAL / BACKGROUND / COMPLETE). With keep-warm off it is also freed
+     * when the UI is hidden. Never while an agent run, automation or indexing job is using it.
      */
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         val critical = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL || level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
-        if (critical) unloadForMemory("onTrimMemory($level)")
+        if (critical || (level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && !cachedSettings.keepWarm)) unloadForMemory("onTrimMemory($level)")
+        // The embedding model is small but only needed while indexing/searching: free it first.
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && !indexer.isBusy) appScope.launch { embeddings.unload() }
     }
 
     override fun onLowMemory() {
@@ -86,8 +169,8 @@ class OfflineAgentApp : Application() {
 
     private fun unloadForMemory(why: String) {
         val s = inference.state.value
-        // Never pull the model from under a running agent or indexing job; they hold the user's work.
-        if (agents.isRunning || indexer.isBusy) return
+        // Never pull the model from under a running agent, report, automation or indexing job; they hold the user's work.
+        if (agents.isRunning || indexer.isBusy || LongTasks.current.value != null) return
         if (s is EngineState.Ready) {
             Log.w(TAG, "Unloading model: $why")
             appScope.launch { inference.unload(UnloadReason.LOW_MEMORY); embeddings.unload() }

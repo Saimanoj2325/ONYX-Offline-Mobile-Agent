@@ -37,6 +37,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -51,7 +52,6 @@ import com.offlineagent.app.data.IntentRequest
 import com.offlineagent.app.ui.chat.ChatScreen
 import com.offlineagent.app.ui.chat.ChatViewModel
 import com.offlineagent.app.ui.library.DocumentsScreen
-import com.offlineagent.app.ui.library.ModelsScreen
 import com.offlineagent.core.data.AgentRunEntity
 import com.offlineagent.core.data.AgentStepEntity
 import com.offlineagent.core.data.SkillEntity
@@ -64,7 +64,7 @@ import com.offlineagent.feature.workflow.SkillsScreen
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 
-class MainActivity : ComponentActivity() {
+class MainActivity : androidx.fragment.app.FragmentActivity() {
     private val chatVm: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -74,15 +74,22 @@ class MainActivity : ComponentActivity() {
         setContent { AppTheme { AppRoot(app, chatVm, ::launchIntent) } }
     }
 
-    /** Only two kinds of outgoing intents exist (share sheet, calendar insert); both were approved by the user. Never ACTION_VIEW URLs. */
+    /**
+     * Outgoing intents. Every one was approved by the user in the tool-approval dialog (share, calendar, phone actions:
+     * alarms, app launches, message drafts, settings panels, links) or is a file the user exported.
+     */
     private fun launchIntent(r: IntentRequest) {
         val intent = when (r) {
+            is IntentRequest.Raw -> r.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            is IntentRequest.ShareFile -> if (r.view) Intent(Intent.ACTION_VIEW).setDataAndType(r.uri, r.mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                else Intent.createChooser(Intent(Intent.ACTION_SEND).setType(r.mime).putExtra(Intent.EXTRA_STREAM, r.uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "Share")
             is IntentRequest.Share -> Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, r.text), "Share")
             is IntentRequest.Calendar -> Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
                 .putExtra(CalendarContract.Events.TITLE, r.title).putExtra(CalendarContract.Events.DESCRIPTION, r.description)
                 .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, r.beginMillis).putExtra(CalendarContract.EXTRA_EVENT_END_TIME, r.endMillis)
         }
         try { startActivity(intent) } catch (e: ActivityNotFoundException) { chatVm.notice("No app on this phone can handle that.") }
+        catch (e: SecurityException) { chatVm.notice("Android blocked that action: ${e.message}") }
     }
 }
 
@@ -109,6 +116,22 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
 
     LaunchedEffect(ui.notice) { ui.notice?.let { snackbar.showSnackbar(it); vm.notice(null) } }
     LaunchedEffect(Unit) { app.intents.requests.collect { launch(it) } }
+    LaunchedEffect(Unit) { app.launcher.requests.collect { launch(it) } }
+    // take_photo tool: open the camera, attach the photo to the current chat.
+    var camFile by remember { mutableStateOf<java.io.File?>(null) }
+    val camera = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.TakePicture()) { ok ->
+        camFile?.let { f -> if (ok) vm.attachCameraFile(f) }
+        camFile = null
+    }
+    val ctx = LocalContext.current
+    LaunchedEffect(Unit) {
+        app.cameraRequests.collect {
+            val f = vm.cameraTarget()
+            camFile = f
+            tab = 0
+            runCatching { camera.launch(androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)) }
+        }
+    }
 
     val skillsHost = remember {
         object : SkillsHost {
@@ -141,7 +164,7 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
             NavigationBar {
                 listOf(
                     Triple("Chat", Icons.Filled.Email, 0), Triple("Docs", Icons.AutoMirrored.Filled.List, 1),
-                    Triple("Skills", Icons.Filled.Build, 2), Triple("Runs", Icons.Filled.DateRange, 3), Triple("Models", Icons.Filled.Settings, 4),
+                    Triple("Skills", Icons.Filled.Build, 2), Triple("Runs", Icons.Filled.DateRange, 3), Triple("Settings", Icons.Filled.Settings, 4),
                 ).forEach { (label, icon, i) ->
                     NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Icon(icon, contentDescription = null) }, label = { Text(label) })
                 }
@@ -154,7 +177,7 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
             1 -> DocumentsScreen(app, notify, m)
             2 -> SkillsScreen(skillsHost, notify, m)
             3 -> RunsScreen(runsHost, notify, m)
-            else -> ModelsScreen(app, notify, m)
+            else -> com.offlineagent.app.settings.SettingsScreen(app, notify, m)
         }
     }
 
@@ -177,7 +200,7 @@ private fun ApprovalDialog(p: PendingApproval, onAnswer: (Boolean, Boolean) -> U
         confirmButton = {
             Column {
                 TextButton(onClick = { onAnswer(true, false) }) { Text("Allow once") }
-                if (p.spec.permission == Permission.WRITE_LOCAL) TextButton(onClick = { onAnswer(true, true) }) { Text("Always allow this tool") }
+                if (p.spec.permission.canAlwaysAllow && p.spec.permission != Permission.READ_ONLY) TextButton(onClick = { onAnswer(true, true) }) { Text("Always allow this tool") }
             }
         },
         dismissButton = { TextButton(onClick = { onAnswer(false, false) }) { Text("Deny") } },

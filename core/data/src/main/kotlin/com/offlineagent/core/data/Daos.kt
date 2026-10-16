@@ -82,6 +82,8 @@ interface DocumentDao {
     suspend fun keywordSearch(match: String, limit: Int): List<ChunkEntity>
 
     @Query("SELECT * FROM chunks WHERE id IN (:ids)") suspend fun chunks(ids: List<Long>): List<ChunkEntity>
+    @Query("SELECT COALESCE(MAX(idx), -1) FROM chunks WHERE documentId = :docId") suspend fun maxChunkIdx(docId: Long): Int
+    @Query("SELECT * FROM documents WHERE mime = :mime LIMIT 1") suspend fun documentByMime(mime: String): DocumentEntity?
 }
 
 @Dao
@@ -121,6 +123,7 @@ interface MiscDao {
 
     @Insert suspend fun insertNote(n: NoteEntity): Long
     @Query("SELECT * FROM notes ORDER BY createdAt DESC") fun observeNotes(): Flow<List<NoteEntity>>
+    @Query("SELECT * FROM notes ORDER BY createdAt DESC LIMIT 500") suspend fun notes(): List<NoteEntity>
     @Query("DELETE FROM notes WHERE id = :id") suspend fun deleteNote(id: Long)
 
     @Query("SELECT * FROM models ORDER BY addedAt DESC") fun observeModels(): Flow<List<ModelEntity>>

@@ -47,6 +47,14 @@ android {
                 arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
                 arguments += "-DGGML_OPENMP=OFF"
                 arguments += "-DGGML_LLAMAFILE=OFF"
+                // Phase 3 speed: Arm KleidiAI micro-kernels (dotprod / i8mm / SME matmuls for Q4_0/Q8_0 weights),
+                // compiled into every CPU variant and dispatched at runtime by CPU features. Vendored source
+                // (third_party/kleidiai, v1.31.0, Apache-2.0) so the build never downloads anything.
+                arguments += "-DGGML_CPU_KLEIDIAI=ON"
+                arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=" + rootProject.file("third_party/kleidiai").absolutePath
+                arguments += "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+                // Weight repacking into the interleaved layouts the dotprod/i8mm kernels want (Q4_0 -> 4x8 etc.).
+                arguments += "-DGGML_CPU_REPACK=ON"
                 cppFlags += listOf("-O3", "-fvisibility=hidden", "-ffunction-sections", "-fdata-sections")
                 cFlags += listOf("-O3")
             }

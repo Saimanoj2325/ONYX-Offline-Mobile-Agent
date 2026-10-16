@@ -21,4 +21,19 @@ object DeviceInfo {
     }.getOrDefault(0)
 
     fun recommendedThreads(): Int = ThreadPolicy.performanceCores(cpuMaxFreqsKhz())
+
+    /** Performance-core ids for thread pinning (empty if unknown). */
+    fun performanceCoreIds(): List<Int> = ThreadPolicy.performanceCoreIds(cpuMaxFreqsKhz())
+
+    /** Total physical RAM in bytes (from /proc/meminfo; ActivityManager gives the same on Android). */
+    fun totalRamBytes(): Long = runCatching {
+        File("/proc/meminfo").readLines().first { it.startsWith("MemTotal:") }
+            .split(Regex("\\s+"))[1].toLong() * 1024
+    }.getOrDefault(4L shl 30)
+
+    /** CPU feature flags relevant to llama.cpp kernels (dotprod, i8mm, sve, sme) from /proc/cpuinfo. */
+    fun cpuFeatures(): Set<String> = runCatching {
+        File("/proc/cpuinfo").readLines().firstOrNull { it.startsWith("Features") }
+            ?.substringAfter(':')?.trim()?.split(' ')?.filter { it in setOf("asimddp", "i8mm", "sve", "sve2", "sme", "sme2", "bf16", "fphp") }?.toSet()
+    }.getOrNull() ?: emptySet()
 }

@@ -60,6 +60,7 @@ fun CanvasPanel(
     onRedo: () -> Unit,
     onSelectVersion: (Int) -> Unit,
     onShare: (String) -> Unit,
+    onExportPdf: () -> Unit = {},
 ) {
     val clipboard = LocalClipboardManager.current
     var menu by remember { mutableStateOf(false) }
@@ -86,6 +87,7 @@ fun CanvasPanel(
                         if (doc != null) {
                             DropdownMenuItem(text = { Text("Copy as Markdown") }, onClick = { clipboard.setText(AnnotatedString(UiMarkdown.render(doc))); menu = false })
                             DropdownMenuItem(text = { Text("Share as text…") }, onClick = { onShare(UiMarkdown.render(doc)); menu = false })
+                            DropdownMenuItem(text = { Text("Export as PDF") }, onClick = { onExportPdf(); menu = false })
                             HorizontalDivider()
                         }
                         versions.sortedByDescending { it.version }.forEach { v ->

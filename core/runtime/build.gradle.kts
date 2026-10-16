@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 // Pure Kotlin/JVM: UI schema, markdown, RAG maths, skills, tools, policy and the agent loop.

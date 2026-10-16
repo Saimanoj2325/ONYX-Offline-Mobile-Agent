@@ -19,9 +19,14 @@
 #include <vector>
 
 #include <cmath>
+#include <deque>
+#include <fstream>
+#include <sched.h>
+#include <unistd.h>
 
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -74,6 +79,26 @@ struct Session {
     int max_new    = 0;
     int stop       = STOP_NONE;
     bool has_logits = false;
+
+    // ---- Phase 3: long context + speed
+    int  n_keep = 0;                 // tokens never discarded by context shifting (system prompt)
+    bool can_shift = false;          // KV cache supports position shifting (false for some quantised/SWA caches)
+    int  n_shifts = 0;               // context shifts performed in this request (reported to Kotlin)
+    ggml_threadpool_t threadpool = nullptr;
+    void (*tp_free)(ggml_threadpool_t) = nullptr;
+
+    // Speculative decoding: a small draft model of the same family proposes n_draft tokens greedily, the target
+    // verifies them in ONE batched decode and keeps the longest matching prefix (+1 own token). Output is exactly the
+    // target model's distribution (each position is sampled from the target).
+    llama_model *   draft_model = nullptr;
+    llama_context * draft_ctx   = nullptr;
+    llama_batch     draft_batch{};
+    std::vector<llama_token> draft_kv;  // what is in the draft KV cache
+    int  n_draft = 0;                   // 0 = speculation off
+    bool spec_active = false;           // this request uses speculation (no grammar, no images)
+    llama_token pending = -1;           // sampled by the target but not yet decoded
+    std::deque<llama_token> out_queue;  // accepted tokens waiting to be returned by nativeNext
+    long spec_drafted = 0, spec_accepted = 0;
 };
 
 std::string g_last_error;
@@ -117,12 +142,17 @@ Session * as_session(jlong h) { return reinterpret_cast<Session *>(h); }
 
 void free_session(Session * s) {
     if (!s) return;
+    if (s->draft_batch.token) llama_batch_free(s->draft_batch);
+    if (s->draft_ctx) llama_free(s->draft_ctx);
+    if (s->draft_model) llama_model_free(s->draft_model);
+    if (s->ctx && s->threadpool) llama_detach_threadpool(s->ctx);
     if (s->sampler) llama_sampler_free(s->sampler);
     if (s->grammar) llama_sampler_free(s->grammar);
     if (s->mtmd) mtmd_free(s->mtmd);
     if (s->batch.token) llama_batch_free(s->batch);
     if (s->ctx) llama_free(s->ctx);
     if (s->model) llama_model_free(s->model);
+    if (s->threadpool && s->tp_free) s->tp_free(s->threadpool);
     delete s;
 }
 
@@ -166,20 +196,61 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeInit(JNIEnv * env, jobje
     g_backend_ready = true;
 }
 
+// Pins the CALLING thread (the Kotlin "llm-engine" thread) to the given CPUs. Threads it creates inherit the mask.
+static void pin_current_thread(const std::vector<int> & cpus) {
+    if (cpus.empty()) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) LOGW("sched_setaffinity failed (ignored)");
+}
+
+// Persistent ggml thread pool pinned to the performance cores. Created through the CPU backend's proc-address table
+// because with GGML_BACKEND_DL the CPU backend is a dlopen()ed variant library we cannot link against directly.
+static void attach_threadpool(Session * s, int n_threads, const std::vector<int> & cpus, int poll) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+    if (!reg) return;
+    auto tp_new = (ggml_threadpool_t (*)(ggml_threadpool_params *)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    auto tp_free = (void (*)(ggml_threadpool_t)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    if (!tp_new || !tp_free) return;
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+    for (int c : cpus) if (c >= 0 && c < GGML_MAX_N_THREADS) tpp.cpumask[c] = true;
+    tpp.strict_cpu = false;          // threads may float within the mask (big cores), not one core each
+    tpp.poll = (uint32_t) std::max(0, std::min(100, poll)); // short busy-poll between ops: lower token latency
+    tpp.prio = GGML_SCHED_PRIO_NORMAL;
+    ggml_threadpool_t tp = tp_new(&tpp);
+    if (!tp) { LOGW("threadpool creation failed; using default"); return; }
+    s->threadpool = tp;
+    s->tp_free = tp_free;
+    llama_attach_threadpool(s->ctx, tp, tp);
+}
+
+// opts: [n_ctx, n_threads, n_batch, n_ubatch, use_mmap, type_k, type_v, flash_attn(-1 auto,0,1), rope_scaling(-1 model,0 none,2 yarn),
+//        yarn_orig_ctx, poll, warmup]
+// fopts: [rope_freq_scale (0 = model)]
+// cpus: performance-core ids to pin to (may be empty)
 JNIEXPORT jlong JNICALL
 Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeLoad(JNIEnv * env, jobject, jstring jpath,
-                                                            jint n_ctx, jint n_threads, jint n_batch,
-                                                            jboolean use_mmap) {
+                                                            jintArray jopts, jfloatArray jfopts, jintArray jcpus) {
     g_last_error.clear();
     const std::string path = jstr(env, jpath);
+    jint o[12] = {2048, 4, 512, 512, 1, GGML_TYPE_F16, GGML_TYPE_F16, -1, -1, 0, 0, 1};
+    env->GetIntArrayRegion(jopts, 0, std::min<jsize>(12, env->GetArrayLength(jopts)), o);
+    jfloat fo[1] = {0.0f};
+    if (jfopts) env->GetFloatArrayRegion(jfopts, 0, std::min<jsize>(1, env->GetArrayLength(jfopts)), fo);
+    std::vector<int> cpus;
+    if (jcpus) { cpus.resize(env->GetArrayLength(jcpus)); env->GetIntArrayRegion(jcpus, 0, (jsize) cpus.size(), cpus.data()); }
+    const int n_ctx = o[0], n_threads = o[1], n_batch = o[2], n_ubatch = o[3];
+    const bool use_mmap = o[4] != 0;
 
     if (ggml_backend_dev_count() == 0) {
         g_last_error = "No CPU backend could be loaded for this device (unsupported CPU?)";
         return 0;
     }
+    pin_current_thread(cpus);
 
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;                                  // CPU only in Phase 1
+    mp.n_gpu_layers = 0;                                  // CPU only
     mp.load_mode = use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
 
     auto * s = new Session();
@@ -192,27 +263,62 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeLoad(JNIEnv * env, jobje
     s->vocab = llama_model_get_vocab(s->model);
 
     const int trained = llama_model_n_ctx_train(s->model);
-    s->n_ctx = std::max(256, std::min((int) n_ctx, trained > 0 ? trained : (int) n_ctx));
-    s->n_batch = std::max(32, std::min((int) n_batch, s->n_ctx));
+    const bool yarn = o[8] == LLAMA_ROPE_SCALING_TYPE_YARN;
+    // Without RoPE scaling the context cannot exceed what the model was trained for; with YaRN it may (up to 4x).
+    const int max_ctx = trained > 0 ? (yarn ? trained * 4 : trained) : n_ctx;
+    s->n_ctx = std::max(256, std::min(n_ctx, max_ctx));
+    s->n_batch = std::max(32, std::min(n_batch, s->n_ctx));
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = (uint32_t) s->n_ctx;
     cp.n_batch = (uint32_t) s->n_batch;
-    cp.n_ubatch = (uint32_t) s->n_batch;
+    cp.n_ubatch = (uint32_t) std::max(32, std::min(n_ubatch, s->n_batch));
     cp.n_seq_max = 1;
     cp.n_threads = n_threads;
     cp.n_threads_batch = n_threads;
     cp.abort_callback = abort_callback;
     cp.abort_callback_data = s;
+    cp.no_perf = true;
+    cp.type_k = (ggml_type) o[5];
+    cp.type_v = (ggml_type) o[6];
+    // A quantised V cache requires flash attention; FA on CPU is also faster and smaller at long contexts.
+    const bool quant_v = cp.type_v != GGML_TYPE_F16 && cp.type_v != GGML_TYPE_F32;
+    cp.flash_attn_type = quant_v ? LLAMA_FLASH_ATTN_TYPE_ENABLED : (llama_flash_attn_type) o[7];
+    if (o[8] >= 0) cp.rope_scaling_type = (llama_rope_scaling_type) o[8];
+    if (yarn) {
+        cp.yarn_orig_ctx = (uint32_t) (o[9] > 0 ? o[9] : trained);
+        cp.rope_freq_scale = fo[0] > 0 ? fo[0] : (float) cp.yarn_orig_ctx / (float) s->n_ctx;
+    } else if (fo[0] > 0) {
+        cp.rope_freq_scale = fo[0];
+    }
 
     s->ctx = llama_init_from_model(s->model, cp);
+    if (!s->ctx && cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED && !quant_v) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        s->ctx = llama_init_from_model(s->model, cp);
+    }
     if (!s->ctx) {
-        g_last_error = "Could not create the inference context (likely out of memory; try a smaller context)";
+        g_last_error = "Could not create the inference context (likely out of memory; try a smaller context or a q4_0 KV cache)";
         free_session(s);
         return 0;
     }
+    s->can_shift = llama_memory_can_shift(llama_get_memory(s->ctx));
     s->batch = llama_batch_init(s->n_batch, 0, 1);
-    LOGI("Model loaded: ctx=%d batch=%d threads=%d mmap=%d", s->n_ctx, s->n_batch, n_threads, (int) use_mmap);
+    attach_threadpool(s, n_threads, cpus, o[10]);
+
+    if (o[11]) {
+        // Warm-up: one tiny decode pages the weights in (mmap) and builds the compute graph, so the first real
+        // token of the first chat is not slowed down by page faults.
+        llama_token t = llama_vocab_bos(s->vocab);
+        if (t < 0) t = 0;
+        batch_clear(s->batch);
+        batch_add(s->batch, t, 0, true);
+        llama_decode(s->ctx, s->batch);
+        llama_memory_clear(llama_get_memory(s->ctx), true);
+    }
+    LOGI("Model loaded: ctx=%d batch=%d ubatch=%d threads=%d mmap=%d kv=%d/%d fa=%d yarn=%d shift=%d",
+         s->n_ctx, s->n_batch, (int) cp.n_ubatch, n_threads, (int) use_mmap, (int) cp.type_k, (int) cp.type_v,
+         (int) cp.flash_attn_type, (int) yarn, (int) s->can_shift);
     return reinterpret_cast<jlong>(s);
 }
 
@@ -228,16 +334,21 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeModelInfo(JNIEnv * env, 
     char desc[256] = {0};
     llama_model_desc(s->model, desc, sizeof(desc));
     const char * tmpl = llama_model_chat_template(s->model, nullptr);
-    std::string fields[6] = {
+    std::string fields[11] = {
         desc,
         std::to_string(llama_model_size(s->model)),
         std::to_string(llama_model_n_params(s->model)),
         std::to_string(llama_model_n_ctx_train(s->model)),
         std::to_string(llama_n_ctx(s->ctx)),
         tmpl ? std::string(tmpl) : std::string(),
+        std::to_string(llama_model_n_layer(s->model)),
+        std::to_string(llama_model_n_head_kv(s->model)),
+        std::to_string(llama_model_n_embd(s->model)),
+        std::to_string(llama_model_n_head(s->model)),
+        s->can_shift ? "1" : "0",
     };
-    jobjectArray arr = env->NewObjectArray(6, env->FindClass("java/lang/String"), nullptr);
-    for (int i = 0; i < 6; i++) {
+    jobjectArray arr = env->NewObjectArray(11, env->FindClass("java/lang/String"), nullptr);
+    for (int i = 0; i < 11; i++) {
         jstring v = env->NewStringUTF(fields[i].c_str());
         env->SetObjectArrayElement(arr, i, v);
         env->DeleteLocalRef(v);
@@ -367,13 +478,18 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeBegin(JNIEnv * env, jobj
                                                              jfloat temp, jint top_k, jfloat top_p, jfloat min_p,
                                                              jfloat repeat_penalty, jint seed, jint max_new,
                                                              jbyteArray jgrammar, jobjectArray jimgs,
-                                                             jintArray jw, jintArray jh) {
+                                                             jintArray jw, jintArray jh, jint n_keep) {
     auto * s = as_session(h);
     s->abort.store(false);
     s->generated = 0;
     s->max_new = max_new;
     s->stop = STOP_NONE;
     s->has_logits = false;
+    s->n_keep = std::max(0, (int) n_keep);
+    s->n_shifts = 0;
+    s->pending = -1;
+    s->out_queue.clear();
+    s->spec_drafted = s->spec_accepted = 0;
 
     if (!setup_sampling(s, temp, top_k, top_p, min_p, repeat_penalty, seed, jbytes(env, jgrammar))) {
         return BEGIN_ERR_GRAMMAR;
@@ -395,12 +511,15 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeBegin(JNIEnv * env, jobj
         rc = eval_text(s, tokens);
     }
     if (rc > 0) s->has_logits = true;
+    s->n_keep = std::min(s->n_keep, std::max(0, (int) s->n_past - 1));
+    const bool has_grammar = jgrammar != nullptr && env->GetArrayLength(jgrammar) > 0;
+    s->spec_active = rc > 0 && s->draft_ctx != nullptr && s->n_draft > 0 && !has_grammar && !s->kv_dirty;
     return rc;
 }
 
 // Sample one token honouring the grammar (if any).
-static llama_token sample_token(Session * s) {
-    llama_token tok = llama_sampler_sample(s->sampler, s->ctx, -1);
+static llama_token sample_token(Session * s, int32_t idx = -1) {
+    llama_token tok = llama_sampler_sample(s->sampler, s->ctx, idx);
     if (!s->grammar) return tok;
     // Fast path: is the freely sampled token allowed by the grammar?
     llama_token_data one{tok, 1.0f, 0.0f};
@@ -411,7 +530,7 @@ static llama_token sample_token(Session * s) {
         return tok;
     }
     // Slow path: mask the full vocabulary with the grammar, then run the normal chain on what is left.
-    const float * logits = llama_get_logits_ith(s->ctx, -1);
+    const float * logits = llama_get_logits_ith(s->ctx, idx);
     const int n_vocab = llama_vocab_n_tokens(s->vocab);
     s->cur.resize(n_vocab);
     for (int i = 0; i < n_vocab; i++) s->cur[i] = llama_token_data{i, logits[i], 0.0f};
@@ -430,19 +549,7 @@ static llama_token sample_token(Session * s) {
     return tok;
 }
 
-// Returns the UTF-8 bytes of the next piece, or null when generation ended (see nativeStopReason).
-JNIEXPORT jbyteArray JNICALL
-Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeNext(JNIEnv * env, jobject, jlong h) {
-    auto * s = as_session(h);
-    if (s->stop != STOP_NONE) return nullptr;
-    if (s->abort.load()) { s->stop = STOP_CANCELLED; return nullptr; }
-    if (!s->has_logits) { s->stop = STOP_ERROR; return nullptr; }
-    if (s->generated >= s->max_new) { s->stop = STOP_MAX_TOKENS; return nullptr; }
-    if ((int) s->n_past >= s->n_ctx - 1) { s->stop = STOP_CONTEXT_FULL; return nullptr; }
-
-    const llama_token tok = sample_token(s);
-    if (llama_vocab_is_eog(s->vocab, tok)) { s->stop = STOP_END_OF_TURN; return nullptr; }
-
+static std::string piece_of(Session * s, llama_token tok) {
     char buf[256];
     int n = llama_token_to_piece(s->vocab, tok, buf, sizeof(buf), 0, /*special*/ false);
     std::string piece;
@@ -453,6 +560,168 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeNext(JNIEnv * env, jobje
     } else {
         piece.assign(buf, n);
     }
+    return piece;
+}
+
+static jbyteArray to_jbytes(JNIEnv * env, const std::string & piece) {
+    jbyteArray out = env->NewByteArray((jsize) piece.size());
+    env->SetByteArrayRegion(out, 0, (jsize) piece.size(), reinterpret_cast<const jbyte *>(piece.data()));
+    return out;
+}
+
+// Context shifting (llama.cpp "infinite generation"): when the window is full, keep the first n_keep tokens (system
+// prompt), discard half of the rest and slide the remainder down. Applied to the draft model's cache too.
+// Returns true when there is room for `need` more tokens afterwards.
+static bool ensure_room(Session * s, int need) {
+    if (s->n_past + need < s->n_ctx) return true;
+    if (!s->can_shift || s->kv_dirty) return false;
+    const int n_left = (int) s->n_past - s->n_keep;
+    const int n_discard = std::max(n_left / 2, need);
+    if (n_left <= 1 || n_discard >= n_left) return false;
+    llama_memory_t mem = llama_get_memory(s->ctx);
+    llama_memory_seq_rm(mem, 0, s->n_keep, s->n_keep + n_discard);
+    llama_memory_seq_add(mem, 0, s->n_keep + n_discard, s->n_past, -n_discard);
+    if ((int) s->kv_tokens.size() >= s->n_keep + n_discard)
+        s->kv_tokens.erase(s->kv_tokens.begin() + s->n_keep, s->kv_tokens.begin() + s->n_keep + n_discard);
+    s->n_past -= n_discard;
+    s->n_shifts++;
+    if (s->draft_ctx) {
+        llama_memory_t dm = llama_get_memory(s->draft_ctx);
+        if (llama_memory_can_shift(dm) && (int) s->draft_kv.size() >= s->n_keep + n_discard) {
+            const int dn = (int) s->draft_kv.size();
+            llama_memory_seq_rm(dm, 0, s->n_keep, s->n_keep + n_discard);
+            llama_memory_seq_add(dm, 0, s->n_keep + n_discard, dn, -n_discard);
+            s->draft_kv.erase(s->draft_kv.begin() + s->n_keep, s->draft_kv.begin() + s->n_keep + n_discard);
+        } else {
+            llama_memory_clear(dm, false);
+            s->draft_kv.clear();
+        }
+    }
+    LOGI("context shift: discarded %d tokens (keep=%d, now %d)", n_discard, s->n_keep, (int) s->n_past);
+    return s->n_past + need < s->n_ctx;
+}
+
+// Brings the draft model's KV cache in line with the target's (common prefix reuse, then batched catch-up).
+static bool sync_draft(Session * s) {
+    llama_memory_t dm = llama_get_memory(s->draft_ctx);
+    size_t common = 0;
+    while (common < s->draft_kv.size() && common < s->kv_tokens.size() && s->draft_kv[common] == s->kv_tokens[common]) common++;
+    if (!llama_memory_seq_rm(dm, 0, (llama_pos) common, -1)) { llama_memory_clear(dm, false); common = 0; }
+    s->draft_kv.resize(common);
+    const int nb = s->n_batch;
+    for (size_t i = common; i < s->kv_tokens.size(); i += nb) {
+        const size_t end = std::min(s->kv_tokens.size(), i + (size_t) nb);
+        batch_clear(s->draft_batch);
+        for (size_t j = i; j < end; j++) batch_add(s->draft_batch, s->kv_tokens[j], (llama_pos) j, false);
+        if (llama_decode(s->draft_ctx, s->draft_batch) != 0) {
+            llama_memory_clear(dm, false);
+            s->draft_kv.clear();
+            return false;
+        }
+        s->draft_kv.insert(s->draft_kv.end(), s->kv_tokens.begin() + i, s->kv_tokens.begin() + end);
+    }
+    return true;
+}
+
+static llama_token argmax_logits(const float * logits, int n_vocab) {
+    int best = 0;
+    for (int i = 1; i < n_vocab; i++) if (logits[i] > logits[best]) best = i;
+    return best;
+}
+
+// One speculative round. Fills out_queue with >= 1 accepted token. Returns false on a fatal decode error.
+static bool spec_round(Session * s) {
+    if (s->pending < 0) s->pending = sample_token(s, -1);
+    const llama_token t0 = s->pending;
+    s->pending = -1;
+    if (llama_vocab_is_eog(s->vocab, t0)) { s->out_queue.push_back(t0); return true; }
+
+    int n_draft = std::min(s->n_draft, std::max(0, s->max_new - s->generated - 1));
+    if (!ensure_room(s, n_draft + 2)) n_draft = std::max(0, s->n_ctx - (int) s->n_past - 2);
+    if ((int) s->n_past + 1 >= s->n_ctx) { s->stop = STOP_CONTEXT_FULL; return true; }
+
+    std::vector<llama_token> drafts;
+    if (n_draft > 0 && sync_draft(s)) {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(s->draft_model));
+        llama_token cur = t0;
+        llama_pos pos = s->n_past;
+        for (int i = 0; i < n_draft; i++) {
+            batch_clear(s->draft_batch);
+            batch_add(s->draft_batch, cur, pos, true);
+            if (llama_decode(s->draft_ctx, s->draft_batch) != 0) break;
+            s->draft_kv.push_back(cur);
+            pos++;
+            const llama_token d = argmax_logits(llama_get_logits_ith(s->draft_ctx, -1), n_vocab);
+            drafts.push_back(d);
+            cur = d;
+            if (llama_vocab_is_eog(s->vocab, d)) break;
+        }
+    }
+
+    batch_clear(s->batch);
+    batch_add(s->batch, t0, s->n_past, true);
+    for (size_t j = 0; j < drafts.size(); j++) batch_add(s->batch, drafts[j], s->n_past + 1 + (llama_pos) j, true);
+    const int rc = llama_decode(s->ctx, s->batch);
+    if (rc != 0) {
+        s->has_logits = false;
+        s->stop = (rc == 2 || s->abort.load()) ? STOP_CANCELLED : STOP_ERROR;
+        if (s->stop == STOP_ERROR) g_last_error = "llama_decode failed during generation (code " + std::to_string(rc) + ")";
+        llama_memory_seq_rm(llama_get_memory(s->ctx), 0, s->n_past, -1);
+        s->out_queue.push_back(t0);
+        return false;
+    }
+    // Verify: sample the TARGET at every position; keep drafts while they agree.
+    size_t k = 0;
+    llama_token next;
+    while (true) {
+        next = sample_token(s, (int32_t) k);
+        if (k < drafts.size() && next == drafts[k]) { k++; continue; }
+        break;
+    }
+    const llama_pos old_past = s->n_past;
+    llama_memory_seq_rm(llama_get_memory(s->ctx), 0, old_past + (llama_pos) k + 1, -1);
+    s->kv_tokens.push_back(t0);
+    for (size_t j = 0; j < k; j++) s->kv_tokens.push_back(drafts[j]);
+    s->n_past = old_past + (llama_pos) k + 1;
+    // Draft cache: drop rejected positions.
+    llama_memory_seq_rm(llama_get_memory(s->draft_ctx), 0, s->n_past, -1);
+    if ((llama_pos) s->draft_kv.size() > s->n_past) s->draft_kv.resize(s->n_past);
+    s->pending = next;
+    s->has_logits = true;
+    s->spec_drafted += (long) drafts.size();
+    s->spec_accepted += (long) k;
+    s->out_queue.push_back(t0);
+    for (size_t j = 0; j < k; j++) s->out_queue.push_back(drafts[j]);
+    return true;
+}
+
+// Returns the UTF-8 bytes of the next piece, or null when generation ended (see nativeStopReason).
+JNIEXPORT jbyteArray JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeNext(JNIEnv * env, jobject, jlong h) {
+    auto * s = as_session(h);
+    if (s->stop != STOP_NONE && s->out_queue.empty()) return nullptr;
+    if (s->abort.load()) { s->stop = STOP_CANCELLED; s->out_queue.clear(); return nullptr; }
+    if (s->generated >= s->max_new) { s->stop = STOP_MAX_TOKENS; s->out_queue.clear(); return nullptr; }
+
+    if (s->spec_active) {
+        if (s->out_queue.empty()) {
+            if (!s->has_logits && s->pending < 0) { s->stop = STOP_ERROR; return nullptr; }
+            spec_round(s);
+            if (s->out_queue.empty()) { if (s->stop == STOP_NONE) s->stop = STOP_ERROR; return nullptr; }
+        }
+        const llama_token tok = s->out_queue.front();
+        s->out_queue.pop_front();
+        if (llama_vocab_is_eog(s->vocab, tok)) { s->stop = STOP_END_OF_TURN; s->out_queue.clear(); return nullptr; }
+        s->generated++;
+        return to_jbytes(env, piece_of(s, tok));
+    }
+
+    if (!s->has_logits) { s->stop = STOP_ERROR; return nullptr; }
+    if (!ensure_room(s, 1)) { s->stop = STOP_CONTEXT_FULL; return nullptr; }
+
+    const llama_token tok = sample_token(s);
+    if (llama_vocab_is_eog(s->vocab, tok)) { s->stop = STOP_END_OF_TURN; return nullptr; }
+    const std::string piece = piece_of(s, tok);
 
     batch_clear(s->batch);
     batch_add(s->batch, tok, s->n_past, true);
@@ -469,10 +738,130 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeNext(JNIEnv * env, jobje
         s->n_past++;
     }
     s->generated++;
+    return to_jbytes(env, piece);
+}
 
-    jbyteArray out = env->NewByteArray((jsize) piece.size());
-    env->SetByteArrayRegion(out, 0, (jsize) piece.size(), reinterpret_cast<const jbyte *>(piece.data()));
-    return out;
+// [n_past, n_ctx, n_shifts, spec_drafted, spec_accepted, kv_tokens]
+JNIEXPORT jintArray JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeStats(JNIEnv * env, jobject, jlong h) {
+    auto * s = as_session(h);
+    jint v[6] = {(jint) s->n_past, s->n_ctx, s->n_shifts, (jint) s->spec_drafted, (jint) s->spec_accepted, (jint) s->kv_tokens.size()};
+    jintArray arr = env->NewIntArray(6);
+    env->SetIntArrayRegion(arr, 0, 6, v);
+    return arr;
+}
+
+// Exact token count of a text under this model's tokenizer (for the chat token counter and context budgeting).
+JNIEXPORT jint JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeCountTokens(JNIEnv * env, jobject, jlong h, jbyteArray jtext) {
+    auto * s = as_session(h);
+    const std::string text = jbytes(env, jtext);
+    const int n = -llama_tokenize(s->vocab, text.data(), (int32_t) text.size(), nullptr, 0, false, true);
+    return n < 0 ? 0 : n;
+}
+
+// Prompt-prefix KV cache on disk (system prompt + skill instructions). If the live KV cache already starts with the
+// prefix nothing happens; else a saved state file for exactly these tokens is loaded; else the prefix is evaluated
+// once and saved. Returns: 0 already cached, 1 loaded from disk, 2 evaluated+saved, <0 error.
+JNIEXPORT jint JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativePrefixCache(JNIEnv * env, jobject, jlong h, jbyteArray jprefix,
+                                                                   jstring jpath, jboolean save) {
+    auto * s = as_session(h);
+    s->abort.store(false);
+    std::vector<llama_token> tokens;
+    if (!tokenize(s->vocab, jbytes(env, jprefix), tokens) || tokens.size() < 2) return -1;
+    if ((int) tokens.size() + 64 > s->n_ctx) return -2;
+    if (!s->kv_dirty && s->kv_tokens.size() >= tokens.size() &&
+        std::equal(tokens.begin(), tokens.end(), s->kv_tokens.begin())) return 0;
+    const std::string path = jstr(env, jpath);
+    llama_memory_t mem = llama_get_memory(s->ctx);
+    if (!path.empty()) {
+        std::vector<llama_token> got(tokens.size() + 8);
+        size_t n_got = 0;
+        std::ifstream probe(path, std::ios::binary);
+        if (probe.good()) {
+            probe.close();
+            llama_memory_clear(mem, false);
+            const size_t rd = llama_state_seq_load_file(s->ctx, path.c_str(), 0, got.data(), got.size(), &n_got);
+            if (rd > 0 && n_got == tokens.size() && std::equal(tokens.begin(), tokens.end(), got.begin())) {
+                s->kv_tokens = tokens;
+                s->kv_dirty = false;
+                s->n_past = (llama_pos) tokens.size();
+                return 1;
+            }
+            llama_memory_clear(mem, false);
+            s->kv_tokens.clear();
+            s->n_past = 0;
+            unlink(path.c_str());   // stale (other model / other prompt): rebuild below
+        }
+    }
+    const jint rc = eval_text(s, tokens);
+    if (rc < 0) return -3;
+    if (save && !path.empty()) {
+        // eval_text re-evaluates the last token if everything was cached; the KV now holds exactly `tokens`.
+        if (llama_state_seq_save_file(s->ctx, path.c_str(), 0, s->kv_tokens.data(), s->kv_tokens.size()) == 0) {
+            LOGW("could not save prefix cache %s", path.c_str());
+            return 3;
+        }
+    }
+    return 2;
+}
+
+// Speculative decoding: loads a small draft model (same tokenizer family) next to the target. n_draft=0 detaches it.
+JNIEXPORT jboolean JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeAttachDraft(JNIEnv * env, jobject, jlong h, jstring jpath,
+                                                                   jint n_draft, jint n_threads, jint type_k) {
+    auto * s = as_session(h);
+    if (s->draft_batch.token) { llama_batch_free(s->draft_batch); s->draft_batch = {}; }
+    if (s->draft_ctx) { llama_free(s->draft_ctx); s->draft_ctx = nullptr; }
+    if (s->draft_model) { llama_model_free(s->draft_model); s->draft_model = nullptr; }
+    s->draft_kv.clear();
+    s->n_draft = 0;
+    if (n_draft <= 0 || jpath == nullptr) return JNI_TRUE;
+    const std::string path = jstr(env, jpath);
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
+    s->draft_model = llama_model_load_from_file(path.c_str(), mp);
+    if (!s->draft_model) { g_last_error = "Could not load the draft model"; return JNI_FALSE; }
+    const llama_vocab * dv = llama_model_get_vocab(s->draft_model);
+    // Same tokenizer required: compare vocab size (allowing padding) and a sample of token texts.
+    const int nt = llama_vocab_n_tokens(s->vocab), nd = llama_vocab_n_tokens(dv);
+    bool ok = std::abs(nt - nd) <= 128;
+    for (int i = 0; ok && i < std::min(nt, nd); i += 997) {
+        const char * a = llama_vocab_get_text(s->vocab, i);
+        const char * b = llama_vocab_get_text(dv, i);
+        ok = a && b && std::strcmp(a, b) == 0;
+    }
+    if (!ok) {
+        llama_model_free(s->draft_model); s->draft_model = nullptr;
+        g_last_error = "The draft model's tokenizer does not match the chat model (use Qwen3-0.6B for Qwen3 models)";
+        return JNI_FALSE;
+    }
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t) s->n_ctx;
+    cp.n_batch = (uint32_t) s->n_batch;
+    cp.n_ubatch = (uint32_t) s->n_batch;
+    cp.n_seq_max = 1;
+    cp.n_threads = n_threads;
+    cp.n_threads_batch = n_threads;
+    cp.no_perf = true;
+    cp.type_k = (ggml_type) type_k;
+    cp.type_v = (ggml_type) type_k;
+    cp.flash_attn_type = (type_k == GGML_TYPE_F16) ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.abort_callback = abort_callback;
+    cp.abort_callback_data = s;
+    s->draft_ctx = llama_init_from_model(s->draft_model, cp);
+    if (!s->draft_ctx) {
+        llama_model_free(s->draft_model); s->draft_model = nullptr;
+        g_last_error = "Could not create the draft context (out of memory?)";
+        return JNI_FALSE;
+    }
+    if (s->threadpool) llama_attach_threadpool(s->draft_ctx, s->threadpool, s->threadpool);
+    s->draft_batch = llama_batch_init(s->n_batch, 0, 1);
+    s->n_draft = std::max(1, std::min((int) n_draft, 16));
+    LOGI("draft model attached, n_draft=%d", s->n_draft);
+    return JNI_TRUE;
 }
 
 JNIEXPORT jint JNICALL

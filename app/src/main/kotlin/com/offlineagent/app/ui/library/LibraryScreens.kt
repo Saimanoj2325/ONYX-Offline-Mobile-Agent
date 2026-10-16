@@ -53,12 +53,13 @@ import com.offlineagent.core.data.ModelEntity
 import com.offlineagent.core.inference.EngineState
 import com.offlineagent.engine.llamacpp.DeviceInfo
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.map
 
 // ---------------------------------------------------------------- Documents (RAG library)
 
 @Composable
 fun DocumentsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modifier = Modifier) {
-    val docsFlow = remember { app.db.documents().observeDocuments() }
+    val docsFlow = remember { app.db.documents().observeDocuments().map { l -> l.filter { it.mime != com.offlineagent.app.data.ChatMemory.MIME } } }
     val docs by docsFlow.collectAsStateWithLifecycle(emptyList())
     val progress by app.indexer.progress.collectAsStateWithLifecycle()
     val models by app.models.models.collectAsStateWithLifecycle(emptyList())
@@ -124,6 +125,7 @@ fun ModelsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modif
     val settings by app.settings.settings.collectAsStateWithLifecycle(AppSettings())
     val engine by app.inference.state.collectAsStateWithLifecycle()
     val loaded by app.engineController.loaded.collectAsStateWithLifecycle()
+    val ctxEff = remember(settings) { app.engineController.effectiveContext(settings, app.engineController.planFor(null, settings)) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var importing by remember { mutableStateOf<String?>(null) }
@@ -190,7 +192,7 @@ fun ModelsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modif
                 }
             }
             items(models.filter { it.role == role.name }, key = { it.id }) { m ->
-                ModelCard(m, isLoaded = loaded?.id == m.id && (engine is EngineState.Ready || engine is EngineState.Generating), settings = settings,
+                ModelCard(m, isLoaded = loaded?.id == m.id && (engine is EngineState.Ready || engine is EngineState.Generating), ctx = ctxEff,
                     onActivate = { scope.launch { app.models.activate(m) } },
                     onLoad = { scope.launch { try { app.engineController.load(m); notify("Loaded ${m.name}") } catch (e: Throwable) { notify("Load failed: ${e.message}") } } },
                     onUnload = { scope.launch { app.inference.unload(); app.engineController.markUnloaded() } },
@@ -202,19 +204,8 @@ fun ModelsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modif
         item {
             HorizontalDivider()
             Text("Settings", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
-            Text("Context length (applies on next load). 4096 is recommended for Canvas and skills.", style = MaterialTheme.typography.bodySmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(2048, 4096, 8192).forEach { n ->
-                    FilterChip(selected = settings.contextLength == n, onClick = { scope.launch { app.settings.update { it.copy(contextLength = n) } } }, label = { Text("$n") })
-                }
-            }
-            val rec = DeviceInfo.recommendedThreads()
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("CPU threads: ${if (settings.threads == 0) "auto ($rec)" else settings.threads}", modifier = Modifier.weight(1f))
-                TextButton(onClick = { scope.launch { app.settings.update { it.copy(threads = ((if (it.threads == 0) rec else it.threads) - 1).coerceAtLeast(1)) } } }) { Text("−") }
-                TextButton(onClick = { scope.launch { app.settings.update { it.copy(threads = ((if (it.threads == 0) rec else it.threads) + 1).coerceAtMost(8)) } } }) { Text("+") }
-                TextButton(onClick = { scope.launch { app.settings.update { it.copy(threads = 0) } } }) { Text("Auto") }
-            }
+            Text("Context window, KV cache, threads, speculative decoding and memory: Settings → Performance & long context. " +
+                "Current window: ${ctxEff / 1024}K tokens.", style = MaterialTheme.typography.bodySmall)
             if (settings.alwaysAllowedTools.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Always allowed without asking: ${settings.alwaysAllowedTools.joinToString()}", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { scope.launch { app.settings.update { it.copy(alwaysAllowedTools = emptySet()) } } }) { Text("Reset") }
@@ -229,7 +220,7 @@ fun ModelsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modif
         onDismissRequest = { showRecs = false },
         confirmButton = { TextButton(onClick = { showRecs = false }) { Text("Close") } },
         title = { Text("Recommended models") },
-        text = { RecommendationList(settings.contextLength) },
+        text = { RecommendationList(ctxEff) },
     )
 }
 
@@ -253,7 +244,7 @@ private fun RecommendationList(ctx: Int) {
 
 @Composable
 private fun ModelCard(
-    m: ModelEntity, isLoaded: Boolean, settings: AppSettings,
+    m: ModelEntity, isLoaded: Boolean, ctx: Int,
     onActivate: () -> Unit, onLoad: () -> Unit, onUnload: () -> Unit, onDelete: () -> Unit, onAddMmproj: () -> Unit,
 ) {
     Card(Modifier.fillMaxWidth(), colors = if (m.active) CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer) else CardDefaults.cardColors()) {
@@ -263,7 +254,7 @@ private fun ModelCard(
                     Text(m.name, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     Text(
                         formatBytes(m.sizeBytes) + (if (m.active) " · selected" else "") + (if (isLoaded) " · loaded" else "") +
-                            (if (m.role != ModelRole.EMBEDDING.name) " · needs ≈${formatBytes(ModelAdvice.estimateRamBytes(m.sizeBytes, settings.contextLength))} RAM" else ""),
+                            (if (m.role == ModelRole.CHAT.name || m.role == ModelRole.VISION.name) " · needs ≈${formatBytes(ModelAdvice.estimateRamBytes(m.sizeBytes, ctx, 58_000))} RAM" else ""),
                         style = MaterialTheme.typography.bodySmall,
                     )
                     if (m.role == ModelRole.VISION.name) Text(
@@ -276,7 +267,7 @@ private fun ModelCard(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!m.active) OutlinedButton(onClick = onActivate) { Text("Use") }
-                if (m.role != ModelRole.EMBEDDING.name) {
+                if (m.role == ModelRole.CHAT.name || m.role == ModelRole.VISION.name) {
                     if (isLoaded) OutlinedButton(onClick = onUnload) { Text("Unload") } else OutlinedButton(onClick = onLoad) { Text("Load now") }
                 }
                 if (m.role == ModelRole.VISION.name) OutlinedButton(onClick = onAddMmproj) { Text(if (m.mmprojPath == null) "Add projector" else "Replace projector") }

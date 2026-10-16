@@ -26,14 +26,19 @@ internal object LlamaNative {
     }
 
     external fun nativeInit(nativeLibDir: String)
-    external fun nativeLoad(path: String, nCtx: Int, nThreads: Int, nBatch: Int, useMmap: Boolean): Long
+    /** opts/fopts layout: see llama_jni.cpp nativeLoad. */
+    external fun nativeLoad(path: String, opts: IntArray, fopts: FloatArray, cpus: IntArray): Long
     external fun nativeLastError(): String
     external fun nativeModelInfo(handle: Long): Array<String>
     external fun nativeBegin(
         handle: Long, promptUtf8: ByteArray, temp: Float, topK: Int, topP: Float, minP: Float,
         repeatPenalty: Float, seed: Int, maxNew: Int,
-        grammarUtf8: ByteArray?, imagesRgb: Array<ByteArray>?, widths: IntArray?, heights: IntArray?,
+        grammarUtf8: ByteArray?, imagesRgb: Array<ByteArray>?, widths: IntArray?, heights: IntArray?, nKeep: Int,
     ): Int
+    external fun nativeStats(handle: Long): IntArray
+    external fun nativeCountTokens(handle: Long, textUtf8: ByteArray): Int
+    external fun nativePrefixCache(handle: Long, prefixUtf8: ByteArray, path: String, save: Boolean): Int
+    external fun nativeAttachDraft(handle: Long, path: String?, nDraft: Int, nThreads: Int, typeK: Int): Boolean
     external fun nativeAttachMmproj(handle: Long, mmprojPath: String, nThreads: Int): Boolean
     external fun nativeMediaMarker(): String
     external fun nativeApplyTemplate(handle: Long, roles: Array<String>, contentsUtf8: Array<ByteArray>): ByteArray?

@@ -1,0 +1,29 @@
+# Baseline profile (hand-written): classes and methods on the cold-start and first-chat path are AOT-compiled at
+# install time by ProfileInstaller, so the app does not start in the interpreter. Regenerate with a Macrobenchmark
+# BaselineProfileRule on a real device for best results (see docs/PHASE3.md).
+HSPLcom/offlineagent/app/OfflineAgentApp;->onCreate()V
+HSPLcom/offlineagent/app/OfflineAgentApp;-><init>()V
+HSPLcom/offlineagent/app/MainActivity;->onCreate(Landroid/os/Bundle;)V
+Lcom/offlineagent/app/MainActivity;
+Lcom/offlineagent/app/OfflineAgentApp;
+HSPLcom/offlineagent/app/ui/chat/ChatViewModel;-><init>(Landroid/app/Application;)V
+HSPLcom/offlineagent/app/ui/chat/ChatViewModel;->**(**)**
+HSPLcom/offlineagent/app/ui/chat/ChatScreenKt;->**(**)**
+HSPLcom/offlineagent/app/ui/markdown/**;->**(**)**
+HSPLcom/offlineagent/app/data/EngineController;->**(**)**
+HSPLcom/offlineagent/app/data/ModelStore;->**(**)**
+HSPLcom/offlineagent/core/data/**;->**(**)**
+HSPLcom/offlineagent/core/inference/**;->**(**)**
+HSPLcom/offlineagent/core/runtime/context/**;->**(**)**
+HSPLcom/offlineagent/core/runtime/ui/**;->**(**)**
+HSPLcom/offlineagent/engine/llamacpp/**;->**(**)**
+Lcom/offlineagent/core/inference/**;
+Lcom/offlineagent/core/data/**;
+Lcom/offlineagent/engine/llamacpp/**;
+HSPLandroidx/compose/runtime/**;->**(**)**
+HSPLandroidx/compose/ui/**;->**(**)**
+HSPLandroidx/compose/foundation/lazy/**;->**(**)**
+HSPLandroidx/compose/material3/**;->**(**)**
+HSPLkotlinx/coroutines/**;->**(**)**
+HSPLandroidx/room/**;->**(**)**
+HSPLandroidx/datastore/**;->**(**)**

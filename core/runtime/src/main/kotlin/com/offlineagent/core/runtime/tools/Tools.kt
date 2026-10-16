@@ -19,6 +19,16 @@ enum class Permission(val label: String) {
     WRITE_LOCAL("writes app data"),
     /** Hands data to another app via an Android intent (share sheet, calendar). Always needs approval. */
     EXTERNAL_INTENT("leaves the app"),
+    /** Reads personal data outside the app (contacts, calendar, notifications, files in picked folders). */
+    SENSITIVE_READ("reads personal data"),
+    /** Changes phone state (alarm, timer, flashlight, volume, ringer, files). Approval unless always-allowed. */
+    DEVICE_CONTROL("changes phone settings"),
+    /** Acts inside another app's UI via the accessibility service. Approval per action; never auto-allowed. */
+    SCREEN_ACTION("acts in another app");
+
+    val hasSideEffects: Boolean get() = this == WRITE_LOCAL || this == EXTERNAL_INTENT || this == DEVICE_CONTROL || this == SCREEN_ACTION
+    /** The user may tick "always allow" for these. */
+    val canAlwaysAllow: Boolean get() = this == WRITE_LOCAL || this == SENSITIVE_READ || this == DEVICE_CONTROL
 }
 
 data class ToolSpec(

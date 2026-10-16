@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Camera photos are written by the camera app into app-private storage via this provider (no storage permission). -->
+<!-- Camera photos are written by the camera app into app-private storage via this provider (no storage permission).
+     Exported PDFs are shared from cache/exports. -->
 <paths>
     <files-path name="attachments" path="attachments/" />
+    <cache-path name="exports" path="exports/" />
 </paths>

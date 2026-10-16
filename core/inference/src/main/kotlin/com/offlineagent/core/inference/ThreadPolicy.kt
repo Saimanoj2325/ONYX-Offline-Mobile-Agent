@@ -28,6 +28,18 @@ object ThreadPolicy {
         }
         return result.coerceIn(1, MAX_THREADS)
     }
+
+    /**
+     * CPU ids of the performance cores (all cores faster than the slowest cluster), used to pin the inference
+     * thread pool. Empty when the topology is unknown or uniform (the OS scheduler is then left alone).
+     */
+    fun performanceCoreIds(maxFreqsKhz: List<Long>): List<Int> {
+        val known = maxFreqsKhz.filter { it > 0 }
+        if (known.isEmpty() || known.size < maxFreqsKhz.size / 2) return emptyList()
+        val minFreq = known.min()
+        val ids = maxFreqsKhz.indices.filter { maxFreqsKhz[it] > minFreq }
+        return ids.take(MAX_THREADS)
+    }
 }
 
 /** Minimal GGUF sanity checks done before handing a file to the native loader. */

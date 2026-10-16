@@ -49,6 +49,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -88,6 +89,11 @@ data class ChatUi(
     val citation: Citation? = null,
     val skillSuggestion: Skill? = null,
     val unfinishedRun: RunCheckpoint? = null,
+    /** Prompt tokens of the last request / context window (chat token counter). */
+    val contextUsed: Int = 0,
+    val contextSize: Int = 0,
+    /** Exported PDF being previewed. */
+    val pdf: com.offlineagent.app.pdf.PdfExporter.ExportedPdf? = null,
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -104,6 +110,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val chatList: StateFlow<List<ChatEntity>> = chats.observeChats().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     private val chatIdFlow = MutableStateFlow<Long?>(null)
     val messages: StateFlow<List<MessageEntity>> = chatIdFlow.flatMapLatest { id -> if (id == null) flowOf(emptyList()) else chats.observeMessages(id) }
+        .map { l -> l.filter { it.kind != KIND_SUMMARY } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val chat: StateFlow<ChatEntity?> = chatIdFlow.flatMapLatest { id -> if (id == null) flowOf(null) else chats.observeChat(id) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
@@ -259,7 +266,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             // Skills: explicit /skill-id, or the suggestion chip
             val explicit = if (forceSkill != null) SkillMatcher.Match(forceSkill, text, true) else if (text.startsWith("/")) SkillMatcher.match(text, g.skills.parsed()) else null
-            if (explicit != null) { runAgent(chatId, explicit.request, explicit.skill); return@launch }
+            if (explicit != null) {
+                if (explicit.skill.id == "write-report") runReport(chatId, explicit.request) else runAgent(chatId, explicit.request, explicit.skill)
+                return@launch
+            }
 
             val s = g.settings.current()
             val hasCanvas = (chats.chat(chatId)?.canvasVersion ?: 0) > 0
@@ -292,7 +302,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun history(chatId: Long, maxTurns: Int = 8): List<ChatMessage> {
-        val msgs = chats.messages(chatId).filter { it.error == null }.takeLast(maxTurns * 2 + 1)
+        val msgs = chats.messages(chatId).filter { it.error == null && it.kind != KIND_SUMMARY }.takeLast(maxTurns * 2 + 1)
         return msgs.dropLast(1).mapNotNull { m ->
             when {
                 m.role == "user" -> ChatMessage(Role.USER, m.text.ifBlank { "(photo)" })
@@ -307,16 +317,57 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         rag.forEachIndexed { i, r -> add(buildJsonObject { put("n", i + 1); put("title", r.candidate.documentTitle); put("text", r.candidate.text); put("documentId", r.candidate.documentId) }) }
     }.toString()
 
+    /** Live turns of the chat (oldest first) for the context manager, without the request just added. */
+    private suspend fun turns(chatId: Long): List<com.offlineagent.core.runtime.context.Turn> {
+        val msgs = chats.messages(chatId).filter { it.error == null && it.kind != KIND_SUMMARY }
+        return msgs.dropLast(1).mapNotNull { m ->
+            when {
+                m.role == "user" -> com.offlineagent.core.runtime.context.Turn(m.id, Role.USER, m.text.ifBlank { "(photo)" })
+                m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed a canvas: ${m.text})")
+                m.text.isNotBlank() -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, m.text.take(4000))
+                else -> null
+            }
+        }
+    }
+
+    private suspend fun latestSummary(chatId: Long): com.offlineagent.core.runtime.context.ConversationSummary? =
+        chats.messages(chatId).lastOrNull { it.kind == KIND_SUMMARY }?.let { m ->
+            com.offlineagent.core.runtime.context.ConversationSummary(m.text, m.runId?.removePrefix("upTo:")?.toLongOrNull() ?: 0)
+        }
+
+    private fun contextManager(s: AppSettings): com.offlineagent.core.runtime.context.ContextManager {
+        val llm = com.offlineagent.core.runtime.agent.InferenceAgentLlm(g.inference)
+        return com.offlineagent.core.runtime.context.ContextManager(
+            counter = { t -> g.inference.countTokens(t) ?: com.offlineagent.core.runtime.context.TokenCounter.estimate(t) },
+            summarizer = if (s.autoSummarize) com.offlineagent.core.runtime.context.ConversationSummarizer { prev, turns, words ->
+                _ui.update { it.copy(streaming = it.streaming?.copy(phase = "Summarising older messages…")) }
+                val (sys, user) = com.offlineagent.core.runtime.context.ContextManager.summaryPrompt(prev, turns, words)
+                llm.complete(sys, user, null, words * 2)
+            } else null,
+            memory = if (s.longTermMemory) g.chatMemory else null,
+        )
+    }
+
     private suspend fun answerMarkdown(chatId: Long, text: String, images: List<File>, rag: List<RetrievedChunk>, thinking: Boolean) {
+        val s = g.settings.current()
         val system = buildString {
             append(SYSTEM_PROMPT)
             if (rag.isNotEmpty()) append("\n\n").append(RagPrompt.context(rag))
         }
+        val info = (g.inference.state.value as? EngineState.Ready)?.model
+        val ctx = info?.contextLength ?: 4096
+        val plan = g.engineController.plan.value ?: g.engineController.planFor(null, s)
+        val maxOut = if (thinking) g.engineController.maxOutput(s, plan, ctx).coerceAtLeast(1536) else g.engineController.maxOutput(s, plan, ctx)
         val imgs = withContext(Dispatchers.Default) { images.map { toImageData(it) } }
-        val req = GenerationRequest(
-            listOf(ChatMessage(Role.SYSTEM, system)) + history(chatId) + ChatMessage(Role.USER, text.ifBlank { "Describe this image." }, imgs),
-            thinking = thinking && images.isEmpty(), maxNewTokens = if (thinking) 1536 else 900,
-        )
+        val built = contextManager(s).build(system, turns(chatId), latestSummary(chatId), text.ifBlank { "Describe this image." }, ctx, maxOut)
+        if (built.summaryChanged) built.summary?.let { sum ->
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "system", text = sum.text, kind = KIND_SUMMARY, runId = "upTo:${sum.upToId}", createdAt = System.currentTimeMillis()))
+            if (s.longTermMemory) viewModelScope.launch { runCatching { g.chatMemory.add("summary of \"${chats.chat(chatId)?.title}\"", sum.text, emptySet()) } }
+        }
+        _ui.update { it.copy(contextUsed = built.promptTokens, contextSize = ctx) }
+        val msgs = built.messages.toMutableList()
+        if (imgs.isNotEmpty()) msgs[msgs.size - 1] = msgs.last().copy(images = imgs)
+        val req = GenerationRequest(msgs, thinking = thinking && images.isEmpty(), maxNewTokens = maxOut)
         _ui.update { it.copy(streaming = Streaming(AnswerMode.MARKDOWN, phase = if (images.isNotEmpty()) "Looking at the image…" else "Reading…")) }
         val splitter = ThinkSplitter()
         var lastEmit = 0L
@@ -345,6 +396,64 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             createdAt = System.currentTimeMillis(),
         ))
         chats.touch(chatId, System.currentTimeMillis())
+        st?.let { stt -> _ui.update { it.copy(contextUsed = (stt.contextUsed.takeIf { c -> c > 0 } ?: (it.contextUsed + stt.generatedTokens))) } }
+        if (s.longTermMemory && p.answer.isNotBlank()) {
+            val all = chats.messages(chatId)
+            val ans = all.lastOrNull { it.role == "assistant" }
+            val q = all.lastOrNull { it.role == "user" }
+            if (ans != null && q != null) viewModelScope.launch {
+                runCatching { g.chatMemory.add("chat \"${chats.chat(chatId)?.title}\"", "User: ${q.text.take(600)}\nAssistant: ${ans.text.take(900)}", setOf(q.id, ans.id)) }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ PDF export / report skill
+
+    fun exportChatPdf() {
+        val id = _ui.value.chatId ?: return notice("Nothing to export yet.")
+        viewModelScope.launch {
+            try { g.pdf.exportChat(id); _ui.update { it.copy(pdf = g.pdf.last) } } catch (e: Throwable) { notice("PDF export failed: ${e.message}") }
+        }
+    }
+
+    fun exportCanvasPdf() {
+        val id = _ui.value.chatId ?: return
+        viewModelScope.launch {
+            try { g.pdf.exportCanvas(id); _ui.update { it.copy(pdf = g.pdf.last) } } catch (e: Throwable) { notice("PDF export failed: ${e.message}") }
+        }
+    }
+
+    fun closePdf() = _ui.update { it.copy(pdf = null) }
+
+    /** "Write a report / PDF" skill: outline -> section-by-section writing -> multi-page PDF in Downloads. */
+    private suspend fun runReport(chatId: Long, request: String) {
+        val taskId = "report-$chatId-${System.currentTimeMillis()}"
+        com.offlineagent.app.work.LongTasks.start(g, com.offlineagent.app.work.LongTask(taskId, "Writing your report", "Planning…"))
+        _ui.update { it.copy(streaming = Streaming(AnswerMode.MARKDOWN, phase = "Planning the report…")) }
+        try {
+            g.engineController.ensure(ModelRole.CHAT)
+            val s = g.settings.current()
+            val notes = if (s.useDocuments && g.retriever.hasDocuments()) g.retriever.search(request, 6).joinToString("\n\n") { "[${it.candidate.documentTitle}] ${it.candidate.text}" } else ""
+            val writer = com.offlineagent.core.runtime.pdf.ReportWriter(com.offlineagent.core.runtime.agent.InferenceAgentLlm(g.inference))
+            val outline = writer.outline(request, 6, notes)
+            val md = writer.write(request, outline, notes, onProgress = { p ->
+                val msg = "Section ${p.section}/${p.total}: ${p.phase}"
+                _ui.update { it.copy(streaming = it.streaming?.copy(phase = msg)) }
+                com.offlineagent.app.work.LongTasks.update(g, com.offlineagent.app.work.LongTask(taskId, "Writing your report", msg, p.section.toFloat() / p.total))
+            })
+            _ui.update { it.copy(streaming = it.streaming?.copy(phase = "Rendering PDF…")) }
+            val body = md.substringAfter('\n') // the writer starts with "# title"
+            val out = g.pdf.createPdf(com.offlineagent.core.runtime.pdf.PdfDocModel(outline.title, com.offlineagent.core.runtime.pdf.PdfContent.fromMarkdown(body, g.pdf::imageResolver), subtitle = outline.subtitle),
+                com.offlineagent.app.pdf.PdfExporter.safeName(outline.title) + ".pdf")
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = md + "\n\n---\n**PDF saved:** Downloads/OfflineAgent/${out.fileName} (${out.pages} pages)",
+                statsText = "report · ${outline.sections.size} sections", createdAt = System.currentTimeMillis()))
+            _ui.update { it.copy(pdf = g.pdf.last) }
+        } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", error = "Report failed: ${e.message}", createdAt = System.currentTimeMillis()))
+        } finally {
+            com.offlineagent.app.work.LongTasks.finish(g, taskId)
+            _ui.update { it.copy(streaming = null) }
+        }
     }
 
     private suspend fun answerCanvas(chatId: Long, text: String, mode: AnswerMode, rag: List<RetrievedChunk>) {
@@ -480,6 +589,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        const val KIND_SUMMARY = "summary"
         const val SYSTEM_PROMPT =
             "You are a helpful assistant running fully offline on the user's Android phone. Answer clearly and concisely. " +
                 "Use Markdown: headings, bullet lists, tables, **bold** and fenced code blocks where they help."

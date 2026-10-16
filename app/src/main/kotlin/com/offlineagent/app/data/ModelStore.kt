@@ -12,6 +12,7 @@ enum class ModelRole(val label: String, val hint: String) {
     CHAT("Chat", "Answers, Canvas UI and agent tool calls"),
     EMBEDDING("Embedding", "Turns documents into vectors for search (RAG)"),
     VISION("Vision", "Understands attached photos (needs a matching mmproj file)"),
+    DRAFT("Draft (speed-up)", "Small model with the same tokenizer for speculative decoding, e.g. Qwen3-0.6B for Qwen3-1.7B/4B"),
 }
 
 /** Multiple local models with roles (chat / embedding / vision). One active model per role. */

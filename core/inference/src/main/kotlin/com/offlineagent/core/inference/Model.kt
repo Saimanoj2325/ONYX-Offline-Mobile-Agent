@@ -10,6 +10,18 @@ class ImageData(val rgb: ByteArray, val width: Int, val height: Int) {
 
 data class ChatMessage(val role: Role, val content: String, val images: List<ImageData> = emptyList())
 
+/** KV-cache element type. ids are ggml_type values passed straight to llama.cpp. */
+enum class KvCacheType(val ggmlType: Int, val bytesPerElement: Double, val label: String) {
+    F16(1, 2.0, "f16 (largest, exact)"),
+    Q8_0(8, 34.0 / 32.0, "q8_0 (default: half the memory, ~lossless)"),
+    Q4_0(2, 18.0 / 32.0, "q4_0 (smallest, slight quality loss)"),
+}
+
+enum class FlashAttention(val native: Int) { AUTO(-1), OFF(0), ON(1) }
+
+/** RoPE scaling. YARN stretches a model past its trained context (Qwen3: 32K native -> 64K/128K, experimental). */
+enum class RopeScaling(val native: Int) { MODEL(-1), NONE(0), YARN(2) }
+
 /** How to load a model. All values are local; there is no remote option by design. */
 data class LoadConfig(
     /** Absolute path to a GGUF file in app-internal storage. */
@@ -18,21 +30,45 @@ data class LoadConfig(
     val contextLength: Int = DEFAULT_CONTEXT_LENGTH,
     /** CPU threads for decode and prompt processing. */
     val threads: Int = ThreadPolicy.FALLBACK_THREADS,
-    /** Prompt-processing batch size. */
+    /** Prompt-processing (logical) batch size. */
     val batchSize: Int = 512,
-    /** Memory-map the weights instead of reading them into heap (always true in Phase 1). */
+    /** Physical micro-batch size (compute buffer scales with it). */
+    val ubatchSize: Int = 512,
+    /** Memory-map the weights instead of reading them into heap. */
     val useMmap: Boolean = true,
     /** Optional vision projector (mmproj GGUF) for image input. */
     val mmprojPath: String? = null,
+    /** KV cache precision (K and V). Quantised V forces flash attention on. */
+    val kvCacheType: KvCacheType = KvCacheType.F16,
+    val flashAttention: FlashAttention = FlashAttention.AUTO,
+    val ropeScaling: RopeScaling = RopeScaling.MODEL,
+    /** YaRN original (trained) context; 0 = from the model. */
+    val yarnOriginalContext: Int = 0,
+    /** CPU ids to pin inference threads to (performance cores). Empty = OS default. */
+    val cpuIds: List<Int> = emptyList(),
+    /** ggml thread-pool busy-poll level 0..100 (higher = lower latency, more power). */
+    val pollLevel: Int = 50,
+    /** Run one tiny decode after loading so weights are paged in before the first real request. */
+    val warmup: Boolean = true,
+    /** Optional speculative-decoding draft model (same tokenizer, e.g. Qwen3-0.6B for Qwen3-1.7B/4B). */
+    val draftModelPath: String? = null,
+    /** Tokens the draft proposes per round. */
+    val draftTokens: Int = 6,
+    /** Directory for on-disk prompt-prefix KV caches (system prompt + skills). null = off. */
+    val prefixCacheDir: String? = null,
 ) {
     init {
-        require(contextLength in 256..32768) { "contextLength out of range: $contextLength" }
+        require(contextLength in 256..MAX_CONTEXT_LENGTH) { "contextLength out of range: $contextLength" }
         require(threads in 1..16) { "threads out of range: $threads" }
-        require(batchSize in 32..2048) { "batchSize out of range: $batchSize" }
+        require(batchSize in 32..4096) { "batchSize out of range: $batchSize" }
+        require(ubatchSize in 32..4096) { "ubatchSize out of range: $ubatchSize" }
+        require(pollLevel in 0..100) { "pollLevel out of range: $pollLevel" }
+        require(draftTokens in 1..16) { "draftTokens out of range: $draftTokens" }
     }
 
     companion object {
         const val DEFAULT_CONTEXT_LENGTH = 2048
+        const val MAX_CONTEXT_LENGTH = 131072
     }
 }
 
@@ -49,6 +85,16 @@ data class ModelInfo(
     val backendInfo: String,
     /** True when a vision projector (mmproj) is attached, i.e. the model accepts images. */
     val supportsImages: Boolean = false,
+    /** Architecture numbers used for KV-cache memory estimates (0 = unknown). */
+    val layers: Int = 0,
+    val kvHeads: Int = 0,
+    val embedding: Int = 0,
+    val heads: Int = 0,
+    /** KV cache can be shifted (context shifting / infinite generation). */
+    val canShift: Boolean = false,
+    val kvCacheType: KvCacheType = KvCacheType.F16,
+    /** Speculative decoding with a draft model is active. */
+    val speculative: Boolean = false,
 )
 
 /** Sampling settings. Defaults follow Qwen3's published non-thinking recommendations. */
@@ -75,6 +121,8 @@ data class GenerationRequest(
     val thinking: Boolean = false,
     val maxNewTokens: Int = 512,
     val sampling: SamplingParams = if (thinking) SamplingParams.QWEN3_THINKING else SamplingParams.QWEN3_NON_THINKING,
+    /** Re-use / persist the KV cache of the system prompt across requests and app restarts. */
+    val cachePrefix: Boolean = true,
     /**
      * Optional GBNF grammar (root rule "root"). When set, the engine can only emit text the grammar accepts:
      * used for Canvas UI JSON and agent tool calls so the output always parses.
@@ -90,7 +138,21 @@ data class GenerationStats(
     val promptMillis: Long,
     val generationMillis: Long,
     val stopReason: StopReason,
+    /** Tokens in the KV cache after this request (prompt + generated, after any shifting). */
+    val contextUsed: Int = 0,
+    val contextLength: Int = 0,
+    /** How many times the window slid (old tokens discarded) during generation. */
+    val contextShifts: Int = 0,
+    /** Speculative decoding: tokens proposed by the draft model and how many the target accepted. */
+    val draftedTokens: Int = 0,
+    val acceptedTokens: Int = 0,
+    /** Messages dropped from the start of the conversation to fit the window. */
+    val droppedMessages: Int = 0,
+    /** System-prompt prefix cache: 0 already in KV, 1 loaded from disk, 2 evaluated+saved, -1 not used. */
+    val prefixCache: Int = -1,
 ) {
+    val acceptanceRate: Double get() = if (draftedTokens <= 0) 0.0 else acceptedTokens.toDouble() / draftedTokens
+
     /** Decode speed: generated tokens / time spent generating (excludes prompt processing). */
     val tokensPerSecond: Double
         get() = if (generationMillis <= 0) 0.0 else generatedTokens * 1000.0 / generationMillis

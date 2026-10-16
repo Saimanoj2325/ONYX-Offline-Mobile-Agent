@@ -158,7 +158,7 @@ object SkillMatcher {
 
 /** The skills shipped with the app (markdown files in resources/skills). */
 object BuiltinSkills {
-    val FILES = listOf("study-plan.md", "flashcards.md", "compare-options.md", "daily-planner.md", "explain-concept.md")
+    val FILES = listOf("study-plan.md", "flashcards.md", "compare-options.md", "daily-planner.md", "explain-concept.md", "write-report.md", "phone-helper.md")
 
     fun load(knownTools: Set<String>? = null): List<Skill> = FILES.mapNotNull { f ->
         val text = BuiltinSkills::class.java.getResourceAsStream("/skills/$f")?.bufferedReader()?.use { it.readText() } ?: return@mapNotNull null

@@ -105,8 +105,11 @@ class RagAndSkillsTest {
 
     @Test fun builtinSkillsLoadAndMatch() {
         val skills = BuiltinSkills.load(setOf("search_docs", "read_document", "summarize", "render_ui", "calculator", "get_datetime", "memory_read", "create_calendar_event"))
-        assertEquals(5, skills.size)
-        skills.forEach { assertTrue(it.name, it.wantsUi && it.tools.contains("render_ui")) }
+        // Phase 3 added write-report and phone-helper (7 built-ins); the five Phase 2 canvas skills are unchanged.
+        assertEquals(7, skills.size)
+        val phase2 = setOf("study-plan", "flashcards", "compare-options", "daily-planner", "explain-concept")
+        assertEquals(phase2, skills.filter { it.id in phase2 }.map { it.id }.toSet())
+        skills.filter { it.id in phase2 }.forEach { assertTrue(it.name, it.wantsUi && it.tools.contains("render_ui")) }
         assertEquals("study-plan", SkillMatcher.match("Make a study plan for my exam", skills)!!.skill.id)
         val explicit = SkillMatcher.match("/compare-options iPhone vs Pixel", skills)!!
         assertTrue(explicit.explicit)

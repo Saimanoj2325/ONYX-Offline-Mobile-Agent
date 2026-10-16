@@ -132,7 +132,8 @@ class DocumentIndexer(
         job = scope.launch(Dispatchers.IO) {
             val m = models.active(ModelRole.EMBEDDING) ?: return@launch onDone("No embedding model selected")
             embeddings.ensureLoaded(m.path, DeviceInfo.recommendedThreads())
-            for (d in dao.documents().filter { it.status == "READY" }) {
+            // Incremental: documents already embedded with this model are skipped.
+            for (d in dao.documents().filter { it.status == "READY" && it.mime != ChatMemory.MIME && it.embeddingModel != m.name }) {
                 val text = File(d.textPath).takeIf { it.isFile }?.readText() ?: continue
                 val chunks = Chunker.chunk(text, 900, 150)
                 dao.deleteChunks(d.id)
@@ -157,10 +158,11 @@ class DocumentIndexer(
 
 /** Hybrid (vector + FTS4 keyword) retrieval over Room. */
 class Retriever(private val dao: DocumentDao, private val embeddings: EmbeddingService, private val models: ModelStore) {
-    suspend fun hasDocuments(): Boolean = dao.documents().any { it.status == "READY" }
+    suspend fun hasDocuments(): Boolean = dao.documents().any { it.status == "READY" && it.mime != ChatMemory.MIME }
 
-    suspend fun search(query: String, k: Int = 4): List<RetrievedChunk> = withContext(Dispatchers.IO) {
-        val docs = dao.documents().filter { it.status == "READY" }.associateBy { it.id }
+    /** [includeMemory]: also search the long-term conversation memory (off for "use my documents" answers). */
+    suspend fun search(query: String, k: Int = 4, includeMemory: Boolean = false): List<RetrievedChunk> = withContext(Dispatchers.IO) {
+        val docs = dao.documents().filter { it.status == "READY" && (includeMemory || it.mime != ChatMemory.MIME) }.associateBy { it.id }
         if (docs.isEmpty()) return@withContext emptyList()
         val embedModel = models.active(ModelRole.EMBEDDING)
         val qVec = if (embedModel != null && docs.values.any { it.embeddingModel != null }) {
@@ -183,11 +185,64 @@ class Retriever(private val dao: DocumentDao, private val embeddings: EmbeddingS
     }
 
     suspend fun documentText(titleOrId: String, maxChars: Int): Pair<DocumentEntity, String>? = withContext(Dispatchers.IO) {
-        val docs = dao.documents().filter { it.status == "READY" }
+        val docs = dao.documents().filter { it.status == "READY" && it.mime != ChatMemory.MIME }
         val d = docs.firstOrNull { it.id.toString() == titleOrId } ?: docs.firstOrNull { it.title.equals(titleOrId, true) }
             ?: docs.firstOrNull { it.title.contains(titleOrId, true) || titleOrId.contains(it.title.substringBeforeLast('.'), true) }
             ?: docs.maxByOrNull { d -> KeywordScorer.score(titleOrId, listOf(d.title)).first() }?.takeIf { KeywordScorer.score(titleOrId, listOf(it.title)).first() > 0f }
             ?: return@withContext null
         d to (File(d.textPath).takeIf { it.isFile }?.readText()?.take(maxChars) ?: "")
     }
+}
+
+
+/**
+ * Long-term memory beyond the context window: every finished chat exchange and every rolling summary is appended
+ * (incrementally, one chunk at a time) to a hidden "Conversation memory" document in the same RAG index as the user's
+ * documents. [recall] pages the most relevant old turns, summaries and document passages back into the prompt.
+ */
+class ChatMemory(
+    private val context: Context,
+    private val dao: DocumentDao,
+    private val embeddings: EmbeddingService,
+    private val models: ModelStore,
+    private val retriever: Retriever,
+) : com.offlineagent.core.runtime.context.LongTermMemory {
+    private val lock = kotlinx.coroutines.sync.Mutex()
+
+    private suspend fun docId(): Long {
+        dao.documentByMime(MIME)?.let { return it.id }
+        val f = File(context.filesDir, "conversation-memory.txt").apply { if (!exists()) writeText("") }
+        return dao.insertDocument(DocumentEntity(title = "Conversation memory", mime = MIME, status = "READY", textPath = f.absolutePath, createdAt = System.currentTimeMillis()))
+    }
+
+    suspend fun add(source: String, text: String, turnIds: Set<Long>) = withContext(Dispatchers.IO) {
+        if (text.isBlank()) return@withContext
+        lock.withLockCompat {
+            val id = docId()
+            val marker = if (turnIds.isNotEmpty()) "⟦t:" + turnIds.joinToString(",") + "⟧ " else ""
+            val body = marker + "[$source] " + text.take(1600)
+            val embedModel = models.active(ModelRole.EMBEDDING)
+            val vec = if (embedModel != null) runCatching {
+                embeddings.ensureLoaded(embedModel.path, DeviceInfo.recommendedThreads()); VectorMath.toBytes(embeddings.embed(body))
+            }.getOrNull() else null
+            dao.insertChunks(listOf(ChunkEntity(documentId = id, idx = dao.maxChunkIdx(id) + 1, text = body, embedding = vec)))
+            dao.document(id)?.let { dao.updateDocument(it.copy(chunkCount = it.chunkCount + 1, chars = it.chars + body.length, embeddingModel = embedModel?.name ?: it.embeddingModel)) }
+        }
+    }
+
+    override suspend fun recall(query: String, excludeTurnIds: Set<Long>, k: Int): List<com.offlineagent.core.runtime.context.MemoryPage> {
+        val hits = runCatching { retriever.search(query, k * 3, includeMemory = true) }.getOrDefault(emptyList())
+        return hits.filter { it.score >= 0.3f }.mapNotNull { h ->
+            val t = h.candidate.text
+            val ids = Regex("^⟦t:([0-9,]+)⟧ ").find(t)?.groupValues?.get(1)?.split(',')?.mapNotNull { it.toLongOrNull() }?.toSet() ?: emptySet()
+            if (ids.any { it in excludeTurnIds }) null
+            else com.offlineagent.core.runtime.context.MemoryPage(h.candidate.documentTitle, t.replace(Regex("^⟦t:[0-9,]+⟧ "), ""), h.score, ids)
+        }.take(k)
+    }
+
+    suspend fun clear() = withContext(Dispatchers.IO) { dao.documentByMime(MIME)?.let { dao.deleteChunks(it.id); dao.updateDocument(it.copy(chunkCount = 0, chars = 0)) } }
+
+    private suspend inline fun <T> kotlinx.coroutines.sync.Mutex.withLockCompat(block: () -> T): T { lock(); try { return block() } finally { unlock() } }
+
+    companion object { const val MIME = "application/x-offline-agent-memory" }
 }

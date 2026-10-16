@@ -21,7 +21,29 @@ import com.offlineagent.core.inference.EmbeddingService
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.Executors
+
+/** One file per (model, context settings, system prompt). Old ones are pruned to [MAX_FILES]. */
+object PrefixCacheFiles {
+    const val MAX_FILES = 8
+
+    fun path(dir: File, info: ModelInfo, prefix: String): String {
+        dir.mkdirs()
+        val f = File(info.path)
+        val key = listOf(info.path, f.length(), f.lastModified(), info.contextLength, info.kvCacheType.name, prefix).joinToString("\u0000")
+        val hash = MessageDigest.getInstance("SHA-256").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }.take(32)
+        val target = File(dir, "$hash.kv")
+        prune(dir, keep = target)
+        return target.absolutePath
+    }
+
+    private fun prune(dir: File, keep: File) {
+        val files = dir.listFiles { x -> x.name.endsWith(".kv") }?.sortedByDescending { it.lastModified() } ?: return
+        files.filter { it != keep }.drop(MAX_FILES - 1).forEach { it.delete() }
+        if (keep.isFile) keep.setLastModified(System.currentTimeMillis())
+    }
+}
 
 /**
  * llama.cpp implementation of [TokenEngine]. Blocking; must be driven from a single thread
@@ -42,7 +64,12 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             throw ModelLoadException("Native inference library failed to load: ${e.message}", e)
         }
         if (handle != 0L) unload()
-        val h = LlamaNative.nativeLoad(file.absolutePath, config.contextLength, config.threads, config.batchSize, config.useMmap)
+        val opts = intArrayOf(
+            config.contextLength, config.threads, config.batchSize, config.ubatchSize, if (config.useMmap) 1 else 0,
+            config.kvCacheType.ggmlType, config.kvCacheType.ggmlType, config.flashAttention.native, config.ropeScaling.native,
+            config.yarnOriginalContext, config.pollLevel, if (config.warmup) 1 else 0,
+        )
+        val h = LlamaNative.nativeLoad(file.absolutePath, opts, floatArrayOf(0f), config.cpuIds.toIntArray())
         if (h == 0L) throw ModelLoadException(LlamaNative.nativeLastError().ifBlank { "Unknown load error" })
         handle = h
         var vision = false
@@ -56,6 +83,17 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             }
             vision = true
         }
+        var speculative = false
+        val draft = config.draftModelPath
+        if (draft != null && mmproj == null) {
+            if (!File(draft).isFile) { unload(); throw ModelLoadException("Draft model file not found") }
+            if (!LlamaNative.nativeAttachDraft(h, draft, config.draftTokens, config.threads, config.kvCacheType.ggmlType)) {
+                val err = LlamaNative.nativeLastError()
+                unload()
+                throw ModelLoadException(err.ifBlank { "Could not load the draft model" })
+            }
+            speculative = true
+        }
         val f = LlamaNative.nativeModelInfo(h)
         return ModelInfo(
             path = file.absolutePath,
@@ -68,6 +106,13 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             chatTemplate = f[5].ifBlank { null },
             backendInfo = systemInfo().lineSequence().filter { it.startsWith("Device:") || it.startsWith("Backends:") }.joinToString("\n"),
             supportsImages = vision,
+            layers = f.getOrNull(6)?.toIntOrNull() ?: 0,
+            kvHeads = f.getOrNull(7)?.toIntOrNull() ?: 0,
+            embedding = f.getOrNull(8)?.toIntOrNull() ?: 0,
+            heads = f.getOrNull(9)?.toIntOrNull() ?: 0,
+            canShift = f.getOrNull(10) == "1",
+            kvCacheType = config.kvCacheType,
+            speculative = speculative,
         )
     }
 
@@ -77,6 +122,15 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         maxNewTokens: Int,
         grammar: String?,
         images: List<ImageData>,
+    ): Int = beginCompletion(prompt, sampling, maxNewTokens, grammar, images, 0)
+
+    override fun beginCompletion(
+        prompt: String,
+        sampling: SamplingParams,
+        maxNewTokens: Int,
+        grammar: String?,
+        images: List<ImageData>,
+        nKeep: Int,
     ): Int {
         val h = handle.takeIf { it != 0L } ?: throw NotLoadedException()
         val rc = LlamaNative.nativeBegin(
@@ -86,6 +140,7 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             if (images.isEmpty()) null else images.map { it.rgb }.toTypedArray(),
             if (images.isEmpty()) null else images.map { it.width }.toIntArray(),
             if (images.isEmpty()) null else images.map { it.height }.toIntArray(),
+            nKeep,
         )
         return when (rc) {
             LlamaNative.BEGIN_ERR_TOO_LONG -> throw PromptTooLongException(-1, -1)
@@ -94,6 +149,22 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             LlamaNative.BEGIN_ERR_DECODE, LlamaNative.BEGIN_ERR_TOKENIZE -> throw InferenceException(LlamaNative.nativeLastError())
             else -> rc.also { lastPromptTokens = it }
         }
+    }
+
+    override fun countTokens(text: String): Int? {
+        val h = handle.takeIf { it != 0L } ?: return null
+        return LlamaNative.nativeCountTokens(h, text.toByteArray(Charsets.UTF_8))
+    }
+
+    override fun prefixCache(prefix: String, cacheFile: String?): Int {
+        val h = handle.takeIf { it != 0L } ?: return -1
+        cacheFile?.let { File(it).parentFile?.mkdirs() }
+        return LlamaNative.nativePrefixCache(h, prefix.toByteArray(Charsets.UTF_8), cacheFile ?: "", cacheFile != null)
+    }
+
+    override fun runtimeStats(): IntArray {
+        val h = handle.takeIf { it != 0L } ?: return IntArray(6)
+        return LlamaNative.nativeStats(h)
     }
 
     override fun nextToken(): TokenStep {
@@ -156,10 +227,13 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         fun createEmbedder(context: Context): EmbeddingService =
             EmbeddingService(LlamaEmbeddingEngine(context.applicationInfo.nativeLibraryDir), newEngineDispatcher("embed-engine"))
 
-        fun createAdapter(context: Context): InferenceAdapter =
-            EngineInferenceAdapter(
+        fun createAdapter(context: Context): InferenceAdapter {
+            val cacheDir = File(context.cacheDir, "prompt-cache")
+            return EngineInferenceAdapter(
                 engine = LlamaCppEngine(context.applicationInfo.nativeLibraryDir),
                 engineDispatcher = newEngineDispatcher(),
+                prefixCacheFile = { info, prefix -> PrefixCacheFiles.path(cacheDir, info, prefix) },
             )
+        }
     }
 }

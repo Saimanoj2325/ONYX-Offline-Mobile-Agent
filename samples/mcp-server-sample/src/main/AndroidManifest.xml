@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sample on-device MCP server. No INTERNET permission: everything stays on the phone. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The USE_MCP_SERVERS permission is DEFINED by the Offline Agent app (dangerous level: the user grants it).
+         Servers only REFERENCE it below, so only apps the user allowed can bind. -->
+
+    <application android:label="@string/app_name" android:allowBackup="false">
+        <service
+            android:name=".StudyToolsMcpService"
+            android:exported="true"
+            android:permission="com.offlineagent.permission.USE_MCP_SERVERS">
+            <intent-filter>
+                <action android:name="com.offlineagent.mcp.SERVER" />
+            </intent-filter>
+            <meta-data android:name="com.offlineagent.mcp.NAME" android:value="Study tools (sample)" />
+            <meta-data android:name="com.offlineagent.mcp.DESCRIPTION" android:value="Unit conversion, CGPA to percentage, Pomodoro planner. Sample on-device MCP server." />
+        </service>
+    </application>
+</manifest>

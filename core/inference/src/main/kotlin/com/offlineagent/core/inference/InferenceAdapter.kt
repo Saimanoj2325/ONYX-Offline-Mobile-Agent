@@ -36,6 +36,9 @@ interface InferenceAdapter {
 
     /** Human readable CPU/backend capabilities string (for diagnostics). */
     suspend fun systemInfo(): String
+
+    /** Exact token count under the loaded model's tokenizer; null if unavailable right now. */
+    suspend fun countTokens(text: String): Int? = null
 }
 
 /**
@@ -58,6 +61,28 @@ interface TokenEngine {
         grammar: String? = null,
         images: List<ImageData> = emptyList(),
     ): Int
+
+    /** Phase 3: same as above plus [nKeep] = tokens at the start that context shifting must never discard. */
+    fun beginCompletion(
+        prompt: String,
+        sampling: SamplingParams,
+        maxNewTokens: Int,
+        grammar: String?,
+        images: List<ImageData>,
+        nKeep: Int,
+    ): Int = beginCompletion(prompt, sampling, maxNewTokens, grammar, images)
+
+    /** Exact token count of [text] (no BOS), or null when the engine cannot tokenize (no model loaded). */
+    fun countTokens(text: String): Int? = null
+
+    /**
+     * Makes sure the KV cache starts with [prefix] (the rendered system prompt), loading it from [cacheFile] when a
+     * saved state matches, otherwise evaluating and saving it. Returns 0/1/2 (see GenerationStats.prefixCache), <0 on error.
+     */
+    fun prefixCache(prefix: String, cacheFile: String?): Int = -1
+
+    /** Live counters: n_past, n_ctx, context shifts, drafted, accepted, cached tokens. */
+    fun runtimeStats(): IntArray = IntArray(6)
 
     /**
      * Formats a conversation with the model's own chat template when the engine knows it (non-ChatML models).

@@ -99,6 +99,8 @@ import com.offlineagent.core.runtime.ui.UiParseResult
 import com.offlineagent.core.runtime.ui.UiParser
 import java.io.File
 
+private fun tokenLabel(n: Int) = if (n >= 1000) "%.1fK".format(n / 1000.0) else n.toString()
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenModels: () -> Unit, modifier: Modifier = Modifier) {
@@ -124,7 +126,8 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenModels: () ->
                 title = {
                     Column(Modifier.clickable { showChats = true }) {
                         Text(chat?.title ?: "New chat", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(engineLabel(engine), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(engineLabel(engine) + if (ui.contextSize > 0) " · ${tokenLabel(ui.contextUsed)}/${tokenLabel(ui.contextSize)} tokens" else "",
+                            style = MaterialTheme.typography.labelSmall, color = if (ui.contextSize > 0 && ui.contextUsed > ui.contextSize * 0.85) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 navigationIcon = { IconButton(onClick = { showChats = true }) { Icon(Icons.Filled.Menu, "Chats") } },
@@ -135,6 +138,8 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenModels: () ->
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Thinking (slower, Qwen3)") }, trailingIcon = { Switch(settings.thinking, { vm.setThinking(it) }) }, onClick = { vm.setThinking(!settings.thinking) })
                         DropdownMenuItem(text = { Text("Use my documents (RAG)") }, trailingIcon = { Switch(settings.useDocuments, { vm.setUseDocuments(it) }) }, onClick = { vm.setUseDocuments(!settings.useDocuments) })
+                        DropdownMenuItem(text = { Text("Export chat as PDF") }, enabled = messages.isNotEmpty(), onClick = { menu = false; vm.exportChatPdf() })
+                        if (versions.isNotEmpty()) DropdownMenuItem(text = { Text("Export canvas as PDF") }, onClick = { menu = false; vm.exportCanvasPdf() })
                     }
                 },
             )
@@ -182,13 +187,14 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenModels: () ->
                 streamingLabel = if (streamingCanvas) "${s!!.phase} ${s.tokens} tok" else null,
                 versions = versions, currentVersion = chat?.canvasVersion ?: 0, actions = uiActions,
                 onClose = { vm.setCanvasOpen(false) }, onUndo = vm::undoCanvas, onRedo = vm::redoCanvas,
-                onSelectVersion = vm::selectCanvasVersion, onShare = onShare,
+                onSelectVersion = vm::selectCanvasVersion, onShare = onShare, onExportPdf = { vm.exportCanvasPdf() },
             )
             BackHandler { vm.setCanvasOpen(false) }
         }
     }
 
     if (showChats) ChatsSheet(vm, onDismiss = { showChats = false })
+    ui.pdf?.let { pdf -> com.offlineagent.app.ui.PdfPreviewDialog(pdf, onDismiss = { vm.closePdf() }) }
     ui.citation?.let { c ->
         AlertDialog(
             onDismissRequest = { vm.showCitation(null) },
