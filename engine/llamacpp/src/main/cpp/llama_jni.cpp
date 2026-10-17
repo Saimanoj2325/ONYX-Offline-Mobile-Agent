@@ -62,6 +62,10 @@ struct Session {
 
     std::vector<llama_token> kv_tokens;   // exactly what is in the KV cache (seq 0) when !kv_dirty
     std::atomic<bool>        abort{false};
+    // Phase 4b: prompt-evaluation progress, read from another thread for the "Reading prompt… n/N" indicator.
+    std::atomic<int>         pf_done{0};
+    std::atomic<int>         pf_total{0};
+    std::atomic<int>         pf_cached{0};
 
     // Grammar-constrained sampling (GBNF). Kept OUTSIDE the chain: we sample normally, then check the
     // token against the grammar and only fall back to a full grammar pass when it is rejected. This is
@@ -416,6 +420,9 @@ static jint eval_text(Session * s, const std::vector<llama_token> & tokens) {
         common = 0;
     }
     s->kv_tokens.resize(common);
+    s->pf_cached.store((int) common);
+    s->pf_total.store((int) (tokens.size() - common));
+    s->pf_done.store(0);
 
     for (size_t i = common; i < tokens.size(); i += s->n_batch) {
         const size_t end = std::min(tokens.size(), i + (size_t) s->n_batch);
@@ -432,6 +439,7 @@ static jint eval_text(Session * s, const std::vector<llama_token> & tokens) {
             return BEGIN_ERR_DECODE;
         }
         s->kv_tokens.insert(s->kv_tokens.end(), tokens.begin() + i, tokens.begin() + end);
+        s->pf_done.store((int) (end - common));
     }
     s->n_past = (llama_pos) s->kv_tokens.size();
     return (jint) tokens.size();
@@ -476,6 +484,7 @@ static jint eval_multimodal(JNIEnv * env, Session * s, const std::string & promp
     s->kv_tokens.clear();
     s->kv_dirty = true;
     llama_pos new_past = 0;
+    s->pf_cached.store(0); s->pf_total.store((int) n_tok); s->pf_done.store(0);
     const int32_t rc = mtmd_helper_eval_chunks(s->mtmd, s->ctx, chunks, 0, 0, s->n_batch, true, &new_past);
     mtmd_input_chunks_free(chunks);
     if (rc != 0) {
@@ -497,6 +506,7 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeBegin(JNIEnv * env, jobj
                                                              jintArray jw, jintArray jh, jint n_keep) {
     auto * s = as_session(h);
     s->abort.store(false);
+    s->pf_done.store(0); s->pf_total.store(0); s->pf_cached.store(0);
     s->generated = 0;
     s->max_new = max_new;
     s->stop = STOP_NONE;
@@ -757,6 +767,20 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeNext(JNIEnv * env, jobje
     return to_jbytes(env, piece);
 }
 
+// Phase 4b: [evaluated, to evaluate, reused from the KV cache] of the prompt being read right now. Safe to call from any
+// thread while the session is alive (atomics only).
+JNIEXPORT jintArray JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativePrefillProgress(JNIEnv * env, jobject, jlong h) {
+    jint v[3] = {0, 0, 0};
+    if (h) {
+        auto * s = as_session(h);
+        v[0] = s->pf_done.load(); v[1] = s->pf_total.load(); v[2] = s->pf_cached.load();
+    }
+    jintArray arr = env->NewIntArray(3);
+    env->SetIntArrayRegion(arr, 0, 3, v);
+    return arr;
+}
+
 // [n_past, n_ctx, n_shifts, spec_drafted, spec_accepted, kv_tokens]
 JNIEXPORT jintArray JNICALL
 Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeStats(JNIEnv * env, jobject, jlong h) {
@@ -784,6 +808,7 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativePrefixCache(JNIEnv * env
                                                                    jstring jpath, jboolean save) {
     auto * s = as_session(h);
     s->abort.store(false);
+    s->pf_done.store(0); s->pf_total.store(0); s->pf_cached.store(0);
     std::vector<llama_token> tokens;
     if (!tokenize(s->vocab, jbytes(env, jprefix), tokens) || tokens.size() < 2) return -1;
     if ((int) tokens.size() + 64 > s->n_ctx) return -2;

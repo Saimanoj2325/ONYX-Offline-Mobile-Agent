@@ -90,6 +90,28 @@ object OpenUiPrompt {
         """.trimIndent(),
     ).filter { (_, code) -> Regex("\\b([A-Z][A-Za-z]+)\\(").findAll(code).all { lib[it.groupValues[1]] != null } }
 
+    /**
+     * Phase 4b: compact chat prompt (≈ 250 tokens instead of ≈ 2 000 for the full library). On a phone CPU every
+     * system-prompt token costs prefill time before the first visible token, so Chat mode uses this short cheat sheet;
+     * the full generated library ([generate]) is only used in Canvas mode or when the user asks for UI.
+     * Every name and argument order here matches [OpenUiLibrary.DEFAULT] (checked by a unit test).
+     */
+    fun cheatSheet(): String = CHEAT_SHEET
+
+    /** Component calls used in [cheatSheet] (for the library-consistency test). */
+    internal val CHEAT_SHEET = """
+        |## Optional UI (openui-lang)
+        |Answer in Markdown. Only when a table, chart, form or step list really helps, add one ```openui-lang block: one `name = Component(args)` per line, positional args, `root = Stack([...])` first.
+        |Components: TextContent(text, size?) · Callout(variant, title, description?) · Table(columns, rows) with Col(label, type?) · BarChart(labels, series) / LineChart(labels, series) with Series(category, values) · PieChart(slices) with Slice(category, value) · Steps(items) with StepsItem(title, details?) · Form(name, fields, buttons?) with FormControl(label, Input(name, placeholder?)) and Buttons([Button(label, "submit:<form name>")]) · FollowUpBlock(items) with FollowUpItem(text)
+        |Example:
+        |```openui-lang
+        |root = Stack([t, tbl])
+        |t = TextContent("Top languages", "large-heavy")
+        |tbl = Table([Col("Language", "string"), Col("Users (M)", "number")], [["Python", 15.7], ["Java", 12.1]])
+        |```
+        |Form answers come back as "${FormSubmission.HEADER} …".
+    """.trimMargin()
+
     /** Canvas update: the current program is shown to the model, which writes the full updated program. */
     fun updateUser(request: String, currentSource: String): String =
         "Current UI (openui-lang):\n$currentSource\n\nChange request: $request\n\nWrite the complete updated program."

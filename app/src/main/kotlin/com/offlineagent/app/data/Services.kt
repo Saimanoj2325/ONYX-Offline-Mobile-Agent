@@ -116,11 +116,23 @@ class EngineController(
 
     suspend fun threads(): Int = settings.current().threads.takeIf { it > 0 } ?: DeviceInfo.recommendedThreads()
 
-    fun archOf(path: String) = runCatching { com.offlineagent.core.inference.GgufMetadata.arch(File(path)) }.getOrNull()
+    /**
+     * GGUF header (cached per path/size/mtime). Always on [Dispatchers.IO]: Phase 4b ANR fix — this used to run on the
+     * main thread from [config] (reload from the chat screen) and took > 5 s on a phone.
+     */
+    suspend fun archOf(path: String) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        runCatching { com.offlineagent.core.inference.GgufMetadata.arch(File(path)) }.getOrNull()
+    }
 
-    fun planFor(path: String?, s: AppSettings): com.offlineagent.core.inference.ContextPlan =
-        com.offlineagent.core.inference.ContextPlanner.plan(DeviceInfo.totalRamBytes(), path?.let { archOf(it) }, s.ubatchSize)
+    suspend fun planFor(path: String?, s: AppSettings): com.offlineagent.core.inference.ContextPlan {
+        val arch = path?.let { archOf(it) }
+        return com.offlineagent.core.inference.ContextPlanner.plan(DeviceInfo.totalRamBytes(), arch, s.ubatchSize)
             .also { if (path != null) _plan.value = it }
+    }
+
+    /** Plan without reading any model file (safe on the main thread). */
+    fun planWithoutModel(s: AppSettings): com.offlineagent.core.inference.ContextPlan =
+        _plan.value ?: com.offlineagent.core.inference.ContextPlanner.plan(DeviceInfo.totalRamBytes(), null, s.ubatchSize)
 
     /** Effective KV precision: the user's explicit choice, else f16 (Auto). Safe mode: always f16. */
     fun kvFor(s: AppSettings, modelPath: String?, ctx: Int): com.offlineagent.core.inference.KvCacheType =
@@ -137,7 +149,11 @@ class EngineController(
     fun maxOutput(s: AppSettings, plan: com.offlineagent.core.inference.ContextPlan, ctx: Int) =
         (if (s.maxOutputTokens > 0) s.maxOutputTokens else plan.maxOutputTokens).coerceAtMost(ctx / 2).coerceIn(256, 8192)
 
-    private suspend fun config(model: ModelEntity, role: ModelRole): LoadConfig {
+    private suspend fun config(model: ModelEntity, role: ModelRole): LoadConfig = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        configIo(model, role)
+    }
+
+    private suspend fun configIo(model: ModelEntity, role: ModelRole): LoadConfig {
         val s = settings.current()
         val plan = planFor(model.path, s)
         val arch = archOf(model.path)
@@ -163,7 +179,9 @@ class EngineController(
     }
 
     /** Ensures a model of [role] (CHAT or VISION) is loaded. Returns its info. */
-    suspend fun ensure(role: ModelRole): ModelInfo = mutex.withLock {
+    suspend fun ensure(role: ModelRole): ModelInfo = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { ensureIo(role) }
+
+    private suspend fun ensureIo(role: ModelRole): ModelInfo = mutex.withLock {
         val want = models.active(role) ?: throw IllegalStateException(
             if (role == ModelRole.VISION) "No vision model: add one (with its mmproj file) in Settings → Models." else "No chat model yet: download one (model menu at the top) or import a .gguf in Settings → Models.",
         )
@@ -176,7 +194,9 @@ class EngineController(
         loadChecked(want, role)
     }
 
-    suspend fun load(model: ModelEntity): ModelInfo = mutex.withLock {
+    suspend fun load(model: ModelEntity): ModelInfo = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { loadIo(model) }
+
+    private suspend fun loadIo(model: ModelEntity): ModelInfo = mutex.withLock {
         val role = runCatching { ModelRole.valueOf(model.role) }.getOrDefault(ModelRole.CHAT)
         loadChecked(model, if (role == ModelRole.DRAFT) ModelRole.CHAT else role)
     }
@@ -388,6 +408,19 @@ class AgentService(
     val pending: StateFlow<PendingApproval?> = _pending.asStateFlow()
     private val _live = MutableStateFlow<Map<String, String>>(emptyMap()) // runId -> "Thinking…" text
     val live: StateFlow<Map<String, String>> = _live.asStateFlow()
+    private val _partial = MutableStateFlow<Map<String, String>>(emptyMap()) // runId -> model text streaming right now
+    /** Phase 4b: the running step's partial model output, streamed into the agent card. */
+    val partial: StateFlow<Map<String, String>> = _partial.asStateFlow()
+    @Volatile private var lastPartialAt = 0L
+
+    /** LLM for agent steps: streams partial text + prompt progress into the card (throttled to ~10 updates/s). */
+    private fun streamingLlm() = InferenceAgentLlm(inference,
+        onPartial = { text ->
+            val now = System.currentTimeMillis()
+            if (now - lastPartialAt > 100) { lastPartialAt = now; activeRunId?.let { id -> _partial.update { it + (id to text) } } }
+        },
+        onPrompt = { done, total -> activeRunId?.let { id -> _live.update { it + (id to com.offlineagent.core.runtime.chat.StreamingTurn.readingStatus(done, total)) } } },
+    )
     private var job: Job? = null
     @Volatile var activeRunId: String? = null
         private set
@@ -423,7 +456,7 @@ class AgentService(
         val reg = registry(chatId)
         val policy = PolicyEngine(reg, alwaysAllowed = { cachedAllowed }, disabled = disabledTools)
         return AgentLoop(
-            InferenceAgentLlm(inference), reg, policy, store,
+            streamingLlm(), reg, policy, store,
             ApprovalGate { runId, spec, call, reason ->
                 val d = CompletableDeferred<Boolean>()
                 _pending.value = PendingApproval(runId, spec, call, reason, d)
@@ -432,8 +465,11 @@ class AgentService(
             AgentLimits(),
             onEvent = { ev ->
                 when (ev) {
-                    is AgentEvent.Thinking -> { _live.update { it + (ev.what.let { w -> (activeRunId ?: "") to w }) }; activeRunId?.let { onLongTask(it, ev.what) } }
-                    is AgentEvent.Status -> if (ev.checkpoint.status.isTerminal) _live.update { it - ev.checkpoint.runId }
+                    is AgentEvent.Thinking -> {
+                        _live.update { it + (ev.what.let { w -> (activeRunId ?: "") to w }) }
+                        activeRunId?.let { id -> _partial.update { it - id }; onLongTask(id, ev.what) }
+                    }
+                    is AgentEvent.Status -> if (ev.checkpoint.status.isTerminal) { _live.update { it - ev.checkpoint.runId }; _partial.update { it - ev.checkpoint.runId } }
                 }
             },
         )
@@ -466,6 +502,7 @@ class AgentService(
                     ?: RunCheckpoint(runId, chatId, skill?.id, request, com.offlineagent.core.runtime.agent.RunStatus.FAILED, error = e.message).also { store.save(it) }
             } finally {
                 _live.update { it - runId }
+                _partial.update { it - runId }
                 activeRunId = null
                 onLongTask(runId, null)
             }
@@ -487,7 +524,7 @@ class AgentService(
                 loopFor(cp.chatId).resume(runId, skill)
             } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Throwable) {
                 cp.copy(status = com.offlineagent.core.runtime.agent.RunStatus.FAILED, error = e.message).also { store.save(it) }
-            } finally { activeRunId = null; onLongTask(runId, null) }
+            } finally { _live.update { it - runId }; _partial.update { it - runId }; activeRunId = null; onLongTask(runId, null) }
             onFinished(result)
         }
         return true

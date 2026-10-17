@@ -267,6 +267,20 @@ Chrome + one app; screen agent success on one real form; any crash logs (§8).
 5. Download SmolVLM2 (2 files) → attach a photo and ask about it.
 6. Disconnect the network after downloading: chatting, documents and tools keep working.
 
+## 28. Phase 4b — speed, streaming, ANR
+
+1. Install the phase4b APK over Phase 4 (settings migrate: Thinking turns ON).
+2. Settings → Models: change the model or reload several times while tapping around — **no ANR** ("app not responding").
+3. New chat, Thinking ON: send "Why is the sky blue?". Expect "Reading prompt… n/N" with a bar within a moment, then a
+   **Thinking…** section that is open and fills live, then it collapses and the answer streams word by word.
+   Note the footer: "… tok/s · first token X s".
+4. Send a second message in the same chat: the first token should come much sooner (prompt reuse).
+5. Tap the **Think** chip (off) and send: answer streams directly, no Thought section.
+6. Ask "make a bar chart of rainfall by month": the block text streams, then turns into a chart.
+7. Agent mode ("what is 23*19 and save it as a note"): the agent card shows the step text while it is written.
+8. PDF report: section text streams in the bubble.
+9. Send Settings → Diagnostics → Export & share if anything is slow or stuck (debug builds also log StrictMode lines).
+
 ## 8. Logs to send back if something fails
 
 Phase 4: Settings → Diagnostics & crash logs → **Export & share logs** collects everything below in one file.

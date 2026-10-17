@@ -383,9 +383,13 @@ private fun QuizView(b: UiBlock.Quiz, key: String) {
 @Composable
 private fun ImageBlock(b: UiBlock.Image, actions: UiActions) {
     val file = remember(b.ref) { actions.resolveImage(b.ref) }
-    val bmp = remember(file) {
-        file?.takeIf { it.isFile }?.let { f -> BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply { inSampleSize = 2 })?.asImageBitmap() }
+    // Decoded off the main thread (Phase 4b main-thread audit).
+    val bmpState = androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(null, file) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            file?.takeIf { it.isFile }?.let { f -> BitmapFactory.decodeFile(f.absolutePath, BitmapFactory.Options().apply { inSampleSize = 2 })?.asImageBitmap() }
+        }
     }
+    val bmp = bmpState.value
     Column {
         if (bmp != null) Image(bmp, b.caption, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp))
         else Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {

@@ -1,8 +1,14 @@
-# Offline-First Android Agent — Phase 4
+# Offline-First Android Agent — Phase 4b
 
 A native Android app (Kotlin + Jetpack Compose, Material 3) that runs local **GGUF** models **fully offline** on the
 phone's CPU, with:
 
+- **Phase 4b — fast first token + live streaming**: 321-token chat system prompt (was 2 163 with the full OpenUI
+  library; the full library is used only in Canvas mode or when you ask for UI), "Reading prompt… n/N" progress, live
+  Thinking section (open while the model thinks, collapses when the answer starts), answer streamed token by token,
+  OpenUI blocks stream as text until they render, agent/report/automation steps stream into their cards, footer with
+  tok/s and time to first token, Thinking on by default (+ per-message Think chip). **Reload ANR fixed** (GGUF header
+  read off the main thread, buffered, early stop, cached); StrictMode in debug builds. See `docs/PHASE4.md` § Phase 4b.
 - **Phase 4 — one ChatGPT-style chat**: drawer with searchable conversations + Settings, model picker, streaming answers
   with Stop / Copy / Regenerate / Edit & resend, collapsible thinking, "+" attachments (photo, camera, document) and a
   Tools toggle (Agent, Canvas, PDF report, Phone actions, Automation) — agent steps, approvals, canvases, PDFs and

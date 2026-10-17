@@ -84,6 +84,9 @@ class OfflineAgentApp : Application() {
     /** take_photo tool -> MainActivity opens the camera; the photo is attached to the current chat. */
     val cameraRequests: SharedFlow<Unit> = _cameraRequests
 
+    /** Phase 4b: the screen agent's current model output (streamed into the automation card). */
+    val automationPartial = kotlinx.coroutines.flow.MutableStateFlow("")
+
     val vault by lazy { ProfileVault(this) }
     val automationLog by lazy { FileAutomationLog(this) }
     val automation by lazy { AutomationController(this) }
@@ -116,10 +119,27 @@ class OfflineAgentApp : Application() {
     val lastCrash = kotlinx.coroutines.flow.MutableStateFlow<com.offlineagent.app.diag.Diagnostics.Startup?>(null)
     private lateinit var engineAdapter: com.offlineagent.core.inference.EngineInferenceAdapter
 
+    /**
+     * Phase 4b (ANR audit): debug builds flag disk reads/writes, slow calls and network on the main thread. Violations
+     * are logged (logcat tag StrictMode) and the first ones are copied to the diagnostics log, so a main-thread file or
+     * JNI call shows up in "Share diagnostics" before it becomes an ANR on a slower phone. Never crashes the app.
+     */
+    private fun enableStrictMode() {
+        val counter = java.util.concurrent.atomic.AtomicInteger()
+        val b = android.os.StrictMode.ThreadPolicy.Builder().detectDiskReads().detectDiskWrites().detectNetwork().detectCustomSlowCalls().penaltyLog()
+        if (android.os.Build.VERSION.SDK_INT >= 28) b.penaltyListener(java.util.concurrent.Executors.newSingleThreadExecutor()) { v ->
+            if (counter.incrementAndGet() <= 30) com.offlineagent.app.diag.Diagnostics.log("StrictMode main-thread violation: ${v.javaClass.simpleName} at " +
+                v.stackTrace.firstOrNull { it.className.startsWith("com.offlineagent") }?.let { "${it.className}.${it.methodName}:${it.lineNumber}" })
+        }
+        android.os.StrictMode.setThreadPolicy(b.build())
+        android.os.StrictMode.setVmPolicy(android.os.StrictMode.VmPolicy.Builder().detectLeakedClosableObjects().penaltyLog().build())
+    }
+
     override fun onCreate() {
         super.onCreate()
         // P0 crash safety first: crash handler, previous-crash detection, compatibility CPU kernels.
         com.offlineagent.app.diag.Diagnostics.init(this)
+        if (BuildConfig.DEBUG) enableStrictMode()
         com.offlineagent.engine.llamacpp.LlamaNative.cpuVariant = com.offlineagent.app.diag.Diagnostics.compatVariant()
         val startup = runCatching { com.offlineagent.app.diag.Diagnostics.startupCheck() }.getOrNull()
         engineAdapter = LlamaCppEngine.createAdapter(this)
@@ -134,6 +154,8 @@ class OfflineAgentApp : Application() {
             "settings: ${cachedSettings.let { "ctx=${it.contextLength} kv=${it.kvCache} fa=${it.flashAttention} large=${it.largeContext} safe=${it.safeMode} threads=${it.threads} batch=${it.batchSize}/${it.ubatchSize} prefixCache=${it.prefixCache} spec=${it.speculative}" }}\n" +
                 "last load: ${engineController.lastConfig}"
         }
+        // Phase 4b: read /proc + sysfs once, off the main thread (DeviceInfo caches them).
+        appScope.launch { runCatching { com.offlineagent.engine.llamacpp.DeviceInfo.totalRamBytes(); com.offlineagent.engine.llamacpp.DeviceInfo.cpuMaxFreqsKhz() } }
         appScope.launch {
             runCatching {
                 // Phase 4 settings migration (16K/32K opt-in, f16 KV) also drops every Phase 3 prompt-cache file.

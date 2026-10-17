@@ -92,3 +92,11 @@
 41. **Binder MCP servers** must declare the `com.offlineagent.mcp.SERVER` action and hold/require
     `com.offlineagent.permission.USE_MCP_SERVERS`; third-party tools always ask for approval.
 42. **Release build (R8 + baseline profile)** is configured but only the debug APKs were built and checked here.
+
+## Phase 4b
+- Phone prefill speed is not measured yet; the first message of a new chat still waits for the ~350-token prompt (or the
+  ~2 200-token full library when you ask for UI / choose "All components").
+- Prompt progress updates once per prefill batch (512 tokens by default), so short prompts show only the status line.
+- Thinking is on by default: answers take longer in total (the reasoning is generated first), but text appears at once.
+- The agent card streams raw step output (JSON tool calls look technical); the final answer is formatted as before.
+- StrictMode only logs (debug builds); it does not crash on violations.

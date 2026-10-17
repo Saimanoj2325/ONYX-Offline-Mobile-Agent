@@ -72,6 +72,25 @@ object OpenUiMessage {
     }.trim()
 }
 
+/**
+ * Phase 4b: what to show for an OpenUI program while it streams. Components render as soon as the partial program
+ * resolves to a root; until then the raw program text streams as-is (never a blank bubble); a finished program that
+ * cannot be resolved degrades to its source.
+ */
+sealed interface ProgramView {
+    data class Components(val resolved: Resolved) : ProgramView
+    /** Not (yet) renderable: show [text] verbatim. [final] = the stream is over (show it as code, with a note). */
+    data class Raw(val text: String, val final: Boolean) : ProgramView
+}
+
+object OpenUiStreaming {
+    fun view(source: String, streaming: Boolean, lib: OpenUiLibrary = OpenUiLibrary.DEFAULT): ProgramView {
+        val program = runCatching { if (streaming) OpenUiStreamParser().append(source).snapshot() else OpenUiParser.parse(source) }.getOrNull()
+        val resolved = program?.let { p -> runCatching { OpenUiResolver(lib).resolve(p, streaming) }.getOrNull() }
+        return if (resolved?.root != null) ProgramView.Components(resolved) else ProgramView.Raw(source, final = !streaming)
+    }
+}
+
 /** Text/Markdown rendering of a resolved tree (copy, PDF export, model history, accessibility). */
 object OpenUiText {
     fun render(node: UiNode?): String {

@@ -42,3 +42,13 @@ tasks.register<JavaExec>("runPhase3") {
     jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
     args(nativeDir)
 }
+
+// Phase 4b: GGUF header speed, prompt sizes, time to first token, streaming + thinking, prefill batch sizes.
+// Env: MODEL, THREADS, CTX, BATCHES, ONLY.
+tasks.register<JavaExec>("runPhase4b") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.offlineagent.tools.Phase4bHarnessKt")
+    val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
+    jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
+    args(nativeDir)
+}

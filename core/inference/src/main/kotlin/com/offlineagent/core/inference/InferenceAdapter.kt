@@ -84,6 +84,9 @@ interface TokenEngine {
     /** Live counters: n_past, n_ctx, context shifts, drafted, accepted, cached tokens. */
     fun runtimeStats(): IntArray = IntArray(6)
 
+    /** Phase 4b: [evaluated, to evaluate, reused] of the prompt being evaluated right now; callable from any thread. */
+    fun prefillProgress(): IntArray? = null
+
     /**
      * Formats a conversation with the model's own chat template when the engine knows it (non-ChatML models).
      * Returns null when unsupported; the adapter then falls back to ChatML.

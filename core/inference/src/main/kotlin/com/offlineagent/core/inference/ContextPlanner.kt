@@ -1,7 +1,6 @@
 package com.offlineagent.core.inference
 
 import java.io.File
-import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -25,8 +24,14 @@ data class ModelArch(
 }
 
 /**
- * Minimal GGUF metadata reader (v2/v3, little-endian). Reads only the key/value header, never the tensors, so it is
- * instant even for multi-GB files. Pure Kotlin; used for memory estimates before a model is loaded.
+ * Minimal GGUF metadata reader (v2/v3, little-endian). Reads only the key/value header, never the tensors.
+ *
+ * Phase 4b (ANR fix, seen on a OnePlus CPH2569): the old reader did two tiny `RandomAccessFile` syscalls per array
+ * element, so skipping Qwen3's 151 k-entry `tokenizer.ggml.tokens` / `merges` string arrays cost ~600 k syscalls
+ * (tens of seconds on a phone, and it ran on the main thread). Now:
+ *  - reads go through a 64 KB buffer over a [java.nio.channels.FileChannel] (large skips reposition the channel);
+ *  - [read] can stop as soon as the wanted keys are found ([stopWhen]); [arch] stops before the tokenizer payload;
+ *  - results are cached per (path, size, mtime) — callers still must not call this on the main thread.
  */
 object GgufMetadata {
     private const val T_UINT8 = 0; private const val T_INT8 = 1; private const val T_UINT16 = 2; private const val T_INT16 = 3
@@ -34,69 +39,145 @@ object GgufMetadata {
     private const val T_STRING = 8; private const val T_ARRAY = 9; private const val T_UINT64 = 10; private const val T_INT64 = 11
     private const val T_FLOAT64 = 12
 
-    /** Returns scalar metadata (strings and numbers; arrays become their length under "<key>.length"). */
-    fun read(file: File, maxKeys: Int = 512): Map<String, Any> = RandomAccessFile(file, "r").use { raf ->
-        val r = Reader(raf)
-        val magic = r.bytes(4)
-        require(String(magic, Charsets.US_ASCII) == "GGUF") { "not a GGUF file" }
-        val version = r.u32()
-        require(version in 2..3) { "unsupported GGUF version $version" }
-        r.u64() // tensor count
-        val kvCount = r.u64()
-        val out = LinkedHashMap<String, Any>()
-        for (i in 0 until minOf(kvCount, maxKeys.toLong())) {
-            val key = r.str()
-            val type = r.u32().toInt()
-            if (type == T_ARRAY) {
-                val et = r.u32().toInt()
-                val n = r.u64()
-                out["$key.length"] = n
-                // Skip array payload.
-                if (et == T_STRING) repeat(n.toInt()) { r.skip(r.u64()) } else r.skip(n * elementSize(et))
-            } else {
-                out[key] = r.value(type)
+    private data class CacheKey(val path: String, val size: Long, val mtime: Long)
+    private val archCache = java.util.concurrent.ConcurrentHashMap<CacheKey, ModelArch>()
+    private val archMisses = java.util.concurrent.ConcurrentHashMap<CacheKey, Boolean>()
+
+    /** Number of real header parses (tests check the cache). */
+    @Volatile var parses: Int = 0
+        private set
+
+    /**
+     * Returns scalar metadata (strings and numbers; arrays become their length under "<key>.length", payload skipped).
+     * [stopWhen] is checked after every key: return true to stop early (e.g. once all needed keys are known).
+     * An array whose length was recorded is only skipped if reading continues.
+     */
+    fun read(file: File, maxKeys: Int = 512, stopWhen: (Map<String, Any>) -> Boolean = { false }): Map<String, Any> =
+        java.io.FileInputStream(file).use { fis ->
+            parses++
+            val r = Reader(fis.channel)
+            val magic = r.bytes(4)
+            require(String(magic, Charsets.US_ASCII) == "GGUF") { "not a GGUF file" }
+            val version = r.u32()
+            require(version in 2..3) { "unsupported GGUF version $version" }
+            r.u64() // tensor count
+            val kvCount = r.u64()
+            val out = LinkedHashMap<String, Any>()
+            for (i in 0 until minOf(kvCount, maxKeys.toLong())) {
+                val key = r.str()
+                val type = r.u32().toInt()
+                if (type == T_ARRAY) {
+                    val et = r.u32().toInt()
+                    val n = r.u64()
+                    require(n >= 0) { "bad array length" }
+                    out["$key.length"] = n
+                    if (stopWhen(out)) break
+                    // Skip the payload: fixed-size elements in one jump, strings length by length (buffered, no syscalls).
+                    if (et == T_STRING) { var k = 0L; while (k < n) { r.skip(r.u64()); k++ } } else r.skip(n * elementSize(et))
+                } else {
+                    out[key] = r.value(type)
+                    if (stopWhen(out)) break
+                }
             }
+            out
         }
-        out
+
+    /** Keys [arch] needs (prefixed by the architecture name where relevant). */
+    private val ARCH_KEYS = listOf("block_count", "attention.head_count", "attention.head_count_kv", "embedding_length", "context_length")
+
+    fun arch(file: File): ModelArch? {
+        val key = runCatching { CacheKey(file.absolutePath, file.length(), file.lastModified()) }.getOrNull() ?: return null
+        archCache[key]?.let { return it }
+        if (archMisses.containsKey(key)) return null
+        val a = runCatching { parseArch(file) }.getOrNull()
+        if (a != null) archCache[key] = a else archMisses[key] = true
+        return a
     }
 
-    fun arch(file: File): ModelArch? = runCatching {
-        val m = read(file)
+    private fun parseArch(file: File): ModelArch? {
+        val m = read(file) { got ->
+            val a = got["general.architecture"] as? String
+            // Stop at the tokenizer vocabulary (its length is all we need) once the architecture keys are known;
+            // the vocabulary and merges arrays are by far the biggest part of the header.
+            a != null && got.containsKey("tokenizer.ggml.tokens.length") && ARCH_KEYS.all { got.containsKey("$a.$it") }
+        }
         val a = m["general.architecture"] as? String ?: return null
         fun int(k: String): Int = (m["$a.$k"] as? Number)?.toInt() ?: 0
         val heads = int("attention.head_count")
         val embd = int("embedding_length")
         val kl = int("attention.key_length").takeIf { it > 0 } ?: if (heads > 0) embd / heads else 0
         val vl = int("attention.value_length").takeIf { it > 0 } ?: kl
-        ModelArch(
+        return ModelArch(
             architecture = a, layers = int("block_count"), kvHeads = int("attention.head_count_kv").takeIf { it > 0 } ?: heads,
             heads = heads, embedding = embd, keyLength = kl, valueLength = vl, trainedContext = int("context_length"),
             vocabSize = ((m["tokenizer.ggml.tokens.length"] as? Number)?.toInt() ?: 0), fileBytes = file.length(),
         )
-    }.getOrNull()
+    }
+
+    /** Drops cached headers (tests; a model file replaced in place gets a new mtime anyway). */
+    fun clearCache() { archCache.clear(); archMisses.clear() }
 
     private fun elementSize(t: Int): Long = when (t) {
         T_UINT8, T_INT8, T_BOOL -> 1; T_UINT16, T_INT16 -> 2; T_UINT32, T_INT32, T_FLOAT32 -> 4
         T_UINT64, T_INT64, T_FLOAT64 -> 8; else -> throw IllegalArgumentException("bad GGUF array type $t")
     }
 
-    private class Reader(val raf: RandomAccessFile) {
-        private val b8 = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-        fun bytes(n: Int): ByteArray = ByteArray(n).also { raf.readFully(it) }
-        private fun le(n: Int): ByteBuffer { b8.clear(); raf.readFully(b8.array(), 0, n); b8.limit(n); return b8 }
-        fun u32(): Long = le(4).int.toLong() and 0xFFFFFFFFL
-        fun u64(): Long = le(8).long
-        fun skip(n: Long) { raf.seek(raf.filePointer + n) }
+    /** Buffered little-endian reader over a file channel: 64 KB reads, large skips reposition the channel. */
+    private class Reader(private val ch: java.nio.channels.FileChannel) {
+        private val buf: ByteBuffer = ByteBuffer.allocate(64 * 1024).order(ByteOrder.LITTLE_ENDIAN).also { it.limit(0) }
+
+        private fun ensure(n: Int) {
+            if (buf.remaining() >= n) return
+            buf.compact()
+            while (buf.position() < n) {
+                val r = ch.read(buf)
+                if (r < 0) throw java.io.EOFException("truncated GGUF header")
+            }
+            buf.flip()
+        }
+
+        fun bytes(n: Int): ByteArray {
+            val out = ByteArray(n)
+            var off = 0
+            while (off < n) {
+                if (!buf.hasRemaining()) ensure(1)
+                val k = minOf(buf.remaining(), n - off)
+                buf.get(out, off, k)
+                off += k
+            }
+            return out
+        }
+
+        fun u8(): Int { ensure(1); return buf.get().toInt() and 0xFF }
+        fun u32(): Long { ensure(4); return buf.int.toLong() and 0xFFFFFFFFL }
+        fun i32(): Int { ensure(4); return buf.int }
+        fun u64(): Long { ensure(8); return buf.long }
+        fun u16(): Int { ensure(2); return buf.short.toInt() and 0xFFFF }
+        fun i16(): Int { ensure(2); return buf.short.toInt() }
+        fun f32(): Float { ensure(4); return buf.float }
+        fun f64(): Double { ensure(8); return buf.double }
+
+        fun skip(n: Long) {
+            require(n >= 0) { "bad skip" }
+            if (n <= buf.remaining()) { buf.position(buf.position() + n.toInt()); return }
+            val beyond = n - buf.remaining()
+            val target = ch.position() + beyond
+            if (target > ch.size()) throw java.io.EOFException("truncated GGUF header")
+            ch.position(target)
+            buf.clear(); buf.limit(0)
+        }
+
         fun str(): String {
             val n = u64()
             require(n in 0..1_000_000) { "string too long" }
             return String(bytes(n.toInt()), Charsets.UTF_8)
         }
+
         fun value(t: Int): Any = when (t) {
-            T_UINT8 -> raf.readUnsignedByte(); T_INT8 -> raf.readByte().toInt(); T_BOOL -> raf.readByte().toInt() != 0
-            T_UINT16 -> le(2).short.toInt() and 0xFFFF; T_INT16 -> le(2).short.toInt()
-            T_UINT32 -> u32(); T_INT32 -> le(4).int; T_FLOAT32 -> le(4).float
-            T_UINT64, T_INT64 -> u64(); T_FLOAT64 -> le(8).double
+            T_UINT8 -> u8(); T_INT8 -> u8().toByte().toInt(); T_BOOL -> u8() != 0
+            T_UINT16 -> u16(); T_INT16 -> i16()
+            T_UINT32 -> u32(); T_INT32 -> i32(); T_FLOAT32 -> f32()
+            T_UINT64, T_INT64 -> u64(); T_FLOAT64 -> f64()
             T_STRING -> str()
             else -> throw IllegalArgumentException("bad GGUF type $t")
         }

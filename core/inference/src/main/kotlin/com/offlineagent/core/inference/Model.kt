@@ -161,6 +161,10 @@ data class GenerationStats(
     val droppedMessages: Int = 0,
     /** System-prompt prefix cache: 0 already in KV, 1 loaded from disk, 2 evaluated+saved, -1 not used. */
     val prefixCache: Int = -1,
+    /** Phase 4b: prompt tokens reused from the live KV cache (prefix reuse between turns). */
+    val reusedTokens: Int = 0,
+    /** Phase 4b: time from the request to the first visible token (ms), 0 = none. */
+    val firstTokenMillis: Long = 0,
 ) {
     val acceptanceRate: Double get() = if (draftedTokens <= 0) 0.0 else acceptedTokens.toDouble() / draftedTokens
 
@@ -182,6 +186,12 @@ sealed interface GenerationEvent {
     }
 
     data class Completed(val stats: GenerationStats) : GenerationEvent
+
+    /**
+     * Phase 4b: prompt evaluation progress ("Reading prompt… [done]/[total]"); [reused] tokens came from the KV cache
+     * and are not evaluated again. Emitted a few times per second while a long prompt is read.
+     */
+    data class PromptProgress(val done: Int, val total: Int, val reused: Int) : GenerationEvent
 }
 
 /** Lifecycle of the inference adapter. */

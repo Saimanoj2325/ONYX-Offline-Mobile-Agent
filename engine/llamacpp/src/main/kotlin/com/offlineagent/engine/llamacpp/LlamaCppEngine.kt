@@ -169,6 +169,11 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         return LlamaNative.nativePrefixCache(h, prefix.toByteArray(Charsets.UTF_8), cacheFile ?: "", cacheFile != null)
     }
 
+    override fun prefillProgress(): IntArray? {
+        val h = handle.takeIf { it != 0L } ?: return null
+        return runCatching { LlamaNative.nativePrefillProgress(h) }.getOrNull()
+    }
+
     override fun runtimeStats(): IntArray {
         val h = handle.takeIf { it != 0L } ?: return IntArray(6)
         return LlamaNative.nativeStats(h)

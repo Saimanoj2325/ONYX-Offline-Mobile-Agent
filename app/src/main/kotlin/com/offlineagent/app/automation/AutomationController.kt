@@ -158,12 +158,17 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
             this.app.engineController.ensure(role)
             val profileNotes = this.app.vault.current()?.let { p -> com.offlineagent.core.runtime.phone.ProfileKey.entries.mapNotNull { k -> p[k]?.let { "${k.label}: $it" } }.joinToString("; ") } ?: ""
             var agentRef: ScreenAgent? = null
-            val agent = ScreenAgent(InferenceAgentLlm(this.app.inference), s, host(s, "Offline Agent") { agentRef }, this.app.automationPolicy(), this.app.automationLog,
+            var lastPartial = 0L
+            val llm = InferenceAgentLlm(this.app.inference,
+                onPartial = { t -> val now = System.currentTimeMillis(); if (now - lastPartial > 150) { lastPartial = now; this.app.automationPartial.value = t } },
+                onPrompt = { d, n -> this.app.automationPartial.value = com.offlineagent.core.runtime.chat.StreamingTurn.readingStatus(d, n) })
+            val agent = ScreenAgent(llm, s, host(s, "Offline Agent") { agentRef }, this.app.automationPolicy(), this.app.automationLog,
                 ScreenAgentLimits(maxSteps = 25))
             agentRef = agent; running = agent
             return agent.run(goal, if (profileNotes.isNotBlank()) "Your saved profile (use only if the task needs it): $profileNotes" else "")
         } finally {
             running = null
+            this.app.automationPartial.value = ""
             LongTasks.finish(this.app, taskId)
         }
     }

@@ -91,7 +91,10 @@ class EngineInferenceAdapter(
     }
 
     /** The actual token loop; runs entirely on [engineDispatcher]. Caller holds [mutex]. */
-    private fun generateLocked(info: ModelInfo, request: GenerationRequest): Flow<GenerationEvent> = flow {
+    private fun generateLocked(info: ModelInfo, request: GenerationRequest): Flow<GenerationEvent> = kotlinx.coroutines.flow.channelFlow {
+        suspend fun emit(e: GenerationEvent) = send(e)
+        val tRequest = nanoTime()
+        var firstTokenMillis = 0L
         run {
             val template = templateFor?.invoke(info) ?: PromptTemplates.forModel(info, engine)
             val images = request.messages.lastOrNull { it.role == Role.USER }?.images.orEmpty()
@@ -113,7 +116,7 @@ class EngineInferenceAdapter(
             if (prefixCacheEnabled && request.cachePrefix && prefix != null && images.isEmpty() && nKeep >= PREFIX_CACHE_MIN_TOKENS) {
                 val file = try { prefixCacheFile?.invoke(info, prefix) } catch (e: Exception) { null }
                 prefixState = try {
-                    abortOnCancel { engine.prefixCache(prefix, file) }
+                    withPrefillProgress { abortOnCancel { engine.prefixCache(prefix, file) } }
                 } catch (e: GenerationAbortedException) { -1 }
                 // Fail safe: a cache file that could not be used is deleted (the native side already drops files whose
                 // token list does not match; this also covers read/eval errors).
@@ -123,7 +126,7 @@ class EngineInferenceAdapter(
                 currentCoroutineContext().ensureActive()
                 val prompt = template.render(messages, request.thinking)
                 try {
-                    promptTokens = abortOnCancel { engine.beginCompletion(prompt, request.sampling, request.maxNewTokens, request.grammar, images, nKeep) }
+                    promptTokens = withPrefillProgress { abortOnCancel { engine.beginCompletion(prompt, request.sampling, request.maxNewTokens, request.grammar, images, nKeep) } }
                     break
                 } catch (e: PromptTooLongException) {
                     val shorter = PromptFitter.dropOldestTurn(messages) ?: throw e
@@ -137,6 +140,7 @@ class EngineInferenceAdapter(
             }
             val dropped = original.size - messages.size
             val promptMillis = (nanoTime() - t0) / 1_000_000
+            val reused = runCatching { engine.prefillProgress()?.getOrNull(2) ?: 0 }.getOrDefault(0)
             if (!aborted) emit(GenerationEvent.PromptProcessed(promptTokens, promptMillis))
 
             val decoder = Utf8StreamDecoder()
@@ -151,6 +155,7 @@ class EngineInferenceAdapter(
                         generated++
                         val text = decoder.feed(step.bytes)
                         if (text.isNotEmpty()) {
+                            if (firstTokenMillis == 0L) firstTokenMillis = ((nanoTime() - tRequest) / 1_000_000).coerceAtLeast(1)
                             emit(GenerationEvent.Token(text, generated, (nanoTime() - genStart) / 1_000_000))
                         }
                     }
@@ -179,6 +184,8 @@ class EngineInferenceAdapter(
                         acceptedTokens = rs.getOrElse(4) { 0 },
                         droppedMessages = dropped,
                         prefixCache = prefixState,
+                        reusedTokens = reused,
+                        firstTokenMillis = firstTokenMillis,
                     ),
                 ),
             )
@@ -211,7 +218,25 @@ class EngineInferenceAdapter(
         return try { withContext(engineDispatcher) { engine.countTokens(text) } } finally { mutex.unlock() }
     }
 
+    /**
+     * Runs a blocking prompt evaluation while a side coroutine reports [GenerationEvent.PromptProgress] every
+     * [PROGRESS_INTERVAL_MS] (the engine thread is busy, so the poller runs on [Dispatchers.Default]; the native
+     * progress counters are atomics).
+     */
+    private suspend fun <T> kotlinx.coroutines.channels.ProducerScope<GenerationEvent>.withPrefillProgress(block: suspend () -> T): T {
+        val poller = launch(Dispatchers.Default) {
+            var last = -1
+            while (true) {
+                kotlinx.coroutines.delay(PROGRESS_INTERVAL_MS)
+                val p = runCatching { engine.prefillProgress() }.getOrNull() ?: continue
+                if (p.size >= 2 && p[1] > 0 && p[0] != last) { last = p[0]; trySend(GenerationEvent.PromptProgress(p[0], p[1], p.getOrElse(2) { 0 })) }
+            }
+        }
+        try { return block() } finally { poller.cancel() }
+    }
+
     companion object {
+        const val PROGRESS_INTERVAL_MS = 200L
         /** Below this the system prompt is cheaper to evaluate than to load from disk. */
         const val PREFIX_CACHE_MIN_TOKENS = 64
     }

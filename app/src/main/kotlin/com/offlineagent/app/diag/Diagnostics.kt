@@ -47,13 +47,21 @@ object Diagnostics {
     private val markerFile get() = File(dir, "native-marker")
     private val compatFile get() = File(dir, "cpu-compat")
 
-    @Synchronized fun log(msg: String) {
+    /** Phase 4b: log lines are appended on a background thread (callers may be on the main thread). */
+    private val logWriter = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "diag-log").apply { isDaemon = true } }
+
+    fun log(msg: String) {
         Log.i(TAG, msg)
         if (!::dir.isInitialized) return
+        val line = "${synchronized(ts) { ts.format(Date()) }}  $msg\n"
+        runCatching { logWriter.execute { appendLine(line) } }
+    }
+
+    @Synchronized private fun appendLine(line: String) {
         runCatching {
             val f = logFile
             if (f.length() > MAX_LOG) { f.copyTo(File(dir, "diag.old.log"), overwrite = true); f.writeText("") }
-            f.appendText("${ts.format(Date())}  $msg\n")
+            f.appendText(line)
         }
     }
 

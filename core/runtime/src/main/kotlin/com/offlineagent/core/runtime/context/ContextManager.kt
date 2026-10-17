@@ -39,6 +39,11 @@ data class ContextConfig(
     /** Share of the budget long-term memory pages may use. */
     val memoryShare: Double = 0.15,
     val memoryPages: Int = 4,
+    /**
+     * Phase 4b: hard cap on memory-page tokens per request. Every memory token is prefilled again on each turn
+     * (it sits in the new user message), so on a phone it adds directly to the time before the first token.
+     */
+    val memoryMaxTokens: Int = Int.MAX_VALUE,
     val summaryWords: Int = 250,
     /** Max tokens of turns folded per summarisation call (each call must itself fit in the window). */
     val maxTokensPerSummaryCall: Int = 3000,
@@ -102,7 +107,7 @@ class ContextManager(
         suspend fun liveTokens() = live.sumOf { t(it) }
         suspend fun summaryTokens() = sum?.let { counter.count(it.text) + 2 * ov + 12 } ?: 0
 
-        val memBudget = if (memory != null) (budget * config.memoryShare).toInt() else 0
+        val memBudget = if (memory != null) minOf((budget * config.memoryShare).toInt(), config.memoryMaxTokens) else 0
         val historyBudget = (budget - fixed - memBudget).coerceAtLeast(0)
 
         // Fold old turns into the summary while history is over the high-water mark.

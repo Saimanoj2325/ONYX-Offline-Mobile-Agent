@@ -65,30 +65,42 @@ class ThinkSplitter {
         return split(raw.toString())
     }
 
-    fun current(): Parts = split(raw.toString())
+    /** Final split (end of stream): nothing is held back. */
+    fun current(): Parts = split(raw.toString(), streaming = false)
 
     companion object {
         private const val OPEN = "<think>"
         private const val CLOSE = "</think>"
 
-        fun split(text: String): Parts {
+        fun split(text: String, streaming: Boolean = true): Parts {
             val start = text.indexOf(OPEN)
             if (start < 0) {
+                // Some templates pre-fill "<think>" in the prompt: the reply then only contains the closing tag.
+                val close = text.indexOf(CLOSE)
+                if (close >= 0) return Parts(text.substring(0, close).trim(), text.substring(close + CLOSE.length).trimStart(), false)
                 // A partial "<thi" at the very start is held back so it never flashes in the UI.
                 val t = text.trimStart()
-                if (t.isNotEmpty() && OPEN.startsWith(t)) return Parts("", "", false)
-                return Parts("", text.trimStart(), false)
+                if (streaming && t.isNotEmpty() && OPEN.startsWith(t)) return Parts("", "", false)
+                return Parts("", if (streaming) holdBackPartial(text.trimStart(), CLOSE) else text.trimStart(), false)
             }
             val end = text.indexOf(CLOSE, start + OPEN.length)
             if (end < 0) {
-                return Parts(text.substring(start + OPEN.length).trim(), text.substring(0, start).trim(), true)
+                // Still thinking: stream the reasoning, but never show a half-written "</thi" at its end.
+                val reasoning = (if (streaming) holdBackPartial(text.substring(start + OPEN.length), CLOSE) else text.substring(start + OPEN.length)).trim()
+                return Parts(reasoning, text.substring(0, start).trim(), true)
             }
             val reasoning = text.substring(start + OPEN.length, end).trim()
             val answer = (text.substring(0, start) + text.substring(end + CLOSE.length)).trimStart()
             return Parts(reasoning, answer, false)
         }
 
+        /** Drops a trailing prefix of [tag] ("</", "</thi"…) that may become the tag with the next token. */
+        internal fun holdBackPartial(s: String, tag: String): String {
+            for (k in minOf(tag.length - 1, s.length) downTo 2) if (s.endsWith(tag.substring(0, k))) return s.dropLast(k)
+            return s
+        }
+
         /** Removes any think block (used when re-sending history, as the official template does). */
-        fun stripThinking(text: String): String = split(text).answer
+        fun stripThinking(text: String): String = split(text, streaming = false).answer
     }
 }

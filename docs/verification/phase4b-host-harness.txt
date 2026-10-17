@@ -1,0 +1,58 @@
+Phase 4b host verification (sandbox: ARM64 Linux host, 2 CPU threads, NEON+dotprod+i8mm, no SVE/SME)
+llama.cpp b11609 host build (KleidiAI OFF, GGML_CPU_ALL_VARIANTS) + this commit's llama_jni.cpp (prefill progress atomics)
+Harness: tools/host-harness/src/main/kotlin/com/offlineagent/tools/Phase4bHarness.kt (real JNI bridge, real GGUF, EngineInferenceAdapter)
+Model: Qwen3-1.7B-Q8_0.gguf, 8K context, f16 KV, flash attention auto. Greedy sampling for repeatability.
+"Phase 4" rows rebuild the Phase 4 chat system prompt (base + generated OpenUI library) exactly as ChatViewModel did.
+Each TTFT scenario: load -> self-test (like the app) -> delete disk prompt cache -> turn 1 -> turn 2 in the same chat.
+"reused" on turn 1 = the system-prompt prefix evaluated by the prefix-cache step just before (included in TTFT).
+The run was interrupted by a sandbox restart during the batch-size section; that section was re-run (ONLY=batch).
+
+== model Qwen3-1.7B-Q8_0.gguf, threads=2, ctx=8192
+== GGUF header: Phase 4 reader 320 ms (28 keys) | Phase 4b arch() 121 ms | cached 33 µs | full buffered read 13 ms (28 keys)
+   arch = ModelArch(architecture=qwen3, layers=28, kvHeads=8, heads=16, embedding=2048, keyLength=128, valueLength=128, trainedContext=40960, vocabSize=151936, fileBytes=1834426016)
+  PASS arch read + cached
+  PASS same block_count as the old reader
+  PASS same vocabulary size as the old reader
+  PASS buffered full read sees every key
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=512 in 9542 ms
+== self-test after load: PASS "5" 2369 ms
+== system prompt tokens: Phase 4 full library 2163 | Phase 4 compact 1760 | Phase 4b chat (cheat sheet) 321 | Phase 4b when the user asks for UI 2163
+   chars: 8259 | 6681 | 1267 | 8259
+  PASS Phase 4b chat system prompt ≤ 400 tokens (got 321)
+  PASS cheat sheet is < 1/4 of the full-library prompt
+== time to first token (thinking off, greedy; each scenario starts right after load + self-test, like the app)
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=512 in 6259 ms
+   Phase 4 (full OpenUI library, 4B Auto) · turn 1 prompt  2195 tok (2168 reused)  44691 ms prefill ( 49.1 tok/s) | TTFT  45035 ms | decode  9.0 tok/s | 7 progress events
+   Phase 4 (full OpenUI library, 4B Auto) · turn 2 (KV prefix reuse) prompt  2260 tok (2182 reused)   2429 ms prefill (930.4 tok/s) | TTFT   2503 ms | decode 18.7 tok/s | 1 progress events
+  PASS Phase 4 (full OpenUI library, 4B Auto): turn 2 reuses the KV cache
+  PASS Phase 4 (full OpenUI library, 4B Auto): prefill progress reported
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=512 in 3838 ms
+   Phase 4 (compact library, <3B Auto) · turn 1   prompt  1792 tok (1765 reused)  35225 ms prefill ( 50.9 tok/s) | TTFT  35287 ms | decode 19.7 tok/s | 6 progress events
+   Phase 4 (compact library, <3B Auto) · turn 2 (KV prefix reuse) prompt  1853 tok (1779 reused)   1637 ms prefill (1131.9 tok/s) | TTFT   1694 ms | decode 19.8 tok/s | 1 progress events
+  PASS Phase 4 (compact library, <3B Auto): turn 2 reuses the KV cache
+  PASS Phase 4 (compact library, <3B Auto): prefill progress reported
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=512 in 3415 ms
+   Phase 4b (cheat sheet) · turn 1                prompt   353 tok ( 326 reused)   3656 ms prefill ( 96.6 tok/s) | TTFT   3699 ms | decode 25.3 tok/s | 2 progress events
+   Phase 4b (cheat sheet) · turn 2 (KV prefix reuse) prompt   410 tok ( 340 reused)    879 ms prefill (466.4 tok/s) | TTFT    922 ms | decode 14.1 tok/s | 1 progress events
+  PASS Phase 4b (cheat sheet): turn 2 reuses the KV cache
+  PASS Phase 4b (cheat sheet): prefill progress reported
+== streaming with thinking ON (Qwen3 thinking mode)
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=512 in 2873 ms
+  PASS thinking section was open while the model reasoned
+   thinking on                                    prompt   347 tok ( 326 reused)    507 ms prefill (684.4 tok/s) | TTFT    766 ms | decode 13.9 tok/s | 1 progress events
+   reasoning: Okay, let's see. The user is asking for 17 multiplied by 23. I need to calculate that. Hmm, 17 times 20 is 340, and 17 times 3 is 51. Adding those together, 340…
+   answer:    **Answer:**   **391**    The product of 17 and 23 is **391**.
+   footer:    119 tok · 13.9 tok/s · first token 0.8 s · prompt 347 tok (326 cached)
+  PASS reasoning captured separately
+  PASS first visible token arrives while thinking (not after the answer)
+
+# batch-size re-run
+== prefill speed by batch size (~2064 token prompt)
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=128 in 2261 ms
+   batch  128: 2187 tok in 52326 ms = 41.8 tok/s
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=256 in 3468 ms
+   batch  256: 2187 tok in 31154 ms = 70.2 tok/s
+== loaded qwen3 1.7B Q8_0 ctx=8192 batch=512 in 3403 ms
+   batch  512: 2187 tok in 42701 ms = 51.2 tok/s
+ALL PHASE 4b CHECKS PASSED
+EXIT=0

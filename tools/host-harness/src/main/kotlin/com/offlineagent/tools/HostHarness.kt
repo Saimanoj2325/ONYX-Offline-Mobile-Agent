@@ -47,6 +47,7 @@ fun main(args: Array<String>): Unit = runBlocking {
                 is GenerationEvent.Token -> { sb.append(ev.text); print(ev.text); System.out.flush() }
                 is GenerationEvent.Completed -> stats = ev.stats
                 is GenerationEvent.PromptProcessed -> println("[prompt ${ev.promptTokens} tok in ${ev.promptMillis} ms]")
+                is GenerationEvent.PromptProgress -> Unit
             }
         }
         val s = stats!!

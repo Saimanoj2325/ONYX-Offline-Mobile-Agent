@@ -5,7 +5,13 @@ import java.io.File
 
 /** Reads CPU topology from sysfs to pick the inference thread count (performance cores only). */
 object DeviceInfo {
-    fun cpuMaxFreqsKhz(): List<Long> {
+    /** sysfs/procfs values never change while the app runs: read once (keeps these cheap on any thread). */
+    private val freqs: List<Long> by lazy { readCpuMaxFreqsKhz() }
+    private val ram: Long by lazy { readTotalRam() }
+
+    fun cpuMaxFreqsKhz(): List<Long> = freqs
+
+    private fun readCpuMaxFreqsKhz(): List<Long> {
         val n = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         return (0 until maxOf(n, possibleCpuCount())).map { i ->
             runCatching {
@@ -26,7 +32,9 @@ object DeviceInfo {
     fun performanceCoreIds(): List<Int> = ThreadPolicy.performanceCoreIds(cpuMaxFreqsKhz())
 
     /** Total physical RAM in bytes (from /proc/meminfo; ActivityManager gives the same on Android). */
-    fun totalRamBytes(): Long = runCatching {
+    fun totalRamBytes(): Long = ram
+
+    private fun readTotalRam(): Long = runCatching {
         File("/proc/meminfo").readLines().first { it.startsWith("MemTotal:") }
             .split(Regex("\\s+"))[1].toLong() * 1024
     }.getOrDefault(4L shl 30)

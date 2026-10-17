@@ -42,6 +42,8 @@ object LlamaNative {
         grammarUtf8: ByteArray?, imagesRgb: Array<ByteArray>?, widths: IntArray?, heights: IntArray?, nKeep: Int,
     ): Int
     external fun nativeStats(handle: Long): IntArray
+    /** Phase 4b: [evaluated, to evaluate, reused] for the prompt being evaluated (any thread). */
+    external fun nativePrefillProgress(handle: Long): IntArray
     external fun nativeCountTokens(handle: Long, textUtf8: ByteArray): Int
     external fun nativePrefixCache(handle: Long, prefixUtf8: ByteArray, path: String, save: Boolean): Int
     external fun nativeAttachDraft(handle: Long, path: String?, nDraft: Int, nThreads: Int, typeK: Int): Boolean

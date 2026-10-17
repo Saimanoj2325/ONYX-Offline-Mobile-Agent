@@ -240,13 +240,14 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             SwitchRow("Prompt cache", "Keeps the system prompt's KV cache in memory and on disk, so the first answer after a restart starts much faster.", s.prefixCache) { v -> upd { it.copy(prefixCache = v) } }
             SwitchRow("Keep model warm", "Stays loaded in the background; freed only when Android is short of memory.", s.keepWarm) { v -> upd { it.copy(keepWarm = v) } }
             Section("Answers & memory")
+            SwitchRow("Thinking", "Qwen3 reasons first (shown live in a collapsible \"Thinking…\" section), then answers. Better answers, a little slower. Change it per message with the Think chip.", s.thinking) { v -> upd { it.copy(thinking = v) } }
             Text("Rich answers (OpenUI components: tables, charts, forms…)", style = MaterialTheme.typography.bodyLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("AUTO" to "Auto", "FULL" to "All components", "COMPACT" to "Core only", "OFF" to "Off (Markdown)").forEach { (v, l) ->
                     FilterChip(selected = s.richUi == v, onClick = { upd { it.copy(richUi = v) } }, label = { Text(l) })
                 }
             }
-            Text("Auto: all components for 3B+ models, the core set (shorter prompt) for smaller ones.", style = MaterialTheme.typography.bodySmall)
+            Text("Auto: a short component cheat sheet (fast first token); the full library only when you ask for a chart, form, dashboard or other UI. \"All components\" makes every prompt much longer.", style = MaterialTheme.typography.bodySmall)
             Text("Maximum answer length", style = MaterialTheme.typography.bodyLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(0, 1024, 2048, 4096, 8192).forEach { n ->
@@ -606,7 +607,8 @@ private fun DiagnosticsPage(app: OfflineAgentApp, notify: (String) -> Unit) {
     val s by app.settings.settings.collectAsStateWithLifecycle(AppSettings())
     val health by app.engineController.health.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
-    var reports by remember { mutableStateOf(com.offlineagent.app.diag.Diagnostics.crashReports()) }
+    var reports by remember { mutableStateOf(emptyList<java.io.File>()) }
+    LaunchedEffect(Unit) { reports = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { com.offlineagent.app.diag.Diagnostics.crashReports() }.getOrDefault(emptyList()) } }
     var open by remember { mutableStateOf<String?>(null) }
     var sysInfo by remember { mutableStateOf("") }
     LaunchedEffect(Unit) { sysInfo = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { app.inference.systemInfo() }.getOrDefault("") } }
@@ -649,7 +651,7 @@ private fun DiagnosticsPage(app: OfflineAgentApp, notify: (String) -> Unit) {
         items(reports, key = { it.name }) { f ->
             Card(Modifier.fillMaxWidth().clickable { open = if (open == f.name) null else f.name }) {
                 Column(Modifier.padding(10.dp)) {
-                    val text = remember(f.name) { runCatching { f.readText() }.getOrDefault("") }
+                    val text by androidx.compose.runtime.produceState("", f.name) { value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { f.readText() }.getOrDefault("") } }
                     Text(text.lineSequence().firstOrNull() ?: f.name, style = MaterialTheme.typography.titleSmall)
                     Text(java.text.DateFormat.getDateTimeInstance().format(java.util.Date(f.lastModified())), style = MaterialTheme.typography.labelSmall)
                     if (open == f.name) androidx.compose.foundation.text.selection.SelectionContainer {

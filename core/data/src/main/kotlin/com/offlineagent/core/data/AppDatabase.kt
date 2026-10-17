@@ -99,7 +99,8 @@ data class AppSettings(
     /** 0 = automatic (by device RAM: 16K on 8 GB phones, 8K on 6 GB, 4K on 4 GB). */
     val contextLength: Int = 0,
     val threads: Int = 0, // 0 = recommended
-    val thinking: Boolean = false,
+    /** Phase 4b: Qwen3 thinking on by default (the reasoning streams live in a collapsible section). */
+    val thinking: Boolean = true,
     val output: OutputPreference = OutputPreference.AUTO,
     val useDocuments: Boolean = true,
     val alwaysAllowedTools: Set<String> = emptySet(),
@@ -109,8 +110,9 @@ data class AppSettings(
     val kvCache: String = "AUTO",
     /** AUTO | ON | OFF */
     val flashAttention: String = "AUTO",
-    val batchSize: Int = 512,
-    val ubatchSize: Int = 512,
+    /** Phase 4b: 256/256 (host harness: 70 tok/s prefill vs 51 at 512 and 42 at 128; finer "Reading prompt" progress). */
+    val batchSize: Int = 256,
+    val ubatchSize: Int = 256,
     /** 0 = automatic by RAM (up to 8192). */
     val maxOutputTokens: Int = 0,
     /** Experimental YaRN rope scaling beyond the model's trained context (64K/128K). */
@@ -200,12 +202,12 @@ class SettingsRepository(context: Context) {
     private fun read(p: Preferences) = AppSettings(
         contextLength = p(K.ctx) ?: 0,
         threads = p(K.threads) ?: 0,
-        thinking = p(K.thinking) ?: false,
+        thinking = p(K.thinking) ?: true,
         output = p(K.output)?.let { runCatching { OutputPreference.valueOf(it) }.getOrNull() } ?: OutputPreference.AUTO,
         useDocuments = p(K.useDocs) ?: true,
         alwaysAllowedTools = p(K.allowed) ?: emptySet(),
         lastChatId = p(K.lastChat)?.toLongOrNull() ?: 0,
-        kvCache = p(K.kv) ?: "AUTO", flashAttention = p(K.fa) ?: "AUTO", batchSize = p(K.batch) ?: 512, ubatchSize = p(K.ubatch) ?: 512,
+        kvCache = p(K.kv) ?: "AUTO", flashAttention = p(K.fa) ?: "AUTO", batchSize = p(K.batch) ?: 256, ubatchSize = p(K.ubatch) ?: 256,
         maxOutputTokens = p(K.maxOut) ?: 0, yarn = p(K.yarn) ?: false, speculative = p(K.spec) ?: false, draftTokens = p(K.draftTokens) ?: 6,
         prefixCache = p(K.prefix) ?: true, keepWarm = p(K.warm) ?: true, autoSummarize = p(K.summarize) ?: true, longTermMemory = p(K.ltm) ?: true,
         pollLevel = p(K.poll) ?: 50, phoneGroups = p(K.groups) ?: AppSettings.DEFAULT_PHONE_GROUPS,
@@ -238,12 +240,21 @@ class SettingsRepository(context: Context) {
      * (now f16), speculative decoding off. Runs once per schema version.
      */
     suspend fun migrate(): Boolean {
-        if (current().settingsVersion >= SCHEMA) return false
+        val from = current().settingsVersion
+        if (from >= SCHEMA) return false
         update {
-            it.copy(contextLength = if (it.contextLength > 8192) 0 else it.contextLength, kvCache = "AUTO", flashAttention = "AUTO",
-                speculative = false, yarn = false, largeContext = false, settingsVersion = SCHEMA)
+            var n = it
+            if (from < 4) n = n.copy(contextLength = if (n.contextLength > 8192) 0 else n.contextLength, kvCache = "AUTO", flashAttention = "AUTO",
+                speculative = false, yarn = false, largeContext = false)
+            // v5 (Phase 4b): thinking on by default (it used to be saved as off for everyone); rich answers back to Auto
+            // (now the short cheat-sheet prompt); the old 512/512 batch default becomes 256/256 (faster prefill in the
+            // host harness); a batch the user picked by hand is kept.
+            if (from < 5) n = n.copy(thinking = true, richUi = if (n.richUi == "OFF") "OFF" else "AUTO",
+                batchSize = if (n.batchSize == 512 && n.ubatchSize == 512) 256 else n.batchSize,
+                ubatchSize = if (n.batchSize == 512 && n.ubatchSize == 512) 256 else n.ubatchSize)
+            n.copy(settingsVersion = SCHEMA)
         }
-        return true
+        return from < 4 // only the Phase 4 migration invalidates prompt-cache files
     }
 
     private suspend fun write(f: (AppSettings) -> AppSettings) {
@@ -260,5 +271,5 @@ class SettingsRepository(context: Context) {
         }
     }
 
-    companion object { const val SCHEMA = 4 }
+    companion object { const val SCHEMA = 5 }
 }

@@ -117,20 +117,25 @@ fun OpenUiMessageView(text: String, streaming: Boolean, host: OpenUiHost, modifi
 
 @Composable
 fun OpenUiProgramView(source: String, streaming: Boolean, host: OpenUiHost, modifier: Modifier = Modifier, key: String = "") {
-    val resolved: Resolved = remember(source, streaming) {
-        val program = if (streaming) OpenUiStreamParser().append(source).snapshot() else OpenUiParser.parse(source)
-        OpenUiResolver().resolve(program, streaming)
-    }
+    // Phase 4b: components render as soon as the partial program resolves; until then the program text itself streams
+    // (never a blank bubble while tokens arrive).
+    val view = remember(source, streaming) { com.offlineagent.core.openui.OpenUiStreaming.view(source, streaming) }
     Column(modifier.fillMaxWidth().animateContentSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        val root = resolved.root
-        if (root != null) Node(root, host, "$key/")
-        else if (streaming) Text("Building the answer…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        else {
-            // Nothing usable: degrade to the raw text so nothing is lost.
-            Text("This part could not be displayed as components:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            CodeBlock(source, "openui")
+        when (view) {
+            is com.offlineagent.core.openui.ProgramView.Components -> {
+                Node(view.resolved.root!!, host, "$key/")
+                if (!streaming) view.resolved.proseLines.takeIf { it.isNotEmpty() }?.let { MarkdownView(it.joinToString("\n"), actions = host.markdown) }
+            }
+            is com.offlineagent.core.openui.ProgramView.Raw -> if (!view.final) {
+                Text("Building UI…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(view.text.takeLast(1200), style = MaterialTheme.typography.bodySmall, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                // Nothing usable: degrade to the raw text so nothing is lost.
+                Text("This part could not be displayed as components:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                CodeBlock(source, "openui")
+            }
         }
-        if (!streaming) resolved.proseLines.takeIf { it.isNotEmpty() }?.let { MarkdownView(it.joinToString("\n"), actions = host.markdown) }
     }
 }
 

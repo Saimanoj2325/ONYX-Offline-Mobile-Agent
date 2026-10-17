@@ -87,6 +87,9 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
     val chat by vm.chat.collectAsStateWithLifecycle()
     val engine by vm.engine.collectAsStateWithLifecycle()
     val live by vm.agentLive.collectAsStateWithLifecycle()
+    val agentPartial by vm.agentPartial.collectAsStateWithLifecycle()
+    val automationPartial by vm.automationPartial.collectAsStateWithLifecycle()
+    val chatSettings by vm.settings.collectAsStateWithLifecycle()
     val chatModels by vm.chatModels.collectAsStateWithLifecycle()
     val downloads by app.modelDownloads.states.collectAsStateWithLifecycle()
     val pending by app.agents.pending.collectAsStateWithLifecycle()
@@ -160,12 +163,17 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
             } else LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 items(messages, key = { it.id }) { m ->
-                    MessageItem(m, vm, host.copyWith(interactive = !busy), busy, live = m.runId?.let { live[it] }, onCopy = { clipboard.setText(AnnotatedString(it)); vm.notice("Copied") })
+                    MessageItem(m, vm, host.copyWith(interactive = !busy), busy, live = m.runId?.let { live[it] }, onCopy = { clipboard.setText(AnnotatedString(it)); vm.notice("Copied") },
+                        partial = when {
+                            m.kind == "agent" -> m.runId?.let { agentPartial[it] }
+                            m.kind == ChatViewModel.KIND_AUTOMATION && m.text.isBlank() -> automationPartial.takeIf { it.isNotBlank() }
+                            else -> null
+                        })
                 }
                 ui.streaming?.let { s -> item(key = "streaming") { StreamingItem(s, host.copyWith(interactive = false)) } }
                 pending?.let { p -> item(key = "approval") { ApprovalCard(p, onAnswer = { allow, always -> app.agents.answerApproval(allow, always) }) } }
             }
-            Composer(vm, ui, busy, onPlus = { sheet = Sheet.ATTACH }, onTools = { sheet = Sheet.TOOLS })
+            Composer(vm, ui, busy, thinkingDefault = chatSettings.thinking, onPlus = { sheet = Sheet.ATTACH }, onTools = { sheet = Sheet.TOOLS })
         }
     }
 
@@ -314,7 +322,7 @@ private fun EmptyState(modifier: Modifier, onPick: (ChatLogic.Suggestion) -> Uni
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, busy: Boolean, live: String?, onCopy: (String) -> Unit) {
+private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, busy: Boolean, live: String?, onCopy: (String) -> Unit, partial: String? = null) {
     if (m.role == "user") {
         var menu by remember { mutableStateOf(false) }
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
@@ -336,8 +344,8 @@ private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, b
     Column(Modifier.fillMaxWidth().animateContentSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         when (m.kind) {
             "canvas" -> CanvasCard(m, vm, host)
-            "agent" -> AgentRunCard(m, vm, live, host)
-            ChatViewModel.KIND_AUTOMATION -> AutomationCard(m)
+            "agent" -> AgentRunCard(m, vm, live, host, partial)
+            ChatViewModel.KIND_AUTOMATION -> AutomationCard(m, partial)
             else -> {
                 if (m.reasoning.isNotBlank()) ThinkingSection(m.reasoning, live = false)
                 val cites = remember(m.id) { vm.citationsOf(m) }
@@ -363,13 +371,38 @@ private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, b
     }
 }
 
+/**
+ * Collapsible reasoning. Phase 4b: while the model is thinking ([live]) it is expanded and streams the latest
+ * reasoning; when the answer starts it collapses by itself (unless the user opened/closed it by hand).
+ */
 @Composable
 private fun ThinkingSection(reasoning: String, live: Boolean) {
-    var open by rememberSaveable { mutableStateOf(false) }
-    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().clickable { open = !open }) {
+    var userChoice by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    val open = userChoice ?: live
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().clickable { userChoice = !open }) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp).animateContentSize()) {
-            Text((if (live) "Thinking… " else "Thought") + " (${reasoning.length} chars) " + if (open) "▲" else "▼", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (open) Text(reasoning.trim(), fontStyle = FontStyle.Italic, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (live) { CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp); Spacer(Modifier.width(6.dp)) }
+                Text((if (live) "Thinking…" else "Thought") + " (${reasoning.length} chars) " + if (open) "▲" else "▼", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (open) {
+                // While streaming only the tail is shown (it keeps up with the model without long re-layouts).
+                val shown = if (live && reasoning.length > 1500) "…" + reasoning.takeLast(1500).trimStart() else reasoning.trim()
+                Text(shown, fontStyle = FontStyle.Italic, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusLine(s: Streaming) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Spacer(Modifier.width(8.dp))
+            Text(s.phase, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+        }
+        if (s.promptTotal > 0 && s.promptDone < s.promptTotal) {
+            androidx.compose.material3.LinearProgressIndicator(progress = { (s.promptDone.toFloat() / s.promptTotal).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth(0.6f))
         }
     }
 }
@@ -377,18 +410,17 @@ private fun ThinkingSection(reasoning: String, live: Boolean) {
 @Composable
 private fun StreamingItem(s: Streaming, host: OpenUiHost) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (s.reasoning.isNotBlank()) ThinkingSection(s.reasoning, live = s.text.isBlank())
+        if (s.reasoning.isNotBlank()) ThinkingSection(s.reasoning, live = s.thinking)
         when {
-            s.text.isBlank() -> Row(verticalAlignment = Alignment.CenterVertically) {
-                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Spacer(Modifier.width(8.dp))
-                Text(s.phase, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            // Nothing visible yet (loading, reading the prompt, or between </think> and the answer): status, never blank.
+            s.text.isBlank() -> if (!s.thinking || s.reasoning.isBlank()) StatusLine(s)
             s.mode == AnswerMode.CANVAS_NEW || s.mode == AnswerMode.CANVAS_UPDATE -> Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp)) { Text("▦ ${s.phase}", style = MaterialTheme.typography.labelMedium); OpenUiProgramView(s.text, streaming = true, host = host) }
             }
             else -> OpenUiMessageView(s.text, streaming = true, host = host)
         }
-        if (s.tokens > 0) Text("%d tok · %.1f tok/s".format(s.tokens, s.tokensPerSecond), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        val footer = s.footer.ifBlank { if (s.tokens > 0) "%d tok · %.1f tok/s".format(s.tokens, s.tokensPerSecond) else "" }
+        if (footer.isNotBlank()) Text(footer, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -420,7 +452,7 @@ private fun CanvasCard(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost) {
 }
 
 @Composable
-private fun AgentRunCard(m: MessageEntity, vm: ChatViewModel, live: String?, host: OpenUiHost) {
+private fun AgentRunCard(m: MessageEntity, vm: ChatViewModel, live: String?, host: OpenUiHost, partial: String? = null) {
     var expanded by rememberSaveable(m.id) { mutableStateOf(false) }
     val stepsFlow = remember(m.runId) { m.runId?.let { vm.observeSteps(it) } ?: kotlinx.coroutines.flow.flowOf(emptyList()) }
     val steps by stepsFlow.collectAsState(initial = emptyList())
@@ -432,6 +464,11 @@ private fun AgentRunCard(m: MessageEntity, vm: ChatViewModel, live: String?, hos
             }
             if (live != null) Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Text("  $live", style = MaterialTheme.typography.bodySmall)
+            }
+            // Phase 4b: the current step's model output streams here while it is being written.
+            if (live != null && !partial.isNullOrBlank()) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                Text(if (partial.length > 600) "…" + partial.takeLast(600) else partial, modifier = Modifier.padding(8.dp), style = MaterialTheme.typography.bodySmall,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             steps.firstOrNull { it.kind == "PLAN" }?.let { p ->
                 Text("Plan", style = MaterialTheme.typography.labelMedium)
@@ -454,12 +491,14 @@ private fun AgentRunCard(m: MessageEntity, vm: ChatViewModel, live: String?, hos
 }
 
 @Composable
-private fun AutomationCard(m: MessageEntity) {
+private fun AutomationCard(m: MessageEntity, partial: String? = null) {
     var open by rememberSaveable(m.id) { mutableStateOf(false) }
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp).animateContentSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("📱 ${m.reasoning}", style = MaterialTheme.typography.titleSmall)
             if (m.text.isBlank()) Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Text("  Running on your screen… (stop from the overlay)", style = MaterialTheme.typography.bodySmall) }
+            if (m.text.isBlank() && !partial.isNullOrBlank()) Text(if (partial.length > 400) "…" + partial.takeLast(400) else partial, style = MaterialTheme.typography.bodySmall,
+                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             else Text(m.text, style = MaterialTheme.typography.bodyMedium)
             val log = m.uiJson.orEmpty()
             if (log.isNotBlank()) {
@@ -506,7 +545,7 @@ fun Thumbnail(f: File, sizeDp: Int, onRemove: (() -> Unit)? = null) {
 // ---------------------------------------------------------------- composer
 
 @Composable
-private fun Composer(vm: ChatViewModel, ui: ChatUi, busy: Boolean, onPlus: () -> Unit, onTools: () -> Unit) {
+private fun Composer(vm: ChatViewModel, ui: ChatUi, busy: Boolean, thinkingDefault: Boolean, onPlus: () -> Unit, onTools: () -> Unit) {
     var text by rememberSaveable { mutableStateOf("") }
     LaunchedEffect(ui.editing?.id) { ui.editing?.let { text = it.text } }
     Surface(tonalElevation = 3.dp, shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)) {
@@ -540,6 +579,12 @@ private fun Composer(vm: ChatViewModel, ui: ChatUi, busy: Boolean, onPlus: () ->
                 FilterChip(selected = ui.mode != ComposerMode.CHAT, onClick = onTools, label = { Text(if (ui.mode == ComposerMode.CHAT) "Tools" else ui.mode.label) },
                     trailingIcon = { Icon(Icons.Filled.ArrowDropDown, null) })
                 if (ui.mode != ComposerMode.CHAT) TextButton(onClick = { vm.setMode(ComposerMode.CHAT) }) { Text("✕ back to chat") }
+                if (ui.mode == ComposerMode.CHAT) {
+                    // Phase 4b: per-message thinking toggle (Settings → Thinking is the default).
+                    val think = ui.thinkOverride ?: thinkingDefault
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(selected = think, onClick = { vm.toggleThinkOnce() }, label = { Text(if (think) "Think: on" else "Think: off") })
+                }
             }
         }
     }

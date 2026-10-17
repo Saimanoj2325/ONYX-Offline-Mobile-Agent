@@ -11,10 +11,18 @@ import com.offlineagent.core.inference.ThinkSplitter
 /** Sampling for structured (grammar-constrained) output: low temperature, NO repeat penalty (JSON repeats braces/quotes). */
 val STRUCTURED_SAMPLING = SamplingParams(temperature = 0.3f, topK = 20, topP = 0.9f, minP = 0.05f, repeatPenalty = 1.0f)
 
-/** [AgentLlm] over the app's [InferenceAdapter]: one non-thinking completion per call, optional GBNF grammar. */
+/**
+ * [AgentLlm] over the app's [InferenceAdapter]: one non-thinking completion per call, optional GBNF grammar.
+ *
+ * Phase 4b: [onPartial] receives the text generated so far (thinking stripped) after every token, and [onPrompt]
+ * the prompt-reading progress, so agent steps / report sections / summaries stream into their cards instead of
+ * appearing only at the end. Both are called from the generation coroutine; keep them cheap (post to a StateFlow).
+ */
 class InferenceAgentLlm(
     private val adapter: InferenceAdapter,
     private val onToken: (Int) -> Unit = {},
+    private val onPartial: ((String) -> Unit)? = null,
+    private val onPrompt: ((done: Int, total: Int) -> Unit)? = null,
 ) : AgentLlm {
     override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int): String {
         val sb = StringBuilder()
@@ -27,7 +35,16 @@ class InferenceAgentLlm(
                 sampling = if (grammar != null) STRUCTURED_SAMPLING else SamplingParams.QWEN3_NON_THINKING,
                 grammar = grammar,
             ),
-        ).collect { ev -> if (ev is GenerationEvent.Token) { sb.append(ev.text); onToken(++n) } }
+        ).collect { ev ->
+            when (ev) {
+                is GenerationEvent.Token -> {
+                    sb.append(ev.text); onToken(++n)
+                    onPartial?.invoke(ThinkSplitter.split(sb.toString()).answer)
+                }
+                is GenerationEvent.PromptProgress -> onPrompt?.invoke(ev.done, ev.total)
+                else -> Unit
+            }
+        }
         return ThinkSplitter.stripThinking(sb.toString()).trim()
     }
 }

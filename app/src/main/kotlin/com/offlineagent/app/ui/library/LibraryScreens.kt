@@ -125,7 +125,7 @@ fun ModelsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modif
     val settings by app.settings.settings.collectAsStateWithLifecycle(AppSettings())
     val engine by app.inference.state.collectAsStateWithLifecycle()
     val loaded by app.engineController.loaded.collectAsStateWithLifecycle()
-    val ctxEff = remember(settings) { app.engineController.effectiveContext(settings, app.engineController.planFor(null, settings)) }
+    val ctxEff = remember(settings) { app.engineController.effectiveContext(settings, app.engineController.planWithoutModel(settings)) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var importing by remember { mutableStateOf<String?>(null) }
