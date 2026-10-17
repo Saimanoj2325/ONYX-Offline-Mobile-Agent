@@ -62,3 +62,94 @@ removes the unverified paths instead of trying to patch them.
 1. Install the Phase 4 APK over the old one (settings migrate automatically, old caches are deleted).
 2. Send a message. If the chat shows a safe-mode or self-test banner, use **Share log** and send us the file.
 3. If answers are fine, optionally re-enable bigger windows in Settings → Performance ("Allow large context").
+
+---
+
+## 1. One ChatGPT-style chat screen
+
+The whole app is `ui/chat/ChatScreen.kt` (+ Settings from the drawer). The Phase 1–3 bottom tabs (Chat / Docs / Skills /
+Runs / Settings) are gone; their screens open as bottom sheets from the chat.
+
+| Part | What it does |
+|---|---|
+| Drawer | Search (all words, accent-insensitive), **New chat**, conversations grouped Today / Yesterday / Previous 7 days / Older, ⋮ → Rename / Delete (with confirm), **Settings** at the bottom. |
+| Top bar | **Model picker**: installed chat models (radio = active; picking one reloads in the background) + **Download models…**; status line (Ready · tokens used/context, Loading, Failed). New-chat icon; ⋮ = Thinking, Use my documents, Export chat as PDF, Rename. |
+| Thread | User messages: right-aligned bubbles (long-press → Copy / **Edit & resend**). Assistant: full-width, Markdown + **OpenUI components inline**, collapsible **Thought** section for Qwen3 `<think>`, Copy / **Regenerate**, stats. Streaming with live OpenUI rendering, auto-scroll only while you're at the bottom. |
+| Inline cards | Agent runs (plan, tool calls with in/out, live status), **approvals** (Allow once / Always / Deny — no more dialogs), Canvas (OpenUI, version label, Undo/Redo, Export PDF), PDF report results (Open PDF preview), automation & macro runs (result + action log). |
+| Empty state | Greeting by time of day + 4 suggestion chips. |
+| Composer | Multiline, IME-aware, Send / **Stop**; **+** → Photo, Camera, Document (RAG); **Tools** chip → mode: Chat, Agent, Canvas, PDF report, Phone actions, Automation; plus Documents / Skills / Agent runs / Macros / Models sheets and "Run a skill". Edit-and-resend banner. |
+| Safety banners | "Last run crashed — safe mode", self-test / compatibility-kernel messages with Share log / Restart / Exit safe mode. |
+| First launch | If no chat model is installed, an **onboarding sheet** recommends one by RAM (Qwen3-1.7B Q4_K_M on ≥ 5 GB, Qwen3-0.6B below) with one **Download** button and progress. |
+
+Pure logic (search, grouping, edit/regenerate targets, auto-scroll rule, streaming reducer, modes, suggestions) is in
+`core/runtime/chat/ChatLogic.kt` and unit-tested.
+
+## 2. OpenUI rendering
+
+[OpenUI](https://www.openui.com) (thesysdev/openui, **MIT licence**) defines *OpenUI Lang*, a compact line-oriented
+language (`identifier = Component(arg, …)`, positional args, forward references) that models write instead of JSON. We
+implemented it natively — no WebView, no JS:
+
+* `:core:openui` (pure Kotlin, JVM-tested)
+  * `Parser.kt` — tolerant recursive-descent parser + **streaming parser**: complete statements are kept, the trailing
+    partial statement is parsed with open strings/arrays/calls closed virtually; multi-line statements; named-argument
+    and alias tolerance for small models; never throws.
+  * `Library.kt` — the component library with OpenUI's default names, positional prop order and enum values:
+    Stack, Card, CardHeader, TextContent, MarkDownRenderer, Callout, TextCallout, Image, ImageBlock, CodeBlock, Separator,
+    Table/Col, BarChart, LineChart, AreaChart, HorizontalBarChart, Series, PieChart/Slice, Tabs/TabItem,
+    Accordion/AccordionItem, Steps/StepsItem, Form, FormControl, Input, TextArea, Select/SelectItem, Slider,
+    CheckBoxGroup/CheckBoxItem, RadioGroup/RadioItem, SwitchGroup/SwitchItem, Button, Buttons, FollowUpBlock/FollowUpItem,
+    ListBlock/ListItem, TagBlock, Tag. `compact()` = core subset for small models.
+  * `Resolver.kt` — OpenUI semantics: entry `root` (else first Stack), last definition wins, unreferenced statements not
+    rendered, defaults for wrong optional props, missing-required drops the component (kept while streaming), unknown
+    components and broken statements **degrade to text**, cycles reported, actions `@ToAssistant`, `@OpenUrl`,
+    `Action([...])` and the string forms `"submit:form"` / `"action:x"`.
+  * `Message.kt` — splits a reply into Markdown and ```` ```openui-lang ```` blocks (OpenUI "inline mode"); a whole-reply
+    program is detected too; plain Markdown when there is no OpenUI. Text view for copy/PDF/history.
+  * `Forms.kt` — field model, OpenUI validation rules (required, email, min/max, minLength/maxLength, pattern, url,
+    numeric), submit → next user turn (`Form submitted: …`, passwords masked) and parse back.
+  * `Prompt.kt` — **system-prompt generator** like OpenUI's `library.prompt()`: syntax rules, signatures grouped by
+    category (`Name(prop: type, opt?: "a" | "b") — description`), streaming rules, examples (only with available
+    components), inline-mode rules; PROGRAM mode for the Canvas.
+  * `Grammar.kt` — llama.cpp **GBNF** for whole programs (root first, library component names only, balanced syntax).
+* `app/ui/openui/OpenUiView.kt` — Compose renderer (Material 3, dark/light): layouts, cards, text/markdown, callouts,
+  code with highlighting, tables, **bar/line/area/horizontal-bar/pie/donut charts drawn on Canvas**, tabs, accordion,
+  steps, list blocks, tags, follow-up chips, buttons, **forms** (inputs, select, checkboxes, radio, switches, slider;
+  validation; submit sends values as the next user message), images (`attachment:N` = your photo; remote images are
+  never fetched).
+* Chat mode: the system prompt contains the generated OpenUI section (Auto = full library for ≥ 3B models, core
+  subset for smaller ones; Settings → Performance → Rich answers: Auto / All / Core / Off). Older answers are sent back
+  to the model as their visible text to save tokens.
+* Canvas mode: the model writes one program under the GBNF grammar; edits send the current program and merge the new
+  statements (OpenUI incremental editing: last definition wins). Every result is a canvas **version** (undo/redo).
+  Old Phase 2/3 JSON canvases and the agent's `render_ui` output are bridged to OpenUI (`OpenUiBridge`) and render
+  with the same renderer.
+* Not done: OpenUI reactive state (`$vars`, `@Set`/`@Reset` only parsed), Query/Mutation, `@Each`; llama.cpp **lazy**
+  grammar for inline blocks (the JNI exposes only full grammars) — inline OpenUI is validated by the tolerant parser.
+
+## 3. In-app model downloader
+
+* `:core:models` (pure JVM): curated catalogue (Qwen3-1.7B Q4_K_M default, Qwen3-4B Q4_K_M, Qwen3-0.6B Q8_0,
+  bge-small-en-v1.5 q8_0, SmolVLM2-256M + mmproj, Qwen3-VL-2B + mmproj), `https://huggingface.co/<repo>/resolve/main/<file>`
+  URLs, pasted-link parser (`/resolve/` or `/blob/`, huggingface.co or hf.co), and `Downloader`: manual redirects with
+  every hop checked against the allow-list (**HTTPS to huggingface.co / *.hf.co only**), HEAD for `X-Linked-Size` and
+  `X-Linked-Etag` (SHA-256), resume via HTTP Range (206 append / 200 restart / 416 complete), retries, free-space check,
+  GGUF magic + size + SHA-256 verification, cancel keeps the `.part` for resuming.
+* App: `models/ModelDownloads.kt` — WorkManager foreground job (dataSync) with a progress notification and Cancel,
+  live progress in the models sheet / onboarding / a strip under the top bar; when done the model (and projector) is
+  registered and activated. Existing file import stays (Models sheet → "Import a .gguf file").
+* **Network policy**: the offline flavor now has `android.permission.INTERNET`, used **only** by this downloader.
+  Inference, chats, documents, tools and MCP (binder) stay on the phone; no telemetry, no cloud fallback. The connected
+  flavor additionally keeps the LAN/remote MCP transport.
+
+## 4. Phase 3 features kept
+
+Long context (now opt-in above 8K), prompt cache, summaries + long-term memory, PDF tool and report skill, MCP (built-in,
+binder, connected-flavor HTTP), phone tools with approvals (now inline cards), autofill + accessibility automation with
+the same safety rules, macros (now runnable from the chat), skills, agent runs and resume.
+
+## 5. Licences
+
+OpenUI Lang syntax, component names and prompt format: thesysdev/openui, MIT, © Thesys Inc. — no OpenUI code is
+bundled; this is an independent Kotlin implementation. llama.cpp MIT. Models are downloaded by the user from
+Hugging Face under their own licences (Apache-2.0 / MIT for the catalogue).

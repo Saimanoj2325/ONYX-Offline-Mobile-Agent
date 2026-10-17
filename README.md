@@ -1,7 +1,21 @@
-# Offline-First Android Agent — Phase 3
+# Offline-First Android Agent — Phase 4
 
 A native Android app (Kotlin + Jetpack Compose, Material 3) that runs local **GGUF** models **fully offline** on the
 phone's CPU, with:
+
+- **Phase 4 — one ChatGPT-style chat**: drawer with searchable conversations + Settings, model picker, streaming answers
+  with Stop / Copy / Regenerate / Edit & resend, collapsible thinking, "+" attachments (photo, camera, document) and a
+  Tools toggle (Agent, Canvas, PDF report, Phone actions, Automation) — agent steps, approvals, canvases, PDFs and
+  automation logs are cards in the thread. Documents, skills, runs, macros and models open as bottom sheets.
+- **OpenUI answers**: a native Kotlin implementation of [OpenUI Lang](https://www.openui.com) (MIT): streaming parser,
+  component library (tables, bar/line/area/pie charts, forms, tabs, steps, callouts, code, follow-up chips…), generated
+  system prompt, GBNF grammar for Canvas mode, Compose renderer. Plain Markdown when the model writes no OpenUI.
+- **Built-in model downloader**: curated Hugging Face catalogue + "paste any HF GGUF link", resumable (HTTP Range),
+  verified (GGUF header, size, SHA-256), WorkManager foreground job with notification; first-launch onboarding picks a
+  model for your RAM.
+- **Phase 4 P0 fixes** (garbage output / crashes on a real phone): KleidiAI off, 8K + f16 KV defaults (16K+ opt-in),
+  post-load self-test with automatic safe mode and compatibility CPU kernels, crash detection + safe-mode start,
+  diagnostics & crash-log export, fail-safe settings and prompt cache. See `docs/PHASE4.md`.
 
 - **Rich answers**: proper Markdown (headings, lists, tables, highlighted code with Copy, quotes, math), streamed without jank.
 - **Intelligent UI / Canvas**: for structured requests the model emits a typed JSON UI document (tables, charts, checklists,
@@ -24,16 +38,20 @@ phone's CPU, with:
   volume/DND, quick settings, device info, clipboard, files, notifications — typed tools behind approvals.
 - **Form filling & automation**: AutofillService + encrypted Keystore profile vault, AccessibilityService screen agent with
   overlay (pause/stop/approve before submit), record/replay macros with schedules; CAPTCHA/OTP/banking safeguards.
-- **Offline build: no INTERNET permission. No cloud fallback. No telemetry.** The only online step is downloading model files beforehand.
+- **Network: the only network use is the in-app model downloader** (HTTPS to huggingface.co and its CDN, every redirect
+  checked against that allow-list). Inference, chats, documents and tools never leave the phone. No cloud fallback,
+  no telemetry. The *connected* flavor additionally allows LAN/remote MCP servers.
 
 Docs: `docs/ARCHITECTURE.md` (how it works), `docs/DECISIONS.md` (why), `docs/CHECKLIST.md`, `docs/DEVICE_TEST_PLAN.md`,
-`docs/KNOWN_ISSUES.md`, `docs/PHASE3.md` (Phase 3 features + Play policy notes), `docs/verification/phase3-host-harness.txt`
+`docs/KNOWN_ISSUES.md`, `docs/PHASE4.md` (Phase 4: P0 root cause + fixes, chat UI, OpenUI, downloader), `docs/PHASE3.md` (Phase 3 features + Play policy notes), `docs/verification/phase4-p0.txt`, `docs/verification/phase3-host-harness.txt`
 and `phase2-host-harness.txt` (real-model test output).
 
 ## Repository layout
 
 ```
-app/                 Compose UI: Chat (+Canvas), Docs, Skills, Runs, Models; ViewModels; ports; DI root
+app/                 Compose UI: one chat screen (ui/chat) + OpenUI renderer (ui/openui) + Settings; downloader worker (models/); diagnostics (diag/)
+core/openui/         Pure Kotlin OpenUI Lang: streaming parser, library, resolver, forms, prompt generator, GBNF (+ tests)
+core/models/         Pure JVM model catalogue + resumable, verified Hugging Face downloader (+ fake-server tests)
 core/inference/      Pure Kotlin: InferenceAdapter/TokenEngine, templates, grammar/images in requests, EmbeddingService
 core/runtime/        Pure Kotlin: UI schema+GBNF+validation, markdown, RAG maths, skills, tools, policy, agent loop (+ tests)
 core/data/           Room database + DataStore settings + agent checkpoint store
@@ -53,28 +71,31 @@ Requirements: JDK 17, Android SDK 35, **NDK 30.0.16248370**, CMake 3.31.6 (Andro
 
 ```bash
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew :core:inference:test :core:runtime:test :core:mcp-http:test   # 136 JVM unit tests
-./gradlew :app:assembleOfflineDebug     # → app/build/outputs/apk/offline/debug/app-offline-debug.apk (no INTERNET)
-./gradlew :app:assembleConnectedDebug   # → app/build/outputs/apk/connected/debug/app-connected-debug.apk (+INTERNET for MCP)
+./gradlew :core:inference:test :core:runtime:test :core:mcp-http:test :core:openui:test :core:models:test   # JVM unit tests (see PHASE4.md for counts)
+./gradlew :app:assembleOfflineDebug     # → app/build/outputs/apk/offline/debug/app-offline-debug.apk (INTERNET only for the model downloader)
+./gradlew :app:assembleConnectedDebug   # → app/build/outputs/apk/connected/debug/app-connected-debug.apk (+ LAN/remote MCP)
 ./gradlew :samples:mcp-server-sample:assembleDebug
 ```
 
 Native code is always built Release/-O3 (also in the debug APK). `gradle.properties` limits Gradle to `-Xmx3g`, 2 workers.
 
-Verify the offline guarantee:
+Check the permissions (since Phase 4 both flavors list INTERNET, used only by the downloader; no ACCESS_NETWORK_STATE):
 
 ```bash
 $ANDROID_HOME/build-tools/35.0.0/aapt dump permissions app/build/outputs/apk/offline/debug/app-offline-debug.apk
 # package: com.offlineagent.app
 # uses-permission: SET_ALARM, POST_NOTIFICATIONS, FOREGROUND_SERVICE(+SPECIAL_USE), READ_CONTACTS, READ_CALENDAR,
 #   ACCESS_NOTIFICATION_POLICY, USE_BIOMETRIC/USE_FINGERPRINT, WAKE_LOCK, RECEIVE_BOOT_COMPLETED, USE_MCP_SERVERS (own)
-# (no android.permission.INTERNET / ACCESS_NETWORK_STATE, no SMS/call/camera/storage permissions)
+# + INTERNET (model downloader only) + FOREGROUND_SERVICE_DATA_SYNC (download job)
+# (no ACCESS_NETWORK_STATE, no SMS/call/camera/storage permissions)
 ```
 
-## Install & provision models (only step needing internet)
+## Install & get a model
 
-1. `adb install -r offline-agent-phase3-offline-debug.apk` (or copy to the phone and open it).
-2. Download GGUFs on the phone/PC, then in the app: **Models → (role) → Add**. Files are copied into app storage.
+1. `adb install -r offline-agent-phase4-offline-debug.apk` (or copy to the phone and open it).
+2. First launch shows a sheet recommending a model for your phone's RAM → **Download** (one-time, Wi-Fi recommended).
+   More models: model picker (top bar) → **Download models…** (catalogue below, or paste any Hugging Face GGUF link).
+   Importing a .gguf file you already have still works (Models sheet → Import).
 
 | role | recommended | size | phone RAM | licence | link |
 |---|---|---|---|---|---|
@@ -93,18 +114,17 @@ phones set context 2048. For a vision model, tap **Add projector** on its card a
 
 ## Use
 
-- **Chat**: type and send; the model loads automatically. Above the composer: **Auto / Chat / Canvas**. Auto opens the
-  Canvas for tables, charts, plans, comparisons, checklists, quizzes…; follow-ups such as "add a chart" edit it in place.
-  Canvas: ‹ › = undo/redo, ⋮ = history, copy/share as Markdown. Red square = Stop.
-- **Documents**: Docs → Import (PDF/txt/md). With "Use my documents" on (chat ⋮ menu), answers cite `[1]`, `[2]`; tap a
-  chip to read the passage.
-- **Skills**: + → *Run a skill…*, or type `/study-plan …`, `/flashcards …`, `/compare-options …`, `/daily-planner …`,
-  `/explain-concept …`. Skills tab: create, duplicate & edit, import .md, enable/disable, delete. Writes (notes, memory)
-  and anything leaving the app (share sheet, calendar) ask for approval.
-- **Runs**: every agent run with plan, tool inputs/outputs, approvals, errors and timings; unfinished runs can be resumed.
-- **Photos**: + → Photo from gallery / Take a photo, then ask about it (needs a Vision model + projector).
+- **Chat**: type and send; the model loads automatically (and runs a 2-second self-test). Answers show tables, charts,
+  forms and follow-up chips inline when they help. Long-press your message → Edit & resend; under an answer → Copy /
+  Regenerate. Red square = Stop.
+- **Tools chip** (under the composer): Agent (tools + approvals), Canvas (a UI you refine with follow-ups; Undo/Redo),
+  PDF report, Phone actions, Automation (screen agent). Also opens Documents, Skills, Agent runs, Macros, Models.
+- **+**: Photo / Camera (needs a vision model) / Document for RAG (answers cite `[1]`, tap to read the passage).
+- **Skills**: Tools → Run a skill, or type `/study-plan …`, `/flashcards …`, `/compare-options …`, `/daily-planner …`.
+- **Settings** (drawer, bottom): Models, Performance (context, KV, rich answers), Phone actions, Profile & autofill,
+  Automation & macros, MCP, **Diagnostics & crash logs** (self-test, safe mode, compatibility CPU kernels, export logs).
 
-## Verified in the build sandbox (no phone available)
+## Verified in the build sandbox — Phase 2/3 (no phone available; Phase 4: docs/PHASE4.md)
 
 | check | result |
 |---|---|

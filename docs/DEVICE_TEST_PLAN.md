@@ -219,7 +219,58 @@ back `adb logcat` snippets for anything that fails.
 Phone model / SoC / RAM; 16K prompt tok/s, gen tok/s, peak RAM; 32K feasible?; heat after 10 min; autofill works in
 Chrome + one app; screen agent success on one real form; any crash logs (§8).
 
+
+## 24. Phase 4 — P0 checks first (garbage output / crashes)
+
+1. Install the Phase 4 offline APK **over** Phase 3 (keep data). Open the app: it must start (no crash) and show the chat.
+2. Settings (drawer → Settings) must open with no model loaded. Change Performance → context Auto/4K/8K and KV f16/q8_0:
+   each change saves at once and shows "Saved…"/"Applied: model reloaded"; the UI never freezes.
+3. Send "What is the capital of France?". Expected: a sane answer, header shows ≤ 8.2K context. Record tok/s.
+4. Settings → Diagnostics: self-test should read "pass — “5”". Note the "CPU variant" line and the CPU feature line
+   (SVE/SME/I8MM…) and send them to us.
+5. If you see a safe-mode or "broken output" banner: tap **Share log** and send the file. If it says "Restart now", do
+   it and test again (compatibility CPU kernels).
+6. Crash test: while a model is loading, swipe the app away. Reopen: it must start normally (a swipe is not a crash). If
+   the app ever crashes, the next start must show "Last run crashed — safe mode" with Share crash log.
+7. Duplicate send: tap Send twice quickly → exactly one user bubble.
+
+## 25. Phase 4 — chat UI
+
+1. Drawer: search, New chat, rename and delete a chat, Settings at the bottom.
+2. Model picker: switch between two installed models; "Download models…" opens the models sheet.
+3. Empty state: greeting + 4 chips; tapping a chip sends it.
+4. Long answer: Stop works; auto-scroll follows while at the bottom and stops when you scroll up.
+5. Long-press your message → Edit & resend → the old turn and answer are replaced. Regenerate an answer.
+6. Thinking on (⋮): the "Thought" section is collapsible.
+7. + → Photo / Camera / Document; Tools → each mode (Agent, Canvas, PDF report, Phone actions, Automation) shows its
+   card in the thread; approvals appear as cards (Allow once / Always / Deny).
+8. Dark mode, rotation, keyboard open/close: composer stays above the keyboard.
+
+## 26. Phase 4 — OpenUI answers
+
+1. "Compare Python and Java in a table with a bar chart" → table + bar chart render inline while streaming.
+2. "Show my monthly spending as a pie chart: rent 40%, food 25%, travel 15%, other 20%" → pie chart.
+3. "Help me plan a 3-day trip to Goa. Ask me what you need with a form." → a form; fill and submit → the values arrive
+   as your next message and the model continues.
+4. Tools → Canvas: "Make a study plan with steps and a checklist", then "add a chart of hours per day" → canvas v2;
+   Undo/Redo switch versions; Export PDF works.
+5. Settings → Performance → Rich answers Off → plain Markdown only.
+
+## 27. Phase 4 — model downloader
+
+1. Fresh install (or delete all chat models): the onboarding sheet recommends a model for your RAM; Download shows
+   progress in the sheet, the strip under the top bar and a notification with Cancel.
+2. Turn on airplane mode mid-download, then off, and tap Resume → it continues (not from 0).
+3. Cancel from the notification → state "Cancelled"; Resume continues.
+4. Paste `https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf` → downloads; a non-HF link is
+   rejected.
+5. Download SmolVLM2 (2 files) → attach a photo and ask about it.
+6. Disconnect the network after downloading: chatting, documents and tools keep working.
+
 ## 8. Logs to send back if something fails
+
+Phase 4: Settings → Diagnostics & crash logs → **Export & share logs** collects everything below in one file.
+
 
 ```
 adb logcat -s OfflineAgentLlama llama.cpp OfflineAgent AndroidRuntime DEBUG SQLiteLog

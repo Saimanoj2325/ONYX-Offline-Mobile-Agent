@@ -198,3 +198,22 @@ An in-app "Open-source licences" screen is a Phase 8 (release) item.
 - KSP 2.2.21-2.0.5, Room 2.7.2, DataStore 1.1.7, kotlinx-serialization-json 1.9.0 (library only, no compiler plugin —
   JSON is handled as `JsonElement`), PdfBox-Android 2.0.27.0. All Apache-2.0.
 - Build sandbox note: JuiceFS occasionally returns EIO to long-lived Gradle daemons; builds use `--no-daemon`.
+
+## D21. Phase 4 P0: remove unverified fast paths instead of patching them
+- Garbage output on a real phone could not be reproduced in the sandbox (native ARM64 + QEMU SVE/SME). The runtime-
+  dispatched KleidiAI kernels were the one path the phone used and the host never did, so `GGML_CPU_KLEIDIAI=OFF`.
+- Defaults are the most-tested llama.cpp configuration: 8K, f16 KV, flash attention Auto; bigger windows opt-in.
+- Every load is followed by a 12-token greedy self-test; failures switch to safe mode, then to the conservative
+  `android_armv8.2_1` CPU variant (needs a restart because ggml backends are registered once per process).
+- Crash detection uses a marker file around native work + ApplicationExitInfo, not a native signal handler (simpler,
+  no async-signal-safety pitfalls).
+
+## D22. OpenUI implemented natively in Kotlin
+- A WebView + the React renderer would add a JS runtime, slow streaming updates and break the native look; OpenUI Lang is
+  small enough to implement (parser ~300 lines). Names/props follow OpenUI's default library so its prompts and examples
+  apply. Inline mode (Markdown + fenced blocks) keeps plain Markdown as the default answer.
+
+## D23. Downloader in plain HttpURLConnection + WorkManager
+- No OkHttp: one class, testable against the JDK's HttpServer. Manual redirects so every hop is checked against the HF
+  allow-list and Range headers survive the CDN hop. WorkManager foreground job survives the app going to background;
+  no network constraint (that would need ACCESS_NETWORK_STATE, which the offline flavor strips).
