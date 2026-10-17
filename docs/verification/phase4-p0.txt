@@ -1,0 +1,79 @@
+Phase 4 P0 verification (sandbox: ARM64 Linux host, CPU features: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb dcpodp flagm2 frint i8mm bf16 dgh rng bti)
+llama.cpp b11609, same CMake flags as the APK (GGML_BACKEND_DL, GGML_CPU_ALL_VARIANTS, REPACK, NATIVE=OFF); tools/host-harness/build-native.sh
+Program: greedy decode (selftest.cpp) — 'capital of France' chat prompt, ~25 or ~230 prompt tokens
+
+## A. Phase 3 build (KleidiAI ON) — host libs /workspace/work/hostnative3
+### C_native_q8fa
+load_backend: loaded CPU backend from /workspace/work/hostnative3/llama/bin/libggml-cpu-armv8.2_2.so
+kleidiai: primary q4 kernel feature I8MM
+kleidiai: primary q8 kernel feature I8MM
+llama_context: n_ctx                 = 512
+llama_context: n_ctx_seq             = 512
+llama_context: flash_attn            = enabled
+llama_context: n_ctx_seq (512) < n_ctx_train (40960) -- the full capacity of the model will not be utilized
+OUT[Paris]
+DONE
+### A_sve128
+load_backend: loaded CPU backend from /workspace/work/hostnative3/llama/bin/libggml-cpu-armv8.6_2.so
+kleidiai: primary q4 kernel feature I8MM
+kleidiai: primary q8 kernel feature I8MM
+llama_context: n_ctx                 = 512
+llama_context: n_ctx_seq             = 512
+llama_context: flash_attn            = auto
+llama_context: n_ctx_seq (512) < n_ctx_train (40960) -- the full capacity of the model will not be utilized
+OUT[Paris]
+DONE
+### B_sme_q8fa
+load_backend: loaded CPU backend from /workspace/work/hostnative3/llama/bin/libggml-cpu-armv9.2_2.so
+kleidiai: primary q4 kernel feature I8MM
+kleidiai: primary q8 kernel feature SME
+kleidiai: primary f32 kernel feature SME
+llama_context: n_ctx                 = 512
+llama_context: n_ctx_seq             = 512
+llama_context: flash_attn            = enabled
+llama_context: n_ctx_seq (512) < n_ctx_train (40960) -- the full capacity of the model will not be utilized
+OUT[Paris]
+DONE
+### D_native_17_32k
+load_backend: loaded CPU backend from /workspace/work/hostnative3/llama/bin/libggml-cpu-armv8.2_2.so
+kleidiai: primary q4 kernel feature I8MM
+kleidiai: primary q8 kernel feature I8MM
+llama_context: n_ctx                 = 32768
+llama_context: n_ctx_seq             = 32768
+llama_context: flash_attn            = enabled
+llama_context: n_ctx_seq (32768) < n_ctx_train (40960) -- the full capacity of the model will not be utilized
+OUT[**Paris**]
+DONE
+### E/E2: Qwen3-1.7B Q8_0, 32K ctx, q8_0 KV + FA, 4 threads, qemu SME 128-bit: did not produce output before the run ended (emulation too slow / killed) — inconclusive
+### G: Qwen3-0.6B Q8_0, 4K, q8_0 KV + FA, 4 threads, ~230-token prompt, qemu SME (KleidiAI SME q8 kernels):
+OUT[
+
+### H: same at 32K context:
+OUT[
+
+
+=> The emulator does not reproduce the device garbage: real SME/SVE hardware differs from QEMU.
+
+## B. Phase 4 build (KleidiAI OFF) — host libs /workspace/work/hostnative4
+load_backend: loaded CPU backend from /workspace/work/hostnative4/llama/bin/libggml-cpu-armv8.2_2.so
+llama_context: n_ctx                 = 8192
+llama_context: n_ctx_seq             = 8192
+llama_context: flash_attn            = auto
+llama_context: n_ctx_seq (8192) < n_ctx_train (40960) -- the full capacity of the model will not be utilized
+OUT[
+DONE
+native, f16 KV, 8K and 4K, FA auto/off:
+  Qwen3-1.7B-Q8_0: OUT[**Paris**] / OUT[Paris];  Qwen3-0.6B-Q8_0: OUT[The capital of France is **Paris] / OUT[Paris]
+== cpu=max,sme=off,sve128=on,sve256=off,sve512=off,sve1024=off,sve2048=off
+load_backend: loaded CPU backend from /workspace/work/hostnative4/llama/bin/libggml-cpu-armv8.6_2.so
+OUT[
+The capital of]
+exit=0
+== cpu=max,sve128=on,sve256=off,sve512=off,sve1024=off,sve2048=off
+load_backend: loaded CPU backend from /workspace/work/hostnative4/llama/bin/libggml-cpu-armv9.2_2.so
+OUT[
+The capital of]
+exit=0
+ALLDONE
+
+APK native libs (Phase 4): grep -a -c kleidiai libggml-cpu-android_armv9.2_2.so = 0 (Phase 3: present); liboffline_agent_llama.so contains the 'CPU variant' reporting.

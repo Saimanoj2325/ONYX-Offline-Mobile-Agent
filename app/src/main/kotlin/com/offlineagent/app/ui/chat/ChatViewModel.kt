@@ -94,6 +94,10 @@ data class ChatUi(
     val contextSize: Int = 0,
     /** Exported PDF being previewed. */
     val pdf: com.offlineagent.app.pdf.PdfExporter.ExportedPdf? = null,
+    /** Composer tool/mode toggle (Phase 4 single-chat UI). */
+    val mode: com.offlineagent.core.runtime.chat.ComposerMode = com.offlineagent.core.runtime.chat.ComposerMode.CHAT,
+    /** User message being edited (edit-and-resend). */
+    val editing: MessageEntity? = null,
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -294,37 +298,114 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 if (explicit.skill.id == "write-report") runReport(chatId, explicit.request) else runAgent(chatId, explicit.request, explicit.skill)
                 return@launch
             }
-
-            val s = g.settings.current()
-            val hasCanvas = (chats.chat(chatId)?.canvasVersion ?: 0) > 0
-            val decision = if (images.isNotEmpty()) com.offlineagent.core.runtime.ui.RouteDecision(AnswerMode.MARKDOWN, "image")
-                else CanvasRouter.decide(text, s.output, hasCanvas)
-            try {
-                _ui.update { it.copy(streaming = Streaming(decision.mode, phase = if (images.isNotEmpty()) "Loading vision model…" else "Loading model…")) }
-                g.engineController.ensure(if (images.isNotEmpty()) ModelRole.VISION else ModelRole.CHAT)
-                val rag = if (s.useDocuments && decision.mode != AnswerMode.CANVAS_UPDATE && images.isEmpty() && g.retriever.hasDocuments()) {
-                    _ui.update { it.copy(streaming = it.streaming?.copy(phase = "Searching your documents…")) }
-                    g.retriever.search(text, 4).filter { it.score >= 0.25f }
-                } else emptyList()
-                when (decision.mode) {
-                    AnswerMode.MARKDOWN -> answerMarkdown(chatId, text, images, rag, s.thinking)
-                    AnswerMode.CANVAS_NEW, AnswerMode.CANVAS_UPDATE -> answerCanvas(chatId, text, decision.mode, rag)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                val msg = when (e) {
-                    is BusyException -> "The model is busy. Try again in a moment."
-                    is PromptTooLongException -> "The conversation is too long for the context window. Start a new chat or raise the context size."
-                    else -> e.message ?: e.toString()
-                }
-                chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", error = msg, createdAt = System.currentTimeMillis()))
-            } finally {
-                _ui.update { it.copy(streaming = null) }
-            }
+            respond(chatId, text, images, _ui.value.mode)
           } finally {
             sending = false
           }
+        }
+    }
+
+    /** Answers the last user turn of [chatId] according to the composer [mode]. Used by send, regenerate and edit. */
+    private suspend fun respond(chatId: Long, text: String, images: List<File>, mode: com.offlineagent.core.runtime.chat.ComposerMode) {
+        when (mode) {
+            com.offlineagent.core.runtime.chat.ComposerMode.AGENT -> { runAgent(chatId, text, null); return }
+            com.offlineagent.core.runtime.chat.ComposerMode.PHONE -> { runAgent(chatId, "Use the phone action tools for this request (ask for approval where needed): $text", null); return }
+            com.offlineagent.core.runtime.chat.ComposerMode.PDF_REPORT -> { runReport(chatId, text); return }
+            com.offlineagent.core.runtime.chat.ComposerMode.AUTOMATION -> { runAutomation(chatId, text); return }
+            else -> Unit
+        }
+        val s = g.settings.current()
+        try {
+            _ui.update { it.copy(streaming = Streaming(if (mode == com.offlineagent.core.runtime.chat.ComposerMode.CANVAS) AnswerMode.CANVAS_NEW else AnswerMode.MARKDOWN, phase = if (images.isNotEmpty()) "Loading vision model…" else "Loading model…")) }
+            g.engineController.ensure(if (images.isNotEmpty()) ModelRole.VISION else ModelRole.CHAT)
+            val rag = if (s.useDocuments && images.isEmpty() && g.retriever.hasDocuments()) {
+                _ui.update { it.copy(streaming = it.streaming?.copy(phase = "Searching your documents…")) }
+                g.retriever.search(text, 4).filter { it.score >= 0.25f }
+            } else emptyList()
+            if (mode == com.offlineagent.core.runtime.chat.ComposerMode.CANVAS && images.isEmpty()) answerCanvasOpenUi(chatId, text, rag)
+            else answerMarkdown(chatId, text, images, rag, s.thinking)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            val msg = when (e) {
+                is BusyException -> "The model is busy. Try again in a moment."
+                is PromptTooLongException -> "The conversation is too long for the context window. Start a new chat or raise the context size."
+                else -> e.message ?: e.toString()
+            }
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", error = msg, createdAt = System.currentTimeMillis()))
+        } finally {
+            _ui.update { it.copy(streaming = null) }
+        }
+    }
+
+    // ------------------------------------------------------------ message actions
+
+    fun setMode(m: com.offlineagent.core.runtime.chat.ComposerMode) = _ui.update { it.copy(mode = m) }
+
+    /** Regenerate an assistant answer: delete it (and anything after) and answer the same user turn again. */
+    fun regenerate(assistantId: Long) {
+        val chatId = _ui.value.chatId ?: return
+        if (busy) return notice("Wait for the current answer to finish (or press Stop).")
+        sending = true
+        genJob = viewModelScope.launch {
+            try {
+                val all = chats.messages(chatId).filter { it.kind != KIND_SUMMARY }
+                val (user, del) = com.offlineagent.core.runtime.chat.ChatLogic.regenerateTarget(all.map { com.offlineagent.core.runtime.chat.MsgRef(it.id, it.role, it.text, it.kind) }, assistantId) ?: return@launch
+                del.forEach { chats.deleteMessage(it) }
+                val um = all.first { it.id == user.id }
+                respond(chatId, um.text, attachmentsOf(um), _ui.value.mode)
+            } finally { sending = false }
+        }
+    }
+
+    fun startEdit(m: MessageEntity) = _ui.update { it.copy(editing = m) }
+    fun cancelEdit() = _ui.update { it.copy(editing = null) }
+
+    /** Edit-and-resend: the edited user message and everything after it are replaced by the new turn. */
+    fun submitEdit(newText: String) {
+        val m = _ui.value.editing ?: return
+        val chatId = _ui.value.chatId ?: return
+        if (busy) return notice("Wait for the current answer to finish (or press Stop).")
+        _ui.update { it.copy(editing = null) }
+        viewModelScope.launch {
+            val all = chats.messages(chatId).filter { it.kind != KIND_SUMMARY }
+            com.offlineagent.core.runtime.chat.ChatLogic.editResendDeletes(all.map { com.offlineagent.core.runtime.chat.MsgRef(it.id, it.role, it.text) }, m.id).forEach { chats.deleteMessage(it) }
+            lastSent = null
+            send(newText)
+        }
+    }
+
+    // ------------------------------------------------------------ models (top-bar picker)
+
+    val chatModels = g.models.models.map { l -> l.filter { it.role == ModelRole.CHAT.name } }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    fun selectModel(m: com.offlineagent.core.data.ModelEntity) = g.appScope.launch {
+        g.models.activate(m)
+        if (g.engineController.loaded.value != null) notice(g.engineController.applySettings())
+    }
+
+    // ------------------------------------------------------------ automation & macros (inline cards)
+
+    private suspend fun runAutomation(chatId: Long, goal: String) {
+        val started = System.currentTimeMillis()
+        val id = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = KIND_AUTOMATION, reasoning = "Automation: ${goal.take(60)}", createdAt = started))
+        val result = try { g.automation.runTask(goal, "") } catch (e: CancellationException) { "Stopped." } catch (e: Throwable) { "Could not run: ${e.message}" }
+        val log = g.automationLog.recent.value.filter { it.time >= started }.joinToString("\n") { "${it.step}. ${it.app}: ${it.action} → ${it.outcome}" }
+        chats.message(id)?.let { chats.updateMessage(it.copy(text = result, uiJson = log)) }
+    }
+
+    fun runMacro(m: com.offlineagent.core.runtime.phone.Macro) {
+        if (busy) return notice("Wait for the current answer to finish.")
+        sending = true
+        genJob = viewModelScope.launch {
+            try {
+                val chatId = ensureChat("Macro: ${m.name}")
+                val started = System.currentTimeMillis()
+                val id = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = KIND_AUTOMATION, reasoning = "Macro: ${m.name}", createdAt = started))
+                val result = try { g.automation.play(m, emptyList(), unattended = false) } catch (e: CancellationException) { "Stopped." } catch (e: Throwable) { "Could not run: ${e.message}" }
+                val log = g.automationLog.recent.value.filter { it.time >= started }.joinToString("\n") { "${it.step}. ${it.app}: ${it.action} → ${it.outcome}" }
+                chats.message(id)?.let { chats.updateMessage(it.copy(text = result, uiJson = log)) }
+            } finally { sending = false }
         }
     }
 
@@ -351,7 +432,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             when {
                 m.role == "user" -> com.offlineagent.core.runtime.context.Turn(m.id, Role.USER, m.text.ifBlank { "(photo)" })
                 m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed a canvas: ${m.text})")
-                m.text.isNotBlank() -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, m.text.take(4000))
+                m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed this UI:)\n" + com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.uiJson?.let { j -> com.offlineagent.core.runtime.ui.OpenUiBridge.toOpenUiSource(j) } ?: m.text).take(1500))
+                m.kind == KIND_AUTOMATION -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(automation) ${m.text}".take(600))
+                m.text.isNotBlank() -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT,
+                    // OpenUI blocks cost many tokens: older answers are shown to the model as their visible text.
+                    (if (com.offlineagent.core.openui.OpenUiMessage.hasProgram(m.text)) com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.text) else m.text).take(4000))
                 else -> null
             }
         }
@@ -379,6 +464,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val s = g.settings.current()
         val system = buildString {
             append(SYSTEM_PROMPT)
+            openUiLibrary(s)?.let { lib -> append("\n\n").append(com.offlineagent.core.openui.OpenUiPrompt.generate(lib)) }
             if (rag.isNotEmpty()) append("\n\n").append(RagPrompt.context(rag))
         }
         val info = (g.inference.state.value as? EngineState.Ready)?.model
@@ -434,6 +520,76 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * OpenUI component library for chat answers: OFF → none (plain Markdown); COMPACT → core components; FULL → all;
+     * AUTO → full for models ≥ 3B parameters, compact for smaller ones (keeps the prompt short on small models).
+     */
+    private fun openUiLibrary(s: AppSettings): com.offlineagent.core.openui.OpenUiLibrary? {
+        val full = com.offlineagent.core.openui.OpenUiLibrary.DEFAULT
+        return when (s.richUi) {
+            "OFF" -> null
+            "FULL" -> full
+            "COMPACT" -> full.compact()
+            else -> {
+                val params = (g.inference.state.value as? EngineState.Ready)?.model?.parameterCount ?: 0
+                if (params >= 3_000_000_000L) full else full.compact()
+            }
+        }
+    }
+
+    /** Canvas mode: the whole answer is one OpenUI program (llama.cpp grammar keeps the syntax valid), versioned per chat. */
+    private suspend fun answerCanvasOpenUi(chatId: Long, text: String, rag: List<RetrievedChunk>) {
+        val current = currentCanvasSource(chatId)
+        val user = buildString {
+            if (rag.isNotEmpty()) append(RagPrompt.context(rag, 500)).append("\n\n")
+            if (current != null) append(com.offlineagent.core.openui.OpenUiPrompt.updateUser(text, current))
+            else append(text)
+        }
+        val lib = com.offlineagent.core.openui.OpenUiLibrary.DEFAULT
+        _ui.update { it.copy(streaming = Streaming(AnswerMode.CANVAS_NEW, phase = if (current != null) "Updating canvas…" else "Designing canvas…")) }
+        val sb = StringBuilder()
+        var lastEmit = 0L
+        var stats: com.offlineagent.core.inference.GenerationStats? = null
+        g.inference.generate(GenerationRequest(
+            listOf(ChatMessage(Role.SYSTEM, com.offlineagent.core.openui.OpenUiPrompt.generate(lib, com.offlineagent.core.openui.OpenUiPrompt.Options(mode = com.offlineagent.core.openui.OpenUiPrompt.Mode.PROGRAM))),
+                ChatMessage(Role.USER, user)),
+            thinking = false, maxNewTokens = 1600, sampling = STRUCTURED_SAMPLING, grammar = com.offlineagent.core.openui.OpenUiGrammar.gbnf(lib),
+        )).collect { ev ->
+            when (ev) {
+                is GenerationEvent.Token -> {
+                    sb.append(ev.text)
+                    val t = System.nanoTime()
+                    if (t - lastEmit > 80_000_000) { lastEmit = t; _ui.update { it.copy(streaming = it.streaming?.copy(text = sb.toString(), tokens = ev.generatedTokens, tokensPerSecond = ev.tokensPerSecond)) } }
+                }
+                is GenerationEvent.Completed -> stats = ev.stats
+                else -> Unit
+            }
+        }
+        val raw = sb.toString().trim()
+        val now = System.currentTimeMillis()
+        val statsText = stats?.let { "%d tok · %.1f tok/s".format(it.generatedTokens, it.tokensPerSecond) }
+        val program = com.offlineagent.core.openui.OpenUiParser.parse(raw)
+        val merged = if (current != null) com.offlineagent.core.openui.OpenUiParser.parse(current).merge(program) else program
+        val resolved = com.offlineagent.core.openui.OpenUiResolver(lib).resolve(merged)
+        if (resolved.root == null) {
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = if (raw.isBlank()) "" else "```openui-lang\n$raw\n```",
+                error = if (stats?.stopReason == StopReason.CANCELLED) null else "The canvas could not be built from the model's output.", statsText = statsText, createdAt = now))
+            return
+        }
+        val source = merged.toSource()
+        val v = chats.addCanvasVersion(chatId, com.offlineagent.core.runtime.ui.OpenUiBridge.wrap(source), (if (current != null) "Edit: " else "Created: ") + text.take(60), now)
+        chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = com.offlineagent.core.openui.OpenUiText.render(resolved.root).take(2000), kind = "canvas",
+            uiJson = com.offlineagent.core.runtime.ui.OpenUiBridge.wrap(source), canvasVersion = v,
+            citationsJson = if (rag.isNotEmpty()) citationsJson(rag) else null, statsText = statsText, createdAt = now))
+    }
+
+    /** OpenUI source of the chat's current canvas version (legacy JSON canvases are bridged). */
+    suspend fun currentCanvasSource(chatId: Long): String? {
+        val v = chats.chat(chatId)?.canvasVersion ?: 0
+        if (v == 0) return null
+        return chats.canvasVersion(chatId, v)?.docJson?.let { com.offlineagent.core.runtime.ui.OpenUiBridge.toOpenUiSource(it) }
+    }
+
     // ------------------------------------------------------------ PDF export / report skill
 
     fun exportChatPdf() {
@@ -451,6 +607,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun closePdf() = _ui.update { it.copy(pdf = null) }
+
+    fun previewLastPdf() { val p = g.pdf.last ?: return notice("No PDF yet"); _ui.update { it.copy(pdf = p) } }
 
     /** "Write a report / PDF" skill: outline -> section-by-section writing -> multi-page PDF in Downloads. */
     private suspend fun runReport(chatId: Long, request: String) {
@@ -618,8 +776,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         const val KIND_SUMMARY = "summary"
         const val DUPLICATE_WINDOW_MS = 1500L
+        const val KIND_AUTOMATION = "automation"
         const val SYSTEM_PROMPT =
             "You are a helpful assistant running fully offline on the user's Android phone. Answer clearly and concisely. " +
-                "Use Markdown: headings, bullet lists, tables, **bold** and fenced code blocks where they help."
+                "Use Markdown: headings, bullet lists, tables, **bold** and fenced code blocks where they help. " +
+                "If the user writes \"Form submitted: …\", those are the values they entered in your form; continue with them."
     }
 }

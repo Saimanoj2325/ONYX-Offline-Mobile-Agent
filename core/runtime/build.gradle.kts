@@ -9,6 +9,7 @@ kotlin { jvmToolchain(17) }
 
 dependencies {
     api(project(":core:inference"))
+    api(project(":core:openui"))
     api(libs.kotlinx.serialization.json)
     api(libs.kotlinx.coroutines.core)
     testImplementation(libs.junit)

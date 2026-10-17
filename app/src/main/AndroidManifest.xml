@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Shared manifest. Network permissions are decided per flavor:
-    src/offline/AndroidManifest.xml   strips INTERNET / network state (the default product: no internet at all)
-    src/connected/AndroidManifest.xml adds INTERNET for LAN/remote MCP servers only
-  Verify:  aapt dump permissions app-offline-debug.apk   (must NOT list android.permission.INTERNET)
+    src/offline/AndroidManifest.xml   INTERNET only for the in-app model downloader (huggingface.co); network-state stripped
+    src/connected/AndroidManifest.xml INTERNET for the downloader + LAN/remote MCP servers
 
   Every permission below is used only after the user turns the matching group on in Settings → Phone actions.
 -->
@@ -17,6 +16,8 @@
     <!-- Long agent runs / report & PDF generation keep running in a foreground service with a Cancel button -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Model downloads run as a WorkManager foreground job (progress notification + Cancel) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Contacts lookup + calendar reading (runtime, opt-in per group) -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.READ_CALENDAR" />
@@ -113,6 +114,12 @@
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
         </service>
+
+        <!-- WorkManager's foreground service hosts the model download job: declare its type (Android 14+). -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

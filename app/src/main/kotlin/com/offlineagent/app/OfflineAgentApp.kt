@@ -88,6 +88,7 @@ class OfflineAgentApp : Application() {
     val automationLog by lazy { FileAutomationLog(this) }
     val automation by lazy { AutomationController(this) }
     val pdf by lazy { PdfExporter(this, db.chats()) }
+    val modelDownloads by lazy { com.offlineagent.app.models.ModelDownloads(this) }
     val chatMemory by lazy { ChatMemory(this, db.documents(), embeddings, models, retriever) }
     val mcp by lazy {
         McpManager(this, PhonePorts(

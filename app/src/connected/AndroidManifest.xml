@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- "connected" flavor: network is used ONLY for MCP servers the user adds (LAN or remote). No cloud inference, no telemetry. -->
+<!-- "connected" flavor: network is used for the model downloader (as in "offline") and for MCP servers the user adds (LAN or remote). No cloud inference, no telemetry. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <application android:usesCleartextTraffic="true" />

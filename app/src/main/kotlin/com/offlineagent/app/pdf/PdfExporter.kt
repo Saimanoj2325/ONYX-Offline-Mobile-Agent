@@ -92,6 +92,13 @@ class PdfExporter(private val ctx: Context, private val chats: ChatDao) : PdfPor
         val id = chatId ?: return null
         val chat = chats.chat(id) ?: return null
         val json = chats.canvasVersion(id, chat.canvasVersion)?.docJson ?: return null
+        if (com.offlineagent.core.runtime.ui.OpenUiBridge.isOpenUi(json)) {
+            // Phase 4 canvases are OpenUI programs: export their visible content as Markdown.
+            val root = com.offlineagent.core.openui.OpenUiResolver().resolve(com.offlineagent.core.openui.OpenUiParser.parse(com.offlineagent.core.runtime.ui.OpenUiBridge.unwrap(json))).root ?: return null
+            val md = com.offlineagent.core.openui.OpenUiText.render(root)
+            val title = md.lineSequence().firstOrNull { it.startsWith("## ") }?.removePrefix("## ") ?: chat.title
+            return title to PdfContent.fromMarkdown(md, ::imageResolver)
+        }
         val doc = (UiParser.parse(json) as? UiParseResult.Success)?.doc ?: return null
         return doc.title to PdfContent.fromCanvas(doc, ::imageResolver)
     }
@@ -104,7 +111,7 @@ class PdfExporter(private val ctx: Context, private val chats: ChatDao) : PdfPor
         for (m in msgs) {
             if (m.text.isBlank()) continue
             blocks += PdfBlock.Heading(2, if (m.role == "user") "You" else "Assistant")
-            blocks += PdfContent.fromMarkdown(m.text, ::imageResolver)
+            blocks += PdfContent.fromMarkdown(com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.text), ::imageResolver)
         }
         canvasMarkdown(chatId)?.let { (title, b) -> blocks += PdfBlock.Heading(1, "Canvas: $title"); blocks += b }
         return createPdf(PdfDocModel(chat.title.ifBlank { "Chat" }, blocks, subtitle = "Conversation exported from Offline Agent", tableOfContents = false),

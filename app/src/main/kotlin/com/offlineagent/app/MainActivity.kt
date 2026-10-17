@@ -10,6 +10,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -109,7 +111,6 @@ private fun AppTheme(content: @Composable () -> Unit) {
 private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequest) -> Unit) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val pending by app.agents.pending.collectAsStateWithLifecycle()
-    var tab by rememberSaveable { mutableIntStateOf(0) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val notify: (String) -> Unit = { msg -> scope.launch { snackbar.showSnackbar(msg) } }
@@ -128,7 +129,6 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
         app.cameraRequests.collect {
             val f = vm.cameraTarget()
             camFile = f
-            tab = 0
             runCatching { camera.launch(androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)) }
         }
     }
@@ -142,7 +142,6 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
             override fun run(skillId: String) {
                 scope.launch {
                     val s = app.skills.parsed().firstOrNull { it.id == skillId } ?: return@launch
-                    tab = 0
                     vm.runSkill(s, "")
                 }
             }
@@ -158,30 +157,24 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
         }
     }
 
-    Scaffold(
-        snackbarHost = { SnackbarHost(snackbar) },
-        bottomBar = {
-            NavigationBar {
-                listOf(
-                    Triple("Chat", Icons.Filled.Email, 0), Triple("Docs", Icons.AutoMirrored.Filled.List, 1),
-                    Triple("Skills", Icons.Filled.Build, 2), Triple("Runs", Icons.Filled.DateRange, 3), Triple("Settings", Icons.Filled.Settings, 4),
-                ).forEach { (label, icon, i) ->
-                    NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Icon(icon, contentDescription = null) }, label = { Text(label) })
-                }
-            }
-        },
-    ) { padding ->
+    // Phase 4: the chat is the whole app; Settings is the only other screen (from the drawer).
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+    Scaffold(snackbarHost = { SnackbarHost(snackbar) }, contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0)) { padding ->
         val m = Modifier.padding(padding)
-        when (tab) {
-            0 -> ChatScreen(vm, onShare = { text -> launch(IntentRequest.Share(text)) }, onOpenModels = { tab = 4 }, modifier = m)
-            1 -> DocumentsScreen(app, notify, m)
-            2 -> SkillsScreen(skillsHost, notify, m)
-            3 -> RunsScreen(runsHost, notify, m)
-            else -> com.offlineagent.app.settings.SettingsScreen(app, notify, m)
+        if (showSettings) {
+            androidx.activity.compose.BackHandler { showSettings = false }
+            Column(m.fillMaxSize().statusBarsPadding()) {
+                TextButton(onClick = { showSettings = false }) { Text("‹ Back to chat") }
+                com.offlineagent.app.settings.SettingsScreen(app, notify, Modifier.weight(1f))
+            }
+        } else {
+            ChatScreen(vm, onShare = { text -> launch(IntentRequest.Share(text)) }, onOpenSettings = { showSettings = true },
+                skillsHost = skillsHost, runsHost = runsHost, notify = notify, modifier = m)
         }
     }
 
-    pending?.let { ApprovalDialog(it, onAnswer = { allow, always -> app.agents.answerApproval(allow, always) }) }
+    // Approvals are cards in the chat thread; while Settings is open they still need an answer.
+    if (showSettings) pending?.let { ApprovalDialog(it, onAnswer = { allow, always -> app.agents.answerApproval(allow, always) }) }
 }
 
 @Composable

@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  OFFLINE GUARANTEE (default flavor): no android.permission.INTERNET, so the OS refuses every socket the process
-  tries to open. tools:node="remove" also strips these if any library dependency tries to merge them in.
+  OFFLINE flavor (default). Since Phase 4 the app has android.permission.INTERNET, used ONLY by the in-app model
+  downloader (HTTPS GET to huggingface.co and its download CDN; every redirect hop is checked against that allow-list,
+  see core/models UrlPolicy.HUGGING_FACE). Inference, chats, documents and tools never use the network; no telemetry,
+  no cloud fallback. Network-state permissions stay stripped (tools:node="remove") even if a library asks for them.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" tools:node="remove" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" tools:node="remove" />

@@ -240,6 +240,13 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             SwitchRow("Prompt cache", "Keeps the system prompt's KV cache in memory and on disk, so the first answer after a restart starts much faster.", s.prefixCache) { v -> upd { it.copy(prefixCache = v) } }
             SwitchRow("Keep model warm", "Stays loaded in the background; freed only when Android is short of memory.", s.keepWarm) { v -> upd { it.copy(keepWarm = v) } }
             Section("Answers & memory")
+            Text("Rich answers (OpenUI components: tables, charts, forms…)", style = MaterialTheme.typography.bodyLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("AUTO" to "Auto", "FULL" to "All components", "COMPACT" to "Core only", "OFF" to "Off (Markdown)").forEach { (v, l) ->
+                    FilterChip(selected = s.richUi == v, onClick = { upd { it.copy(richUi = v) } }, label = { Text(l) })
+                }
+            }
+            Text("Auto: all components for 3B+ models, the core set (shorter prompt) for smaller ones.", style = MaterialTheme.typography.bodySmall)
             Text("Maximum answer length", style = MaterialTheme.typography.bodyLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(0, 1024, 2048, 4096, 8192).forEach { n ->

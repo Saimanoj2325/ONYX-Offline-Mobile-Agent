@@ -14,14 +14,15 @@ android {
         applicationId = "com.offlineagent.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.0-phase3"
+        versionCode = 4
+        versionName = "0.4.0-phase4"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
     // Two products from one code base:
-    //  - offline   (default): NO INTERNET permission at all; MCP over binder (other on-device apps) + built-in servers.
-    //  - connected: adds INTERNET + Streamable HTTP/SSE MCP transport for LAN/remote MCP servers. Inference stays local.
+    //  - offline   (default): INTERNET is used ONLY by the in-app model downloader (HTTPS to huggingface.co + its CDN).
+    //               No other network code; MCP over binder (other on-device apps) + built-in servers. Inference is local.
+    //  - connected: additionally the Streamable HTTP/SSE MCP transport for LAN/remote MCP servers. Inference stays local.
     flavorDimensions += "network"
     productFlavors {
         create("offline") {
@@ -75,6 +76,8 @@ dependencies {
     implementation(project(":core:data"))
     implementation(project(":feature:workflow"))
     implementation(project(":mcp-aidl"))
+    implementation(project(":core:openui"))
+    implementation(project(":core:models"))
     "connectedImplementation"(project(":core:mcp-http"))
     implementation(libs.pdfbox.android)
 
