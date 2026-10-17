@@ -47,10 +47,10 @@ android {
                 arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
                 arguments += "-DGGML_OPENMP=OFF"
                 arguments += "-DGGML_LLAMAFILE=OFF"
-                // Phase 3 speed: Arm KleidiAI micro-kernels (dotprod / i8mm / SME matmuls for Q4_0/Q8_0 weights),
-                // compiled into every CPU variant and dispatched at runtime by CPU features. Vendored source
-                // (third_party/kleidiai, v1.31.0, Apache-2.0) so the build never downloads anything.
-                arguments += "-DGGML_CPU_KLEIDIAI=ON"
+                // KleidiAI (Arm micro-kernels, vendored + pruned in third_party/kleidiai) is OFF since Phase 4: garbage
+                // output was reported on a real phone, and the pruned KleidiAI SME/SVE paths cannot be verified without
+                // that hardware. Plain ggml-cpu kernels (+ repack) are the upstream-default, widely used configuration.
+                arguments += "-DGGML_CPU_KLEIDIAI=OFF" // P0 (Phase 4): see docs/PHASE4.md "Garbage output on device"
                 arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=" + rootProject.file("third_party/kleidiai").absolutePath
                 arguments += "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
                 // Weight repacking into the interleaved layouts the dotprod/i8mm kernels want (Q4_0 -> 4x8 etc.).

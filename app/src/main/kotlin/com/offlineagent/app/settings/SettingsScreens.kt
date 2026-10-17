@@ -78,11 +78,12 @@ import java.util.Date
 
 private enum class Page(val title: String, val hint: String) {
     MODELS("Models", "Import, choose and load chat, embedding, vision and draft models"),
-    PERFORMANCE("Performance & long context", "Context window (up to 32K / 128K experimental), KV cache, speed-ups, memory"),
+    PERFORMANCE("Performance & long context", "Context window (8K default; 16K+ opt-in), KV cache, speed-ups, memory"),
     PHONE("Phone actions", "Alarms, reminders, apps, message drafts, device settings, files, notifications, screen automation"),
     PROFILE("Profile & autofill", "Encrypted profile used to fill forms in any app"),
     AUTOMATION("Automation & macros", "Teach by demonstration, schedules, full action log, kill switch"),
     MCP("MCP tool servers", "Built-in on-device servers, other apps' servers" + if (BuildConfig.NETWORK_MCP) ", LAN/remote servers" else ""),
+    DIAGNOSTICS("Diagnostics & crash logs", "Self-test, safe mode, compatibility CPU kernels, crash reports, export logs"),
 }
 
 @Composable
@@ -118,6 +119,7 @@ fun SettingsScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Mod
                 Page.PROFILE -> ProfilePage(app, notify)
                 Page.AUTOMATION -> AutomationPage(app, notify)
                 Page.MCP -> McpPage(app, notify)
+                Page.DIAGNOSTICS -> DiagnosticsPage(app, notify)
             }
         }
     }
@@ -149,11 +151,22 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
     val models by app.models.models.collectAsStateWithLifecycle(emptyList())
     val scope = rememberCoroutineScope()
     val chatModel = models.firstOrNull { it.role == ModelRole.CHAT.name && it.active }
-    val plan = remember(chatModel?.path, s.ubatchSize) { app.engineController.planFor(chatModel?.path, s) }
-    val arch = remember(chatModel?.path) { chatModel?.path?.let { app.engineController.archOf(it) } }
+    // GGUF header reads happen off the main thread (Settings must open instantly, with or without a model).
+    val plan by androidx.compose.runtime.produceState(ContextPlanner.plan(DeviceInfo.totalRamBytes(), null, s.ubatchSize), chatModel?.path, s.ubatchSize) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { app.engineController.planFor(chatModel?.path, s) }.getOrElse { ContextPlanner.plan(DeviceInfo.totalRamBytes(), null) } }
+    }
+    val arch by androidx.compose.runtime.produceState<com.offlineagent.core.inference.ModelArch?>(null, chatModel?.path) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { chatModel?.path?.let { app.engineController.archOf(it) } }
+    }
     val ctx = app.engineController.effectiveContext(s, plan)
     val kv = app.engineController.kvFor(s, chatModel?.path, ctx)
-    fun upd(f: (AppSettings) -> AppSettings) = scope.launch { app.settings.update(f) }
+    fun upd(f: (AppSettings) -> AppSettings) = scope.launch { if (!app.settings.update(f)) notify("Could not save the setting") }
+    /** Settings that change how the model is loaded: save, then unload + reload in the background (never blocks the UI). */
+    fun updReload(f: (AppSettings) -> AppSettings) = app.appScope.launch {
+        if (!app.settings.update(f)) { notify("Could not save the setting"); return@launch }
+        notify(app.engineController.applySettings())
+    }
+    val health by app.engineController.health.collectAsStateWithLifecycle()
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         item {
@@ -163,12 +176,26 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             Section("Context window")
             Text("Default for this phone: ${plan.recommendedContext / 1024}K. Bigger windows remember more of a long chat or document but use RAM and make the first answer slower.",
                 style = MaterialTheme.typography.bodySmall)
-            FilterChip(selected = s.contextLength == 0, onClick = { upd { it.copy(contextLength = 0) } }, label = { Text("Auto (${plan.recommendedContext / 1024}K)") })
+            if (s.safeMode || health.compatCpu) Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                Column(Modifier.padding(10.dp)) {
+                    if (s.safeMode) {
+                        Text("Safe mode is on", style = MaterialTheme.typography.titleSmall)
+                        Text((s.safeModeReason.ifBlank { "Turned on after a problem." }) + " Uses 4K context, f16 KV, no flash attention, no prompt cache.", style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { app.appScope.launch { app.engineController.exitSafeMode(); notify(app.engineController.applySettings()) } }) { Text("Exit safe mode") }
+                    }
+                    if (health.compatCpu) Text("Compatibility CPU kernels are on (slower, most compatible). Change under Settings → Diagnostics.", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            FilterChip(selected = s.contextLength == 0, onClick = { updReload { it.copy(contextLength = 0) } }, label = { Text("Auto (${plan.recommendedContext / 1024}K)") })
+            SwitchRow("Allow large context (16K+, experimental)", "Bigger windows use much more RAM and are slower to start. Off = 8K maximum.", s.largeContext) { v ->
+                updReload { it.copy(largeContext = v, contextLength = if (!v && it.contextLength > ContextPlanner.LARGE_CONTEXT) 0 else it.contextLength) }
+            }
         }
         items(plan.options) { o ->
             val est = arch?.let { ContextPlanner.estimate(it, o.tokens, if (s.kvCache == "AUTO") ContextPlanner.kvFor(DeviceInfo.totalRamBytes(), it, o.tokens, s.ubatchSize) else kv, s.ubatchSize) } ?: o.estimate
             val selected = s.contextLength == o.tokens
-            Card(Modifier.fillMaxWidth().clickable(enabled = !o.blocked && (!o.needsYarn || s.yarn)) { upd { it.copy(contextLength = o.tokens) } },
+            val allowed = !o.blocked && (!o.needsYarn || s.yarn) && (o.tokens <= ContextPlanner.LARGE_CONTEXT || s.largeContext)
+            Card(Modifier.fillMaxWidth().clickable(enabled = allowed) { updReload { it.copy(contextLength = o.tokens) } },
                 colors = if (selected) CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer) else CardDefaults.cardColors()) {
                 Column(Modifier.padding(10.dp)) {
                     Text("${o.tokens / 1024}K tokens" + (if (selected) "  ✓" else "") + (if (o.needsYarn) "  · YaRN (experimental)" else ""), style = MaterialTheme.typography.titleSmall)
@@ -176,26 +203,27 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
                         style = MaterialTheme.typography.bodySmall)
                     o.warning?.let { Text("⚠ $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
                     if (o.needsYarn && !s.yarn) Text("Turn on YaRN below to use this size.", style = MaterialTheme.typography.bodySmall)
+                    if (o.tokens > ContextPlanner.LARGE_CONTEXT && !s.largeContext) Text("Turn on “Allow large context” to use this size.", style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
         item {
-            SwitchRow("YaRN rope scaling (experimental)", "Stretches the model beyond its trained context (64K/128K). Quality and speed on phones are untested.", s.yarn) { v -> upd { it.copy(yarn = v) } }
+            SwitchRow("YaRN rope scaling (experimental)", "Stretches the model beyond its trained context (64K/128K). Quality and speed on phones are untested.", s.yarn) { v -> updReload { it.copy(yarn = v) } }
             Section("KV cache precision")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = s.kvCache == "AUTO", onClick = { upd { it.copy(kvCache = "AUTO") } }, label = { Text("Auto (now ${kv.name.lowercase()})") })
+                FilterChip(selected = s.kvCache == "AUTO", onClick = { updReload { it.copy(kvCache = "AUTO") } }, label = { Text("Auto (f16)") })
                 KvCacheType.entries.forEach { t ->
-                    FilterChip(selected = s.kvCache == t.name, onClick = { upd { it.copy(kvCache = t.name) } }, label = { Text(t.label) })
+                    FilterChip(selected = s.kvCache == t.name, onClick = { updReload { it.copy(kvCache = t.name) } }, label = { Text(t.label) })
                 }
             }
-            Text("Auto uses f16 when it fits (prompts are read ~3x faster on phone CPUs) and q8_0 for windows that would not fit otherwise. q8_0 halves KV memory with no visible quality loss; q4_0 quarters it, slightly lower quality. Quantised KV needs flash attention.", style = MaterialTheme.typography.bodySmall)
+            Text("Auto = f16: the most reliable setting and the fastest prompt reading on phone CPUs. q8_0 halves KV memory, q4_0 quarters it (lower quality); both force flash attention and are experimental on phones.", style = MaterialTheme.typography.bodySmall)
             Section("Speed")
             Text("Flash attention", style = MaterialTheme.typography.bodyLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("AUTO", "ON", "OFF").forEach { v -> FilterChip(selected = s.flashAttention == v, onClick = { upd { it.copy(flashAttention = v) } }, label = { Text(v.lowercase()) }) } }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("AUTO", "ON", "OFF").forEach { v -> FilterChip(selected = s.flashAttention == v, onClick = { updReload { it.copy(flashAttention = v) } }, label = { Text(v.lowercase()) }) } }
             Text("Batch / micro-batch (prompt reading speed vs. memory)", style = MaterialTheme.typography.bodyLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(256 to 256, 512 to 512, 1024 to 512, 2048 to 512).forEach { (b, u) ->
-                    FilterChip(selected = s.batchSize == b && s.ubatchSize == u, onClick = { upd { it.copy(batchSize = b, ubatchSize = u) } }, label = { Text("$b/$u") })
+                    FilterChip(selected = s.batchSize == b && s.ubatchSize == u, onClick = { updReload { it.copy(batchSize = b, ubatchSize = u) } }, label = { Text("$b/$u") })
                 }
             }
             val rec = DeviceInfo.recommendedThreads()
@@ -224,7 +252,7 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             Section("Apply")
             Text("Current: ${ctx / 1024}K context, KV ${kv.label}, flash attention ${s.flashAttention.lowercase()}, batch ${s.batchSize}/${s.ubatchSize}" +
                 if (s.speculative) ", speculative on" else "", style = MaterialTheme.typography.bodySmall)
-            Button(onClick = { scope.launch { try { app.engineController.reloadIfLoaded(); notify("Applied") } catch (e: Throwable) { notify("Reload failed: ${e.message}") } } }) { Text("Reload model with these settings") }
+            Button(onClick = { app.appScope.launch { notify(app.engineController.applySettings()) } }) { Text("Reload model with these settings") }
             Spacer(Modifier.height(24.dp))
         }
     }
@@ -558,6 +586,76 @@ private fun McpPage(app: OfflineAgentApp, notify: (String) -> Unit) {
                 OutlinedTextField(token, { token = it }, label = { Text("Bearer token (optional)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Button(onClick = { scope.launch { app.mcp.connectNetwork(url, token).onSuccess { notify("Connected") }.onFailure { notify("Failed: ${it.message}") } } }, enabled = url.startsWith("http")) { Text("Connect") }
             }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------- diagnostics (Phase 4, P0)
+
+@Composable
+private fun DiagnosticsPage(app: OfflineAgentApp, notify: (String) -> Unit) {
+    val s by app.settings.settings.collectAsStateWithLifecycle(AppSettings())
+    val health by app.engineController.health.collectAsStateWithLifecycle()
+    val ctx = LocalContext.current
+    var reports by remember { mutableStateOf(com.offlineagent.app.diag.Diagnostics.crashReports()) }
+    var open by remember { mutableStateOf<String?>(null) }
+    var sysInfo by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { sysInfo = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { app.inference.systemInfo() }.getOrDefault("") } }
+    fun share() = app.appScope.launch {
+        try {
+            val f = com.offlineagent.app.diag.Diagnostics.exportBundle("System info:\n$sysInfo\n\nSettings: $s\nLast load: ${app.engineController.lastConfig}\nSelf-test: ${health.selfTest}")
+            val uri = androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain").putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                .putExtra(android.content.Intent.EXTRA_SUBJECT, "Offline Agent diagnostics").addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            app.launcher.launch(android.content.Intent.createChooser(send, "Share diagnostics"), "share diagnostics")
+        } catch (e: Throwable) { notify("Export failed: ${e.message}") }
+    }
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        item {
+            Text("Everything here stays on this phone. Nothing is sent unless you share the file yourself.", style = MaterialTheme.typography.bodySmall)
+            Section("Model self-test")
+            Text(health.selfTest?.let { "${it.verdict.name.lowercase().replace('_', ' ')} — “${it.output.take(40)}” (${it.reason}, ${it.millis} ms)" } ?: "Runs automatically after every model load.",
+                style = MaterialTheme.typography.bodySmall)
+            health.message?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            SwitchRow("Safe mode", "4K context, f16 KV, no flash attention, no prompt cache, no draft model, no core pinning." + if (s.safeModeReason.isNotBlank()) " (${s.safeModeReason})" else "", s.safeMode) { v ->
+                app.appScope.launch {
+                    if (v) app.settings.update { it.copy(safeMode = true, safeModeReason = "Turned on by you.") } else app.engineController.exitSafeMode()
+                    notify(app.engineController.applySettings())
+                }
+            }
+            SwitchRow("Compatibility CPU kernels", "Use the basic NEON/dotprod kernels instead of the fastest ones for this CPU (SVE/SME/i8mm). Slower; takes effect after a restart.",
+                health.compatCpu) { v ->
+                com.offlineagent.app.diag.Diagnostics.setCompatVariant(if (v) com.offlineagent.app.diag.Diagnostics.COMPAT_VARIANT else null)
+                notify("Restart the app to apply")
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { share() }) { Text("Export & share logs") }
+                TextButton(onClick = { com.offlineagent.engine.llamacpp.LlamaCppEngine.clearPrefixCache(ctx); notify("Prompt cache cleared") }) { Text("Clear prompt cache") }
+            }
+            Section("System")
+            Text(sysInfo.ifBlank { "…" }, style = MaterialTheme.typography.bodySmall, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+            Section("Crash reports (${reports.size})")
+            if (reports.isEmpty()) Text("No crashes recorded.", style = MaterialTheme.typography.bodySmall)
+        }
+        items(reports, key = { it.name }) { f ->
+            Card(Modifier.fillMaxWidth().clickable { open = if (open == f.name) null else f.name }) {
+                Column(Modifier.padding(10.dp)) {
+                    val text = remember(f.name) { runCatching { f.readText() }.getOrDefault("") }
+                    Text(text.lineSequence().firstOrNull() ?: f.name, style = MaterialTheme.typography.titleSmall)
+                    Text(java.text.DateFormat.getDateTimeInstance().format(java.util.Date(f.lastModified())), style = MaterialTheme.typography.labelSmall)
+                    if (open == f.name) androidx.compose.foundation.text.selection.SelectionContainer {
+                        Text(text.take(12000), style = MaterialTheme.typography.bodySmall, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                    }
+                }
+            }
+        }
+        item {
+            Section("Diagnostics log")
+            val log = remember(reports) { com.offlineagent.app.diag.Diagnostics.readLog().takeLast(6000) }
+            Text(log.ifBlank { "(empty)" }, style = MaterialTheme.typography.bodySmall, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+            TextButton(onClick = { com.offlineagent.app.diag.Diagnostics.clear(); reports = emptyList(); notify("Cleared") }) { Text("Clear crash reports & log") }
             Spacer(Modifier.height(24.dp))
         }
     }

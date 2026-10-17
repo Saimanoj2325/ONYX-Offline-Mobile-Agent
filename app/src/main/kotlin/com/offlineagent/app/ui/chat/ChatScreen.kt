@@ -152,6 +152,7 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenModels: () ->
                     }
                 }
             }
+            SafetyBanners(vm)
             if (engine is EngineState.Unloaded && messages.isEmpty() && ui.streaming == null) {
                 Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth().clickable { onOpenModels() }) {
                     Text("The model loads automatically when you send a message. Tap to manage models.", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
@@ -443,6 +444,43 @@ private fun ChatsSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                 }
             }
             Spacer(Modifier.heightIn(min = 24.dp))
+        }
+    }
+}
+
+
+/** P0 (Phase 4): "last run crashed → safe mode" and self-test / compatibility-mode banners. */
+@Composable
+fun SafetyBanners(vm: ChatViewModel) {
+    val app = vm.getApplication<com.offlineagent.app.OfflineAgentApp>()
+    val crash by app.lastCrash.collectAsStateWithLifecycle()
+    val health by app.engineController.health.collectAsStateWithLifecycle()
+    val ctx = LocalContext.current
+    crash?.let { c ->
+        Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                Text("Last run crashed — started in safe mode (no model loaded until you send a message).", style = MaterialTheme.typography.bodySmall)
+                Text(c.reason.take(160), style = MaterialTheme.typography.labelSmall)
+                Row {
+                    TextButton(onClick = { vm.shareDiagnostics() }) { Text("Share crash log") }
+                    TextButton(onClick = { app.lastCrash.value = null }) { Text("Dismiss") }
+                }
+            }
+        }
+    }
+    health.message?.let { msg ->
+        Surface(color = if (health.needsRestart || health.selfTest?.ok == false) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+                Text(msg, style = MaterialTheme.typography.bodySmall)
+                Row {
+                    if (health.needsRestart) TextButton(onClick = {
+                        val i = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+                        if (i != null) { ctx.startActivity(android.content.Intent.makeRestartActivityTask(i.component)); Runtime.getRuntime().exit(0) }
+                    }) { Text("Restart now") }
+                    if (health.safeMode) TextButton(onClick = { vm.exitSafeMode() }) { Text("Exit safe mode") }
+                    TextButton(onClick = { vm.shareDiagnostics() }) { Text("Share log") }
+                }
+            }
         }
     }
 }

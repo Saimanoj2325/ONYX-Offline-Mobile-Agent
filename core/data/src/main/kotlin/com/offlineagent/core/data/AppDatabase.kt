@@ -20,6 +20,7 @@ import com.offlineagent.core.runtime.agent.StepRecord
 import com.offlineagent.core.runtime.ui.OutputPreference
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -133,6 +134,17 @@ data class AppSettings(
     val automationEnabled: Boolean = true,
     /** Enabled third-party MCP server ids (binder component names / LAN URLs). */
     val mcpServers: Set<String> = emptySet(),
+    // ---- Phase 4
+    /** 16K/32K/64K/128K windows are opt-in (P0 fix: Auto picked 32K and q8_0 KV on a 12 GB phone; see PHASE4.md). */
+    val largeContext: Boolean = false,
+    /** Safe mode: 4K context, f16 KV, flash attention off, no prompt cache, no draft model. Set after a crash or a failed self-test. */
+    val safeMode: Boolean = false,
+    /** Why safe mode was turned on (shown in the banner). */
+    val safeModeReason: String = "",
+    /** OpenUI rich answers in chat: AUTO (full library on 4B+, compact on small models) | FULL | COMPACT | OFF. */
+    val richUi: String = "AUTO",
+    /** Persisted-settings schema version (migrations in [SettingsRepository.migrate]). */
+    val settingsVersion: Int = 0,
 ) {
     companion object {
         /** Groups that need no special access are on by default; everything sensitive is opt-in. */
@@ -140,7 +152,11 @@ data class AppSettings(
     }
 }
 
-private val Context.settingsStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+// A corrupted settings file is replaced by defaults instead of crashing every launch (P0, Phase 4).
+private val Context.settingsStore: DataStore<Preferences> by preferencesDataStore(
+    name = "settings",
+    corruptionHandler = androidx.datastore.core.handlers.ReplaceFileCorruptionHandler { androidx.datastore.preferences.core.emptyPreferences() },
+)
 
 class SettingsRepository(context: Context) {
     private val store = context.applicationContext.settingsStore
@@ -171,29 +187,66 @@ class SettingsRepository(context: Context) {
         val vision = booleanPreferencesKey("screen_vision")
         val autoOn = booleanPreferencesKey("automation_enabled")
         val mcp = stringSetPreferencesKey("mcp_servers")
+        val large = booleanPreferencesKey("large_context")
+        val safe = booleanPreferencesKey("safe_mode")
+        val safeWhy = stringPreferencesKey("safe_mode_reason")
+        val richUi = stringPreferencesKey("rich_ui")
+        val version = intPreferencesKey("settings_version")
     }
 
+    /** A value of the wrong type (older app version, corrupted file) reads as "unset" instead of crashing. */
+    private operator fun <T> Preferences.invoke(k: Preferences.Key<T>): T? = try { this[k] } catch (e: ClassCastException) { null }
+
     private fun read(p: Preferences) = AppSettings(
-        contextLength = p[K.ctx] ?: 0,
-        threads = p[K.threads] ?: 0,
-        thinking = p[K.thinking] ?: false,
-        output = p[K.output]?.let { runCatching { OutputPreference.valueOf(it) }.getOrNull() } ?: OutputPreference.AUTO,
-        useDocuments = p[K.useDocs] ?: true,
-        alwaysAllowedTools = p[K.allowed] ?: emptySet(),
-        lastChatId = p[K.lastChat]?.toLongOrNull() ?: 0,
-        kvCache = p[K.kv] ?: "AUTO", flashAttention = p[K.fa] ?: "AUTO", batchSize = p[K.batch] ?: 512, ubatchSize = p[K.ubatch] ?: 512,
-        maxOutputTokens = p[K.maxOut] ?: 0, yarn = p[K.yarn] ?: false, speculative = p[K.spec] ?: false, draftTokens = p[K.draftTokens] ?: 6,
-        prefixCache = p[K.prefix] ?: true, keepWarm = p[K.warm] ?: true, autoSummarize = p[K.summarize] ?: true, longTermMemory = p[K.ltm] ?: true,
-        pollLevel = p[K.poll] ?: 50, phoneGroups = p[K.groups] ?: AppSettings.DEFAULT_PHONE_GROUPS,
-        automationAllowedApps = p[K.autoAllow] ?: emptySet(), automationBlockedApps = p[K.autoBlock] ?: emptySet(),
-        screenVision = p[K.vision] ?: false, automationEnabled = p[K.autoOn] ?: true, mcpServers = p[K.mcp] ?: emptySet(),
+        contextLength = p(K.ctx) ?: 0,
+        threads = p(K.threads) ?: 0,
+        thinking = p(K.thinking) ?: false,
+        output = p(K.output)?.let { runCatching { OutputPreference.valueOf(it) }.getOrNull() } ?: OutputPreference.AUTO,
+        useDocuments = p(K.useDocs) ?: true,
+        alwaysAllowedTools = p(K.allowed) ?: emptySet(),
+        lastChatId = p(K.lastChat)?.toLongOrNull() ?: 0,
+        kvCache = p(K.kv) ?: "AUTO", flashAttention = p(K.fa) ?: "AUTO", batchSize = p(K.batch) ?: 512, ubatchSize = p(K.ubatch) ?: 512,
+        maxOutputTokens = p(K.maxOut) ?: 0, yarn = p(K.yarn) ?: false, speculative = p(K.spec) ?: false, draftTokens = p(K.draftTokens) ?: 6,
+        prefixCache = p(K.prefix) ?: true, keepWarm = p(K.warm) ?: true, autoSummarize = p(K.summarize) ?: true, longTermMemory = p(K.ltm) ?: true,
+        pollLevel = p(K.poll) ?: 50, phoneGroups = p(K.groups) ?: AppSettings.DEFAULT_PHONE_GROUPS,
+        automationAllowedApps = p(K.autoAllow) ?: emptySet(), automationBlockedApps = p(K.autoBlock) ?: emptySet(),
+        screenVision = p(K.vision) ?: false, automationEnabled = p(K.autoOn) ?: true, mcpServers = p(K.mcp) ?: emptySet(),
+        largeContext = p(K.large) ?: false, safeMode = p(K.safe) ?: false, safeModeReason = p(K.safeWhy) ?: "",
+        richUi = p(K.richUi) ?: "AUTO", settingsVersion = p(K.version) ?: 0,
     )
 
-    val settings: Flow<AppSettings> = store.data.map { read(it) }
+    /** Never throws: an unreadable settings file yields defaults (and is overwritten on the next save). */
+    val settings: Flow<AppSettings> = store.data
+        .catch { e -> android.util.Log.w("OfflineAgent", "settings unreadable, using defaults", e); emit(androidx.datastore.preferences.core.emptyPreferences()) }
+        .map { runCatching { read(it) }.getOrElse { AppSettings() } }
 
     suspend fun current(): AppSettings = settings.first()
 
-    suspend fun update(f: (AppSettings) -> AppSettings) {
+    /** Saves a change. Never throws (returns false if the settings file could not be written). */
+    suspend fun update(f: (AppSettings) -> AppSettings): Boolean = try {
+        write(f)
+        true
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        android.util.Log.e("OfflineAgent", "settings save failed", e)
+        false
+    }
+
+    /**
+     * Phase 4 migration (P0 garbage-output fix): windows above 8K become opt-in, KV/flash-attention go back to Auto
+     * (now f16), speculative decoding off. Runs once per schema version.
+     */
+    suspend fun migrate(): Boolean {
+        if (current().settingsVersion >= SCHEMA) return false
+        update {
+            it.copy(contextLength = if (it.contextLength > 8192) 0 else it.contextLength, kvCache = "AUTO", flashAttention = "AUTO",
+                speculative = false, yarn = false, largeContext = false, settingsVersion = SCHEMA)
+        }
+        return true
+    }
+
+    private suspend fun write(f: (AppSettings) -> AppSettings) {
         store.edit { p ->
             val n = f(read(p))
             p[K.ctx] = n.contextLength; p[K.threads] = n.threads; p[K.thinking] = n.thinking; p[K.output] = n.output.name
@@ -203,6 +256,9 @@ class SettingsRepository(context: Context) {
             p[K.prefix] = n.prefixCache; p[K.warm] = n.keepWarm; p[K.summarize] = n.autoSummarize; p[K.ltm] = n.longTermMemory
             p[K.poll] = n.pollLevel; p[K.groups] = n.phoneGroups; p[K.autoAllow] = n.automationAllowedApps; p[K.autoBlock] = n.automationBlockedApps
             p[K.vision] = n.screenVision; p[K.autoOn] = n.automationEnabled; p[K.mcp] = n.mcpServers
+            p[K.large] = n.largeContext; p[K.safe] = n.safeMode; p[K.safeWhy] = n.safeModeReason; p[K.richUi] = n.richUi; p[K.version] = n.settingsVersion
         }
     }
+
+    companion object { const val SCHEMA = 4 }
 }

@@ -60,16 +60,17 @@ class GgufAndContextPlannerTest {
         assertEquals(RamTier.MEDIUM, ContextPlanner.tier((5.6 * gb).toLong()))
         assertEquals(RamTier.SMALL, ContextPlanner.tier((3.7 * gb).toLong()))
         val p8 = ContextPlanner.plan((7.4 * gb).toLong(), qwen17)
-        assertEquals(16384, p8.recommendedContext)
-        // f16 KV (fastest on CPU) fits at 16K for a 1.7B Q4 model on an 8 GB phone; 32K needs q8_0.
+        // Phase 4 (P0): 8K + f16 KV on 8 GB phones (and on 12 GB+); larger windows are opt-in.
+        assertEquals(8192, p8.recommendedContext)
         assertEquals(KvCacheType.F16, p8.recommendedKv)
-        assertEquals(KvCacheType.Q8_0, ContextPlanner.kvFor((7.4 * gb).toLong(), qwen17, 32768))
+        assertEquals(KvCacheType.F16, ContextPlanner.kvFor((7.4 * gb).toLong(), qwen17, 32768))
+        assertEquals(8192, ContextPlanner.plan((12.0 * gb).toLong(), qwen17).recommendedContext)
         assertEquals(8192, p8.maxOutputTokens)
         val o32 = p8.options.first { it.tokens == 32768 }
-        assertFalse(o32.blocked); assertNotNull(o32.warning); assertFalse(o32.needsYarn)
+        assertNotNull(o32.warning); assertFalse(o32.needsYarn) // f16 32K is blocked or flagged on 8 GB
         val o64 = p8.options.first { it.tokens == 65536 }
         assertTrue(o64.needsYarn); assertTrue(o64.warning!!.contains("experimental") || o64.blocked)
-        assertEquals(8192, ContextPlanner.plan((5.6 * gb).toLong(), qwen17).recommendedContext)
+        assertEquals(4096, ContextPlanner.plan((5.6 * gb).toLong(), qwen17).recommendedContext)
         assertEquals(4096, ContextPlanner.plan((3.7 * gb).toLong(), qwen17).recommendedContext)
     }
 
@@ -96,12 +97,16 @@ class GgufAndContextPlannerTest {
         LoadConfig("/x", contextLength = 131072, kvCacheType = KvCacheType.Q4_0, ropeScaling = RopeScaling.YARN)
         try { LoadConfig("/x", contextLength = 262144); throw AssertionError("accepted") } catch (e: IllegalArgumentException) { }
     }
-    @Test fun autoKvFallsBackToQ8ForBigModelsAndQ4OnTinyPhones() {
+    @Test fun autoKvIsAlwaysF16AndContextIsLoweredToFit() {
         val gb = 1024L * 1024 * 1024
         val qwen4b = ModelArch("qwen3", 36, 8, 32, 2560, 128, 128, 40960, 151936, 2_500_000_000L)
-        assertEquals(KvCacheType.Q8_0, ContextPlanner.kvFor((7.4 * gb).toLong(), qwen4b, 16384))
-        assertEquals(KvCacheType.Q8_0, ContextPlanner.plan((7.4 * gb).toLong(), qwen4b).recommendedKv)
-        assertEquals(KvCacheType.Q4_0, ContextPlanner.kvFor((2.8 * gb).toLong(), qwen17, 2048))
+        assertEquals(KvCacheType.F16, ContextPlanner.kvFor((7.4 * gb).toLong(), qwen4b, 16384))
+        assertEquals(KvCacheType.F16, ContextPlanner.plan((7.4 * gb).toLong(), qwen4b).recommendedKv)
+        assertEquals(KvCacheType.F16, ContextPlanner.kvFor((2.8 * gb).toLong(), qwen17, 2048))
+        // 32K f16 for a 4B model does not fit an 8 GB phone's budget: the window is halved until it does.
+        val fit = ContextPlanner.fitContext((7.4 * gb).toLong(), qwen4b, 32768, KvCacheType.F16)
+        assertTrue(fit in 2048..16384)
+        assertEquals(8192, ContextPlanner.fitContext((7.4 * gb).toLong(), qwen17, 8192, KvCacheType.F16))
         // Mixed K/V types are accounted separately.
         assertEquals(114688.0, qwen17.kvBytesPerToken(KvCacheType.F16), 0.1)
         assertTrue(qwen17.kvBytesPerToken(KvCacheType.Q4_0) < qwen17.kvBytesPerToken(KvCacheType.Q8_0))

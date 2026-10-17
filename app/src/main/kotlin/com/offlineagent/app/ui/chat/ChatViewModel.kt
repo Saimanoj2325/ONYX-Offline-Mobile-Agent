@@ -132,6 +132,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun notice(s: String?) = _ui.update { it.copy(notice = s) }
 
+    fun exitSafeMode() = g.appScope.launch { g.engineController.exitSafeMode(); notice(g.engineController.applySettings()) }
+
+    /** Writes the diagnostics bundle and opens the share sheet (the user decides where it goes). */
+    fun shareDiagnostics() = g.appScope.launch {
+        try {
+            val info = runCatching { g.inference.systemInfo() }.getOrDefault("")
+            val f = com.offlineagent.app.diag.Diagnostics.exportBundle("System info:\n$info\n\nLast load: ${g.engineController.lastConfig}\nSelf-test: ${g.engineController.health.value.selfTest}")
+            val ctx = getApplication<Application>()
+            val uri = androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain").putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            g.launcher.launch(android.content.Intent.createChooser(send, "Share diagnostics"), "share diagnostics")
+        } catch (e: Throwable) { notice("Export failed: ${e.message}") }
+    }
+
     // ------------------------------------------------------------ chats
 
     fun openChat(id: Long?) {
@@ -250,14 +265,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ sending
 
-    val busy: Boolean get() = genJob?.isActive == true || g.agents.isRunning
+    val busy: Boolean get() = sending || genJob?.isActive == true || g.agents.isRunning
+
+    /** Set synchronously on the main thread before anything else, so a double tap / IME action can't send twice. */
+    @Volatile private var sending = false
+    private var lastSent: Pair<String, Long>? = null
 
     fun send(rawText: String, forceSkill: Skill? = null) {
         val text = rawText.trim()
         val images = _ui.value.pendingImages
         if ((text.isEmpty() && images.isEmpty()) || busy) return
+        val now0 = System.currentTimeMillis()
+        if (images.isEmpty() && lastSent?.let { (t, at) -> t == text && now0 - at < DUPLICATE_WINDOW_MS } == true) return
+        lastSent = text to now0
+        sending = true
         _ui.update { it.copy(pendingImages = emptyList(), skillSuggestion = null) }
         genJob = viewModelScope.launch {
+          try {
             val chatId = ensureChat(text.ifBlank { "Photo" })
             val now = System.currentTimeMillis()
             chats.insertMessage(MessageEntity(chatId = chatId, role = "user", text = text,
@@ -298,6 +322,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 _ui.update { it.copy(streaming = null) }
             }
+          } finally {
+            sending = false
+          }
         }
     }
 
@@ -590,6 +617,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val KIND_SUMMARY = "summary"
+        const val DUPLICATE_WINDOW_MS = 1500L
         const val SYSTEM_PROMPT =
             "You are a helpful assistant running fully offline on the user's Android phone. Answer clearly and concisely. " +
                 "Use Markdown: headings, bullet lists, tables, **bold** and fenced code blocks where they help."

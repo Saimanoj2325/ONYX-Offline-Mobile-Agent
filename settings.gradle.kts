@@ -31,6 +31,10 @@ include(":core:mcp-http")             // Streamable HTTP/SSE MCP transport (pure
 include(":mcp-aidl")                  // On-device MCP over Android binder (AIDL contract + server base Service)
 include(":samples:mcp-server-sample") // Sample third-party on-device MCP server app
 
+// Phase 4 modules
+include(":core:openui")  // OpenUI Lang parser, library, prompt generator, grammar (pure Kotlin)
+include(":core:models")  // Model catalogue + resumable Hugging Face downloader (pure JVM)
+
 // Optional developer tool: runs the real JNI bridge + real GGUF on an ARM64 Linux host JVM.
 // Enabled only with -PhostHarness (see tools/host-harness/README.md). Not part of the APK.
 if (providers.gradleProperty("hostHarness").isPresent) include(":tools:host-harness")

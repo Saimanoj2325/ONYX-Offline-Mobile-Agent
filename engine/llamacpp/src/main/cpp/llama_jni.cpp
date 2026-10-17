@@ -183,15 +183,31 @@ bool tokenize(const llama_vocab * vocab, const std::string & text, std::vector<l
 
 extern "C" {
 
+// CPU backend variant actually loaded ("auto" = best for this CPU, else the forced compatibility variant).
+static std::string g_cpu_variant = "none";
+
 JNIEXPORT void JNICALL
-Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeInit(JNIEnv * env, jobject, jstring jlibdir) {
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeInit(JNIEnv * env, jobject, jstring jlibdir, jstring jvariant) {
     if (g_backend_ready) return;
     llama_log_set(log_callback, nullptr);
     mtmd_helper_log_set(log_callback, nullptr);
     const std::string dir = jstr(env, jlibdir);
-    // Loads libggml-cpu-android_armv*.so variants and keeps the best one this CPU supports.
-    LOGI("Loading ggml backends from %s", dir.c_str());
-    ggml_backend_load_all_from_path(dir.c_str());
+    const std::string variant = jvariant ? jstr(env, jvariant) : std::string();
+    bool loaded = false;
+    if (!variant.empty()) {
+        // Compatibility mode (after a failed self-test): a conservative kernel set (e.g. android_armv8.2_1 = NEON +
+        // dotprod, no SVE/SME/i8mm) instead of the "best" variant for this CPU.
+        const std::string path = dir + "/libggml-cpu-" + variant + ".so";
+        LOGI("Loading forced CPU backend variant %s", path.c_str());
+        loaded = ggml_backend_load(path.c_str()) != nullptr;
+        if (loaded) g_cpu_variant = variant; else LOGW("forced variant %s failed; falling back to auto", variant.c_str());
+    }
+    if (!loaded) {
+        // Loads libggml-cpu-android_armv*.so variants and keeps the best one this CPU supports.
+        LOGI("Loading ggml backends from %s", dir.c_str());
+        ggml_backend_load_all_from_path(dir.c_str());
+        g_cpu_variant = "auto";
+    }
     llama_backend_init();
     g_backend_ready = true;
 }
@@ -1048,6 +1064,7 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeFreeEmbedder(JNIEnv *, j
 JNIEXPORT jstring JNICALL
 Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeSystemInfo(JNIEnv * env, jobject) {
     std::string info = llama_print_system_info();
+    info += "\nCPU variant: " + g_cpu_variant;
     info += "\nBackends:";
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         info += " ";

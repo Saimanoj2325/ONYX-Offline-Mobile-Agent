@@ -47,6 +47,9 @@ class EngineInferenceAdapter(
     @Volatile
     private var loaded: ModelInfo? = null
 
+    /** Prompt-prefix KV cache (memory + disk). Turned off by the app in safe mode or from Settings. */
+    @Volatile var prefixCacheEnabled: Boolean = true
+
     override suspend fun load(config: LoadConfig): ModelInfo {
         cancel()
         return mutex.withLock {
@@ -107,10 +110,14 @@ class EngineInferenceAdapter(
             var prefixState = -1
             val prefix = template.systemPrefix(messages)
             val nKeep = prefix?.let { engine.countTokens(it) } ?: 0
-            if (request.cachePrefix && prefix != null && images.isEmpty() && nKeep >= PREFIX_CACHE_MIN_TOKENS) {
+            if (prefixCacheEnabled && request.cachePrefix && prefix != null && images.isEmpty() && nKeep >= PREFIX_CACHE_MIN_TOKENS) {
+                val file = try { prefixCacheFile?.invoke(info, prefix) } catch (e: Exception) { null }
                 prefixState = try {
-                    abortOnCancel { engine.prefixCache(prefix, prefixCacheFile?.invoke(info, prefix)) }
+                    abortOnCancel { engine.prefixCache(prefix, file) }
                 } catch (e: GenerationAbortedException) { -1 }
+                // Fail safe: a cache file that could not be used is deleted (the native side already drops files whose
+                // token list does not match; this also covers read/eval errors).
+                if (prefixState < 0 && file != null) runCatching { java.io.File(file).delete() }
             }
             while (true) {
                 currentCoroutineContext().ensureActive()

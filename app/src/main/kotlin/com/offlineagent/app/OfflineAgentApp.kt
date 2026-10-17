@@ -57,7 +57,11 @@ import kotlinx.coroutines.launch
  * Phase 3 services (MCP, automation, vault, PDF, long-term memory) are created lazily for a fast cold start.
  */
 class OfflineAgentApp : Application() {
-    val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+        // A failing background job (load, reload, indexing…) must never take the whole app down.
+        Log.e(TAG, "background job failed", e)
+        com.offlineagent.app.diag.Diagnostics.log("background job failed: $e")
+    })
     lateinit var inference: InferenceAdapter private set
     lateinit var embeddings: EmbeddingService private set
     lateinit var db: AppDatabase private set
@@ -107,15 +111,39 @@ class OfflineAgentApp : Application() {
         runCatching { automation.stopAll() }
     }
 
+    /** Set when the previous run crashed (banner + safe mode). */
+    val lastCrash = kotlinx.coroutines.flow.MutableStateFlow<com.offlineagent.app.diag.Diagnostics.Startup?>(null)
+    private lateinit var engineAdapter: com.offlineagent.core.inference.EngineInferenceAdapter
+
     override fun onCreate() {
         super.onCreate()
-        inference = LlamaCppEngine.createAdapter(this)
+        // P0 crash safety first: crash handler, previous-crash detection, compatibility CPU kernels.
+        com.offlineagent.app.diag.Diagnostics.init(this)
+        com.offlineagent.engine.llamacpp.LlamaNative.cpuVariant = com.offlineagent.app.diag.Diagnostics.compatVariant()
+        val startup = runCatching { com.offlineagent.app.diag.Diagnostics.startupCheck() }.getOrNull()
+        engineAdapter = LlamaCppEngine.createAdapter(this)
+        inference = engineAdapter
         embeddings = LlamaCppEngine.createEmbedder(this)
         db = AppDatabase.create(this)
         settings = SettingsRepository(this)
         legacyModels = ModelRepository(this).also { it.cleanupPartials() }
         models = ModelStore(db.misc(), legacyModels)
-        engineController = EngineController(inference, models, settings)
+        engineController = EngineController(inference, models, settings, onPrefixCacheInvalid = { LlamaCppEngine.clearPrefixCache(this) })
+        com.offlineagent.app.diag.Diagnostics.context = {
+            "settings: ${cachedSettings.let { "ctx=${it.contextLength} kv=${it.kvCache} fa=${it.flashAttention} large=${it.largeContext} safe=${it.safeMode} threads=${it.threads} batch=${it.batchSize}/${it.ubatchSize} prefixCache=${it.prefixCache} spec=${it.speculative}" }}\n" +
+                "last load: ${engineController.lastConfig}"
+        }
+        appScope.launch {
+            runCatching {
+                // Phase 4 settings migration (16K/32K opt-in, f16 KV) also drops every Phase 3 prompt-cache file.
+                if (settings.migrate()) LlamaCppEngine.clearPrefixCache(this@OfflineAgentApp)
+                if (startup?.crashed == true) {
+                    LlamaCppEngine.clearPrefixCache(this@OfflineAgentApp)
+                    settings.update { it.copy(safeMode = true, safeModeReason = "Last run crashed (${startup.reason}).") }
+                    lastCrash.value = startup
+                }
+            }.onFailure { Log.w(TAG, "startup safety steps failed", it) }
+        }
         indexer = DocumentIndexer(this, db.documents(), embeddings, models, appScope)
         retriever = Retriever(db.documents(), embeddings, models)
         val toolNames = setOf(
@@ -134,7 +162,12 @@ class OfflineAgentApp : Application() {
             },
         )
         Notifications.ensureChannels(this)
-        appScope.launch { settings.settings.collect { cachedSettings = it } }
+        appScope.launch {
+            settings.settings.collect {
+                cachedSettings = it
+                engineAdapter.prefixCacheEnabled = it.prefixCache && !it.safeMode
+            }
+        }
         appScope.launch {
             runCatching { models.migrateLegacy() }.onFailure { Log.w(TAG, "legacy model migration failed", it) }
             runCatching { skills.seedBuiltins() }.onFailure { Log.w(TAG, "seeding skills failed", it) }

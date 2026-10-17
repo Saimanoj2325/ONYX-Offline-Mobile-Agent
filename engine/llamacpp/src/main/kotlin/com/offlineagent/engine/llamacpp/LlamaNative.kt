@@ -1,7 +1,7 @@
 package com.offlineagent.engine.llamacpp
 
 /** Raw JNI surface of libofflineagent_llama.so. See src/main/cpp/llama_jni.cpp. */
-internal object LlamaNative {
+object LlamaNative {
     const val BEGIN_ERR_TOO_LONG = -1
     const val BEGIN_ERR_ABORTED = -2
     const val BEGIN_ERR_DECODE = -3
@@ -17,15 +17,21 @@ internal object LlamaNative {
 
     @Volatile private var libraryLoaded = false
 
+    /**
+     * CPU backend variant to force (e.g. "android_armv8.2_1"), or "" = best for this CPU. Read once, when the native
+     * library initialises; set by the app from its compatibility-mode marker before the first model load.
+     */
+    @Volatile var cpuVariant: String = ""
+
     @Synchronized
     fun ensureLoaded(nativeLibDir: String) {
         if (libraryLoaded) return
         System.loadLibrary("offline_agent_llama")
-        nativeInit(nativeLibDir)
+        nativeInit(nativeLibDir, cpuVariant)
         libraryLoaded = true
     }
 
-    external fun nativeInit(nativeLibDir: String)
+    external fun nativeInit(nativeLibDir: String, cpuVariant: String)
     /** opts/fopts layout: see llama_jni.cpp nativeLoad. */
     external fun nativeLoad(path: String, opts: IntArray, fopts: FloatArray, cpus: IntArray): Long
     external fun nativeLastError(): String

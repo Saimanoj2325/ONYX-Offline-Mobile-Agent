@@ -72,16 +72,34 @@ import java.time.LocalDate
 import java.time.LocalTime
 import java.util.UUID
 
+/** What the user should know about the engine: self-test outcome, safe mode, compatibility mode. */
+data class EngineHealth(
+    val selfTest: com.offlineagent.core.inference.SelfTest.Result? = null,
+    val safeMode: Boolean = false,
+    val compatCpu: Boolean = false,
+    /** Banner text (null = all good). */
+    val message: String? = null,
+    /** The fix needs an app restart (compatibility CPU kernels are chosen when the native library starts). */
+    val needsRestart: Boolean = false,
+)
+
 /**
- * Loads the right model for a request (chat or vision) with the Phase 3 performance settings: context window chosen
- * from the phone's RAM (16K on 8 GB phones), q8_0 KV cache, flash attention, batch/ubatch, threads pinned to the
- * performance cores, optional YaRN, optional speculative draft model. Never runs on the main thread.
- * "Keep warm": the model stays loaded between chats; only a real low-memory signal unloads it.
+ * Loads the right model for a request (chat or vision).
+ *
+ * Phase 4 (P0 garbage-output/crash fix):
+ *  - defaults: 8K context (4K on ≤ 6 GB phones), f16 KV; 16K+ only with the "large context" opt-in; the window is
+ *    lowered automatically when the estimate would not fit in RAM (an oversized f16/32K load was a likely crash);
+ *  - safe mode: 4K, f16 KV, flash attention off, no prompt cache, no draft model, no core pinning;
+ *  - every load runs under a native crash marker and is followed by a greedy [SelfTest]; degenerate output switches to
+ *    safe mode and reloads; if it is still degenerate, the conservative CPU kernel variant is selected for the next
+ *    start (needs a restart);
+ *  - never throws anything but a readable exception; never runs on the main thread.
  */
 class EngineController(
     private val inference: InferenceAdapter,
     private val models: ModelStore,
     private val settings: SettingsRepository,
+    private val onPrefixCacheInvalid: () -> Unit = {},
 ) {
     private val mutex = Mutex()
     private val _loaded = MutableStateFlow<ModelEntity?>(null)
@@ -89,8 +107,12 @@ class EngineController(
     private val _plan = MutableStateFlow<com.offlineagent.core.inference.ContextPlan?>(null)
     /** Context plan for the loaded (or selected) chat model on this phone. */
     val plan: StateFlow<com.offlineagent.core.inference.ContextPlan?> = _plan.asStateFlow()
+    private val _health = MutableStateFlow(EngineHealth(compatCpu = com.offlineagent.app.diag.Diagnostics.compatVariant().isNotBlank()))
+    val health: StateFlow<EngineHealth> = _health.asStateFlow()
     @Volatile var lastConfig: LoadConfig? = null
         private set
+    /** Settings changed while a model was generating: reload when it finishes. */
+    @Volatile private var reloadPending = false
 
     suspend fun threads(): Int = settings.current().threads.takeIf { it > 0 } ?: DeviceInfo.recommendedThreads()
 
@@ -100,14 +122,17 @@ class EngineController(
         com.offlineagent.core.inference.ContextPlanner.plan(DeviceInfo.totalRamBytes(), path?.let { archOf(it) }, s.ubatchSize)
             .also { if (path != null) _plan.value = it }
 
-    /** Effective KV precision: the user's choice, or Auto = f16 when it fits in RAM at [ctx], else q8_0. */
+    /** Effective KV precision: the user's explicit choice, else f16 (Auto). Safe mode: always f16. */
     fun kvFor(s: AppSettings, modelPath: String?, ctx: Int): com.offlineagent.core.inference.KvCacheType =
-        runCatching { com.offlineagent.core.inference.KvCacheType.valueOf(s.kvCache) }.getOrNull()
-            ?: modelPath?.let { archOf(it) }?.let { com.offlineagent.core.inference.ContextPlanner.kvFor(DeviceInfo.totalRamBytes(), it, ctx, s.ubatchSize) }
-            ?: com.offlineagent.core.inference.KvCacheType.Q8_0
+        if (s.safeMode) com.offlineagent.core.inference.KvCacheType.F16
+        else runCatching { com.offlineagent.core.inference.KvCacheType.valueOf(s.kvCache) }.getOrNull() ?: com.offlineagent.core.inference.KvCacheType.F16
 
-    /** Effective context: the user's choice, or the RAM-based default. */
-    fun effectiveContext(s: AppSettings, plan: com.offlineagent.core.inference.ContextPlan) = if (s.contextLength > 0) s.contextLength else plan.recommendedContext
+    /** Effective context: the user's choice (16K+ needs the opt-in), or the RAM-based default; 4K in safe mode. */
+    fun effectiveContext(s: AppSettings, plan: com.offlineagent.core.inference.ContextPlan): Int {
+        val want = if (s.contextLength > 0) s.contextLength else plan.recommendedContext
+        val gated = if (want > com.offlineagent.core.inference.ContextPlanner.LARGE_CONTEXT && !s.largeContext) com.offlineagent.core.inference.ContextPlanner.LARGE_CONTEXT else want
+        return if (s.safeMode) minOf(gated, SAFE_CONTEXT) else gated
+    }
 
     fun maxOutput(s: AppSettings, plan: com.offlineagent.core.inference.ContextPlan, ctx: Int) =
         (if (s.maxOutputTokens > 0) s.maxOutputTokens else plan.maxOutputTokens).coerceAtMost(ctx / 2).coerceIn(256, 8192)
@@ -115,52 +140,132 @@ class EngineController(
     private suspend fun config(model: ModelEntity, role: ModelRole): LoadConfig {
         val s = settings.current()
         val plan = planFor(model.path, s)
-        val ctx = effectiveContext(s, plan)
-        val trained = archOf(model.path)?.trainedContext ?: 0
-        val kv = kvFor(s, model.path, ctx)
-        val fa = runCatching { com.offlineagent.core.inference.FlashAttention.valueOf(s.flashAttention) }.getOrDefault(com.offlineagent.core.inference.FlashAttention.AUTO)
-        val draft = if (s.speculative && role == ModelRole.CHAT) models.active(ModelRole.DRAFT)?.path?.takeIf { it != model.path } else null
-        val yarn = s.yarn && trained > 0 && ctx > trained
+        val arch = archOf(model.path)
+        val kv = kvFor(s, model.path, effectiveContext(s, plan))
+        val fa = if (s.safeMode) com.offlineagent.core.inference.FlashAttention.OFF
+            else runCatching { com.offlineagent.core.inference.FlashAttention.valueOf(s.flashAttention) }.getOrDefault(com.offlineagent.core.inference.FlashAttention.AUTO)
+        val quantKv = kv != com.offlineagent.core.inference.KvCacheType.F16
+        // Lower the window until weights + KV + buffers fit the app's RAM budget (oversized loads get the app killed).
+        val ctx = com.offlineagent.core.inference.ContextPlanner.fitContext(DeviceInfo.totalRamBytes(), arch, effectiveContext(s, plan), kv, s.ubatchSize,
+            flashAttention = quantKv || fa == com.offlineagent.core.inference.FlashAttention.ON)
+        val trained = arch?.trainedContext ?: 0
+        val draft = if (!s.safeMode && s.speculative && role == ModelRole.CHAT) models.active(ModelRole.DRAFT)?.path?.takeIf { it != model.path } else null
+        val yarn = !s.safeMode && s.yarn && s.largeContext && trained > 0 && ctx > trained
+        val threads = if (s.safeMode) threads().coerceIn(1, 4) else threads()
         return LoadConfig(
-            model.path, contextLength = ctx, threads = threads(), batchSize = s.batchSize, ubatchSize = s.ubatchSize.coerceAtMost(s.batchSize),
+            model.path, contextLength = ctx, threads = threads, batchSize = if (s.safeMode) 512 else s.batchSize,
+            ubatchSize = if (s.safeMode) 512 else s.ubatchSize.coerceAtMost(s.batchSize),
             mmprojPath = if (role == ModelRole.VISION) model.mmprojPath else null, kvCacheType = kv, flashAttention = fa,
             ropeScaling = if (yarn) com.offlineagent.core.inference.RopeScaling.YARN else com.offlineagent.core.inference.RopeScaling.MODEL,
-            yarnOriginalContext = if (yarn) trained else 0, cpuIds = DeviceInfo.performanceCoreIds(), pollLevel = s.pollLevel,
-            draftModelPath = draft, draftTokens = s.draftTokens,
+            yarnOriginalContext = if (yarn) trained else 0, cpuIds = if (s.safeMode) emptyList() else DeviceInfo.performanceCoreIds(),
+            pollLevel = if (s.safeMode) 0 else s.pollLevel, draftModelPath = draft, draftTokens = s.draftTokens,
         ).also { lastConfig = it }
     }
 
     /** Ensures a model of [role] (CHAT or VISION) is loaded. Returns its info. */
     suspend fun ensure(role: ModelRole): ModelInfo = mutex.withLock {
         val want = models.active(role) ?: throw IllegalStateException(
-            if (role == ModelRole.VISION) "No vision model: add one (with its mmproj file) in Settings → Models." else "No chat model: import a .gguf in Settings → Models.",
+            if (role == ModelRole.VISION) "No vision model: add one (with its mmproj file) in Settings → Models." else "No chat model yet: download one (model menu at the top) or import a .gguf in Settings → Models.",
         )
         if (role == ModelRole.VISION && want.mmprojPath == null) throw IllegalStateException("The vision model needs its mmproj file (Settings → Models → Add projector).")
         val st = inference.state.value
         val cur = _loaded.value
-        if (cur?.id == want.id && cur.mmprojPath == want.mmprojPath && (st is EngineState.Ready || st is EngineState.Generating)) {
+        if (!reloadPending && cur?.id == want.id && cur.mmprojPath == want.mmprojPath && (st is EngineState.Ready || st is EngineState.Generating)) {
             return (st as? EngineState.Ready)?.model ?: (st as EngineState.Generating).model
         }
-        val info = inference.load(config(want, role))
-        _loaded.value = want
-        info
+        loadChecked(want, role)
     }
 
     suspend fun load(model: ModelEntity): ModelInfo = mutex.withLock {
         val role = runCatching { ModelRole.valueOf(model.role) }.getOrDefault(ModelRole.CHAT)
-        val info = inference.load(config(model, if (role == ModelRole.DRAFT) ModelRole.CHAT else role))
+        loadChecked(model, if (role == ModelRole.DRAFT) ModelRole.CHAT else role)
+    }
+
+    /** Load + self-test + automatic fallback. Caller holds [mutex]. */
+    private suspend fun loadChecked(model: ModelEntity, role: ModelRole): ModelInfo {
+        reloadPending = false
+        var info = loadOnce(model, role)
+        if (role == ModelRole.EMBEDDING) return info
+        var result = selfTest(model)
+        if (result != null && !result.ok) {
+            // Broken output: clear caches, switch to safe settings, reload, test again.
+            onPrefixCacheInvalid()
+            val s = settings.current()
+            if (!s.safeMode) {
+                settings.update { it.copy(safeMode = true, safeModeReason = "Self-test failed (${result!!.reason}); safe settings applied automatically.") }
+                com.offlineagent.app.diag.Diagnostics.log("self-test failed with normal settings → safe mode, reloading")
+                info = loadOnce(model, role)
+                result = selfTest(model)
+            }
+            if (result != null && !result.ok) {
+                val compat = com.offlineagent.app.diag.Diagnostics.compatVariant().isNotBlank()
+                if (!compat) com.offlineagent.app.diag.Diagnostics.setCompatVariant(com.offlineagent.app.diag.Diagnostics.COMPAT_VARIANT)
+                _health.value = EngineHealth(result, safeMode = true, compatCpu = true, needsRestart = !compat,
+                    message = if (!compat) "The model still gives broken output in safe mode. Restart the app to switch to compatibility CPU kernels."
+                        else "The model gives broken output even with compatibility CPU kernels. Try another model file (it may be corrupted) and send the diagnostics log from Settings.")
+                return info
+            }
+        }
+        val s = settings.current()
+        _health.value = EngineHealth(result, safeMode = s.safeMode, compatCpu = com.offlineagent.app.diag.Diagnostics.compatVariant().isNotBlank(),
+            message = when {
+                s.safeMode -> "Safe mode: ${s.safeModeReason.ifBlank { "4K context, f16 KV, no prompt cache" }}"
+                result?.verdict == com.offlineagent.core.inference.SelfTest.Verdict.WRONG_ANSWER -> null // sane but wrong (tiny models): no banner
+                else -> null
+            })
+        return info
+    }
+
+    private suspend fun loadOnce(model: ModelEntity, role: ModelRole): ModelInfo {
+        val cfg = config(model, role)
+        val desc = "load ${model.name} ctx=${cfg.contextLength} kv=${cfg.kvCacheType} fa=${cfg.flashAttention} threads=${cfg.threads} batch=${cfg.batchSize}/${cfg.ubatchSize}"
+        val info = try {
+            com.offlineagent.app.diag.Diagnostics.native(desc) { inference.load(cfg) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            _loaded.value = null
+            com.offlineagent.app.diag.Diagnostics.log("load failed: ${e.message}")
+            throw com.offlineagent.core.inference.ModelLoadException("Could not load ${model.name}: ${e.message ?: e}", e)
+        }
         _loaded.value = model
-        info
+        com.offlineagent.app.diag.Diagnostics.log("loaded ${model.name}: ${info.backendInfo.replace('\n', ' ')}")
+        return info
+    }
+
+    private suspend fun selfTest(model: ModelEntity): com.offlineagent.core.inference.SelfTest.Result? = try {
+        com.offlineagent.app.diag.Diagnostics.native("self-test ${model.name}") { com.offlineagent.core.inference.SelfTest.run(inference) }
+            .also { com.offlineagent.app.diag.Diagnostics.log("self-test ${it.verdict}: \"${it.output.take(60)}\" (${it.reason}, ${it.millis} ms)") }
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        com.offlineagent.app.diag.Diagnostics.log("self-test could not run: ${e.message}")
+        null
+    }
+
+    /**
+     * Apply changed context/KV/flash-attention/threads settings: unload + reload (+ self-test) in the background.
+     * If the model is generating, the reload happens on the next request. Never throws.
+     */
+    suspend fun applySettings(): String {
+        val m = _loaded.value ?: return "Saved. Applies when a model loads."
+        if (inference.state.value is EngineState.Generating) { reloadPending = true; return "Saved. Applies after the current answer." }
+        return try { load(m); "Applied: model reloaded." } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Throwable) { "Saved, but reload failed: ${e.message}" }
     }
 
     /** Reload with new settings if something is loaded (after the user changes context/KV/etc.). */
-    suspend fun reloadIfLoaded() {
-        val m = _loaded.value ?: return
-        if (inference.state.value is EngineState.Generating) return
-        load(m)
+    suspend fun reloadIfLoaded() { applySettings() }
+
+    /** Leaves safe mode (the user's choice); the next load uses their settings again. */
+    suspend fun exitSafeMode() {
+        settings.update { it.copy(safeMode = false, safeModeReason = "") }
+        _health.value = _health.value.copy(safeMode = false, message = null)
+        reloadPending = true
     }
 
     fun markUnloaded() { _loaded.value = null }
+
+    companion object { const val SAFE_CONTEXT = 4096 }
 }
 
 sealed interface IntentRequest {

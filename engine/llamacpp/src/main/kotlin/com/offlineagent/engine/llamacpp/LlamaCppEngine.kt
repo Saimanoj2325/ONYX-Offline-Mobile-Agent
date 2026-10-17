@@ -27,11 +27,13 @@ import java.util.concurrent.Executors
 /** One file per (model, context settings, system prompt). Old ones are pruned to [MAX_FILES]. */
 object PrefixCacheFiles {
     const val MAX_FILES = 8
+    /** Everything else that changes the KV layout/contents (flash attention, batch, CPU variant, cache format). */
+    @Volatile var configTag: String = ""
 
     fun path(dir: File, info: ModelInfo, prefix: String): String {
         dir.mkdirs()
         val f = File(info.path)
-        val key = listOf(info.path, f.length(), f.lastModified(), info.contextLength, info.kvCacheType.name, prefix).joinToString("\u0000")
+        val key = listOf("v4", info.path, f.length(), f.lastModified(), info.contextLength, info.kvCacheType.name, configTag, LlamaNative.cpuVariant, prefix).joinToString("\u0000")
         val hash = MessageDigest.getInstance("SHA-256").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }.take(32)
         val target = File(dir, "$hash.kv")
         prune(dir, keep = target)
@@ -69,7 +71,12 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
             config.kvCacheType.ggmlType, config.kvCacheType.vGgmlType, config.flashAttention.native, config.ropeScaling.native,
             config.yarnOriginalContext, config.pollLevel, if (config.warmup) 1 else 0,
         )
-        val h = LlamaNative.nativeLoad(file.absolutePath, opts, floatArrayOf(0f), config.cpuIds.toIntArray())
+        PrefixCacheFiles.configTag = "fa=${config.flashAttention}/b=${config.batchSize}/ub=${config.ubatchSize}/rope=${config.ropeScaling}"
+        val h = try {
+            LlamaNative.nativeLoad(file.absolutePath, opts, floatArrayOf(0f), config.cpuIds.toIntArray())
+        } catch (e: Throwable) { // UnsatisfiedLinkError / OOM in JNI glue: report, never crash the app
+            throw ModelLoadException("Native load failed: ${e.message ?: e}", e)
+        }
         if (h == 0L) throw ModelLoadException(LlamaNative.nativeLastError().ifBlank { "Unknown load error" })
         handle = h
         var vision = false
@@ -227,8 +234,13 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         fun createEmbedder(context: Context): EmbeddingService =
             EmbeddingService(LlamaEmbeddingEngine(context.applicationInfo.nativeLibraryDir), newEngineDispatcher("embed-engine"))
 
-        fun createAdapter(context: Context): InferenceAdapter {
-            val cacheDir = File(context.cacheDir, "prompt-cache")
+        fun prefixCacheDir(context: Context) = File(context.cacheDir, "prompt-cache")
+
+        /** Deletes every saved prompt-prefix KV file (after a crash, a failed self-test, or a settings migration). */
+        fun clearPrefixCache(context: Context) { prefixCacheDir(context).listFiles()?.forEach { it.delete() } }
+
+        fun createAdapter(context: Context): EngineInferenceAdapter {
+            val cacheDir = prefixCacheDir(context)
             return EngineInferenceAdapter(
                 engine = LlamaCppEngine(context.applicationInfo.nativeLibraryDir),
                 engineDispatcher = newEngineDispatcher(),

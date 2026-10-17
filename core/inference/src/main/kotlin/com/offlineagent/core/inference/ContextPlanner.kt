@@ -138,8 +138,9 @@ data class ContextPlan(
  * Picks the context window and KV cache precision from the phone's RAM and the model's architecture, and estimates
  * the memory each choice costs (weights + KV + compute buffers + runtime overhead).
  *
- *  - 8 GB phones: 16K default (q8_0 KV), 32K allowed with a warning, 64K/128K (YaRN) experimental.
- *  - 6 GB: 8K default.  4 GB: 4K.  < 4 GB: 2K.
+ *  - Phase 4 (P0 fix): 8 GB+ phones default to 8K with f16 KV; 16K/32K are opt-in ("Allow large context"),
+ *    64K/128K (YaRN) experimental. 6 GB and 4 GB: 4K.  < 4 GB: 2K.
+ *    (Phase 3 defaulted to 16K/32K with "Auto" q8_0 KV; a 12 GB phone produced garbage at 32K — see docs/PHASE4.md.)
  *
  * Android leaves an app roughly 45-55 % of physical RAM before the low-memory killer gets aggressive, which is the
  * budget used for "blocked" vs "warning".
@@ -160,7 +161,7 @@ object ContextPlanner {
     }
 
     fun defaultContext(tier: RamTier): Int = when (tier) {
-        RamTier.TINY -> 2048; RamTier.SMALL -> 4096; RamTier.MEDIUM -> 8192; RamTier.LARGE -> 16384; RamTier.XL -> 32768
+        RamTier.TINY -> 2048; RamTier.SMALL -> 4096; RamTier.MEDIUM -> 4096; RamTier.LARGE -> 8192; RamTier.XL -> 8192
     }
 
     fun maxOutputTokens(tier: RamTier): Int = when (tier) {
@@ -199,19 +200,29 @@ object ContextPlanner {
         var rec = defaultContext(tier).coerceAtMost(trained)
         // Never recommend something that does not fit.
         while (rec > 2048 && options.firstOrNull { it.tokens == rec }?.blocked == true) rec /= 2
-        val kvDefault = arch?.let { kvFor(totalRamBytes, it, rec, ubatch) } ?: if (tier == RamTier.TINY) KvCacheType.Q4_0 else KvCacheType.Q8_0
+        val kvDefault = arch?.let { kvFor(totalRamBytes, it, rec, ubatch) } ?: KvCacheType.F16
         return ContextPlan(tier, rec, kvDefault, maxOutputTokens(tier), options)
     }
 
     /**
-     * "Auto" KV precision for [ctx] tokens: f16 (fastest prompt reading on CPU) when the whole estimate stays within
-     * [F16_HEADROOM] of the app's RAM budget, otherwise q8_0 (half the KV memory); q4_0 only on < 4 GB phones.
+     * "Auto" KV precision. Phase 4: always f16 — the most-tested llama.cpp configuration and the fastest prompt reading
+     * on phone CPUs. Quantised KV (q8_0/q4_0, which force flash attention) is an explicit user choice only. When f16
+     * does not fit, [fitContext] lowers the window instead of silently switching precision.
      */
-    fun kvFor(totalRamBytes: Long, arch: ModelArch, ctx: Int, ubatch: Int = 512): KvCacheType {
-        if (tier(totalRamBytes) == RamTier.TINY) return KvCacheType.Q4_0
+    @Suppress("UNUSED_PARAMETER")
+    fun kvFor(totalRamBytes: Long, arch: ModelArch, ctx: Int, ubatch: Int = 512): KvCacheType = KvCacheType.F16
+
+    /** Largest window ≤ [ctx] (halving, min 2048) whose estimate fits the app's RAM budget with [kv]. */
+    fun fitContext(totalRamBytes: Long, arch: ModelArch?, ctx: Int, kv: KvCacheType, ubatch: Int = 512, flashAttention: Boolean = kv != KvCacheType.F16): Int {
+        if (arch == null) return ctx
         val budget = totalRamBytes * APP_RAM_FRACTION
-        return if (estimate(arch, ctx, KvCacheType.F16, ubatch, flashAttention = true).totalBytes <= budget * F16_HEADROOM) KvCacheType.F16 else KvCacheType.Q8_0
+        var c = ctx
+        while (c > 2048 && estimate(arch, c, kv, ubatch, flashAttention).totalBytes > budget) c /= 2
+        return c
     }
+
+    /** Context sizes above this need the user's opt-in. */
+    const val LARGE_CONTEXT = 8192
 
     fun gb(b: Long) = "%.1f GB".format(b / (1024.0 * 1024 * 1024))
 
