@@ -14,6 +14,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
+import kotlinx.coroutines.sync.withLock
 
 /** Everything an agent may use. [queue] is null when no model is loaded: agents then use their rule-based paths. */
 class AgentDeps(
@@ -38,11 +39,18 @@ private fun JsonObject.isErrorResult(): Boolean = this["error"] != null || (this
 
 /** Picks the tools most relevant to a request (keeps planner prompts short on a phone). */
 object ToolSelector {
-    private fun words(s: String) = s.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 2 }.toSet()
-    fun relevant(request: String, specs: List<ToolSpec>, limit: Int): List<ToolSpec> {
-        val q = words(request)
-        return specs.map { s -> s to (words(s.name.replace('_', ' ') + " " + s.description) intersect q).size }
-            .sortedByDescending { it.second }.filter { it.second > 0 }.take(limit).map { it.first }
+    private val STOP = setOf("the", "and", "for", "with", "from", "that", "this", "you", "your", "are", "was", "can", "please", "tell", "show",
+        "give", "what", "about", "into", "then", "also", "get", "use", "user", "app", "apps", "phone", "its", "it's", "how", "has", "have", "all", "any", "or")
+    fun words(s: String) = s.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 2 && it !in STOP }.toSet()
+    private fun doc(s: ToolSpec) = s.name.replace('_', ' ') + " " + s.description + " " + com.offlineagent.core.runtime.tools.ToolSelector.hints(s.name)
+    fun score(text: String, spec: ToolSpec): Int = (words(doc(spec)) intersect words(text)).size
+    fun relevant(request: String, specs: List<ToolSpec>, limit: Int): List<ToolSpec> =
+        specs.map { s -> s to score(request, s) }.sortedByDescending { it.second }.filter { it.second > 0 }.take(limit).map { it.first }
+    /** Best-scoring tools for a clause (ties kept), empty when nothing matches. */
+    fun best(clause: String, specs: List<ToolSpec>): List<ToolSpec> {
+        val scored = specs.map { it to score(clause, it) }.filter { it.second > 0 }
+        val top = scored.maxOfOrNull { it.second } ?: return emptyList()
+        return scored.filter { it.second == top }.map { it.first }
     }
 }
 
@@ -57,15 +65,24 @@ class PlannerAgent(private val deps: AgentDeps) {
     suspend fun plan(request: String, board: Blackboard): TaskPlan {
         val specs = deps.tools.specs()
         val llmPlan = deps.queue?.let { q ->
-            runCatching { llmSteps(q, request, specs) }.onFailure { board.note("Planner model failed (${it.message?.take(80)}); using rules") }.getOrNull()
+            try { llmSteps(q, request, specs, board) }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { board.note("Planner model failed (${e.message?.take(80)}); using rules"); null }
         }
-        val middle = llmPlan?.takeIf { it.isNotEmpty() } ?: RulePlanner.steps(request, specs)
-        return assemble(request, middle, if (llmPlan.isNullOrEmpty()) "rules" else "model", screen = RulePlanner.wantsScreen(request))
+        val rules = RulePlanner.steps(request, specs)
+        val base = llmPlan?.takeIf { it.isNotEmpty() } ?: rules
+        // Phase 5b: small models often merge or drop parts of a multi-part request ("…at 7pm and tell me tomorrow's
+        // plan" → one reminder step). Coverage repair adds a step for every clause whose best tool is missing and
+        // takes complete rule arguments (e.g. time "19:00") over model-filled ones.
+        val middle = Coverage.repair(request, base, rules, specs)
+        val source = when { llmPlan.isNullOrEmpty() -> "rules"; middle.size > base.size -> "model + coverage check"; else -> "model" }
+        if (middle.size > base.size) board.note("Coverage check added ${middle.size - base.size} step(s) the planner missed")
+        return assemble(request, middle, source, screen = RulePlanner.wantsScreen(request))
     }
 
     data class Step(val agent: AgentRole, val tool: String?, val goal: String, val after: List<Int>, val args: JsonObject = JsonObject(emptyMap()))
 
-    private suspend fun llmSteps(q: InferenceQueue, request: String, all: List<ToolSpec>): List<Step> {
+    private suspend fun llmSteps(@Suppress("UNUSED_PARAMETER") q: InferenceQueue, request: String, all: List<ToolSpec>, board: Blackboard): List<Step> {
         val specs = (ToolSelector.relevant(request, all, 10) + all.filter { it.name in setOf("get_datetime", "device_info", "search_docs") }).distinctBy { it.name }
         if (specs.isEmpty()) return emptyList()
         val schema = Schema.Obj(listOf("steps" to Schema.Arr(Schema.Obj(listOf(
@@ -73,9 +90,11 @@ class PlannerAgent(private val deps: AgentDeps) {
             "goal" to Schema.Str(maxLength = 160, minLength = 3),
             "after" to Schema.Arr(Schema.Num(min = 1.0, max = 4.0, integer = true), maxItems = 3),
         )), maxItems = 4)))
-        val system = "You plan phone-assistant tasks. Choose at most 4 tool steps (fewer is better; none if the question needs no tool). " +
-            "\"after\" lists earlier step numbers a step needs. Tools:\n" + specs.joinToString("\n") { "- ${it.name}: ${it.description.take(110)}" }
-        val out = q.complete(InferenceQueue.Priority.PLANNING, "planner", system, request, Gbnf.of(schema), 300)
+        val system = "You plan phone-assistant tasks. Make ONE step per thing the user asks for (a request with \"and\" usually needs several steps), " +
+            "at most 4, none if no tool is needed. \"after\" lists earlier step numbers a step needs. " +
+            "Example: \"remind me at 9am to pay rent and show my calendar\" -> steps: schedule_exact_reminder, list_events. Tools:\n" + specs.joinToString("\n") { "- ${it.name}: ${it.description.take(110)}" }
+        val user = if (board.conversation.isBlank()) request else "Earlier conversation:\n${board.conversation.takeLast(1200)}\n\nRequest: $request"
+        val out = modelCall(deps, board, AgentRole.PLANNER, "plan", InferenceQueue.Priority.PLANNING, "planner", system, user, Gbnf.of(schema), 300, PlanPreview::readable)
         val steps = (AgentJson.parseToJsonElement(out).jsonObject["steps"] as? JsonArray) ?: return emptyList()
         return steps.mapIndexedNotNull { i, el ->
             val o = el as? JsonObject ?: return@mapIndexedNotNull null
@@ -115,7 +134,15 @@ object RulePlanner {
         }
         if (Regex("battery|storage|ram\\b|device info|phone model").containsMatchIn(r)) add("device_info", "Read battery, storage and device info")
         if (Regex("notification").containsMatchIn(r)) add("recent_notifications", "Read recent notifications", buildJsonObject { put("limit", 10); put("app", "") })
-        if (Regex("calendar|schedule|meeting|events? today|agenda").containsMatchIn(r)) add("list_events", "List today's events", buildJsonObject { put("from", ""); put("days", 1) })
+        val tomorrow = Regex("\\btomorrow").containsMatchIn(r)
+        if (Regex("calendar|schedule|meeting|events? today|agenda|my plan|tomorrow'?s plan|today'?s plan|plan for (today|tomorrow)").containsMatchIn(r))
+            add("list_events", if (tomorrow) "List today's and tomorrow's events" else "List today's events", buildJsonObject { put("from", ""); put("days", if (tomorrow) 2 else 1) })
+        // "remind me at 7pm to call mom" → a reminder with the time and text already filled (no model call needed).
+        val at = ArgRepair.requestTime(request)
+        if (Regex("\\bremind(er)?\\b").containsMatchIn(r) && at != null) {
+            val tool = listOf("schedule_exact_reminder", "set_reminder").firstOrNull { it in have }
+            if (tool != null) add(tool, "Remind at $at: ${ArgRepair.reminderText(request)}", ArgRepair.fillByName(have.getValue(tool), at, ArgRepair.reminderText(request)))
+        }
         if (Regex("reminders?\\b").containsMatchIn(r) && Regex("list|show|what").containsMatchIn(r)) add("list_reminders", "List reminders")
         if (Regex("flashlight|torch").containsMatchIn(r)) add("flashlight", "Switch the flashlight", buildJsonObject { put("on", !Regex("\\boff\\b").containsMatchIn(r)) })
         if (Regex("\\b(time|date|today|day is it)\\b").containsMatchIn(r) && out.isEmpty()) add("get_datetime", "Get the current date and time")
@@ -153,12 +180,13 @@ class ContextAgent(private val deps: AgentDeps) : Agent {
 internal suspend fun fillArgs(deps: AgentDeps, node: TaskNode, spec: ToolSpec, board: Blackboard, lastError: String?): Result<JsonObject> {
     if (node.args.isNotEmpty() && spec.input.validate(node.args, "args").isEmpty()) return Result.success(node.args)
     if (spec.input.properties.isEmpty()) return Result.success(JsonObject(emptyMap()))
-    val q = deps.queue ?: return Result.failure(IllegalStateException("load a chat model so I can fill in ${spec.name}'s details"))
+    if (deps.queue == null) return Result.failure(IllegalStateException("load a chat model so I can fill in ${spec.name}'s details"))
     val facts = board.facts().entries.joinToString("\n") { (k, v) -> "$k: ${v.take(500)}" }
     val system = "Fill the arguments for the tool ${spec.name}: ${spec.description}\nUse the user's request and the facts. Output only JSON."
     val user = "Request: ${board.request}\nStep: ${node.goal}\nFacts:\n$facts" + (lastError?.let { "\nThe previous attempt failed: $it. Fix the arguments." } ?: "")
-    val out = q.complete(InferenceQueue.Priority.INTERACTIVE, "args:${spec.name}", system, user, Gbnf.of(spec.input), 256)
+    val out = modelCall(deps, board, node.agent, node.id, InferenceQueue.Priority.INTERACTIVE, "args:${spec.name}", system, user, Gbnf.of(spec.input), 256)
     val obj = runCatching { AgentJson.parseToJsonElement(out).jsonObject }.getOrElse { return Result.failure(IllegalArgumentException("model returned invalid JSON")) }
+        .let { ArgRepair.fix(spec, it, board.request) }
     val errs = spec.input.validate(obj, "args")
     return if (errs.isEmpty()) Result.success(obj) else Result.failure(IllegalArgumentException(errs.joinToString { it.toString() }.take(200)))
 }
@@ -180,11 +208,15 @@ internal suspend fun gatedCall(deps: AgentDeps, role: AgentRole, node: TaskNode,
     val risk = deps.tools.risk(name, args)
     val needsNet = deps.tools.requiresNetwork(name)
     if (alwaysAsk && risk > Risk.NONE || risk.needsApproval) {
-        board.message(AgentMessage.ApprovalAsked(role, AgentRole.ORCHESTRATOR, node.id, name, risk))
-        board.setStatus(TaskStatus.AWAITING_APPROVAL)
-        deps.store.save(board.checkpoint())
-        val ok = deps.approvals.approve(ApprovalRequest(board.runId, node.id, name, node.goal, spec.description, args, risk, spec.sideEffects, needsNet))
-        board.setStatus(TaskStatus.RUNNING)
+        val req = ApprovalRequest(board.runId, node.id, name, node.goal, spec.description, args, risk, spec.sideEffects, needsNet)
+        // Phase 5b: one confirmation at a time — parallel branches wait here (never while holding the model queue),
+        // so a second approval can't overwrite the first and the AWAITING status is counted, not toggled.
+        val ok = board.approvalLock.withLock {
+            board.message(AgentMessage.ApprovalAsked(role, AgentRole.ORCHESTRATOR, node.id, name, risk))
+            board.approvalStarted(req)
+            deps.store.save(board.checkpoint())
+            try { deps.approvals.approve(req) } finally { board.approvalEnded() }
+        }
         deps.audit.record(board.runId, role.title, if (ok) "approved $name" else "denied $name", args.toString().take(500), risk)
         if (!ok) return NodeOutcome.Denied("You declined $name")
     }
@@ -225,13 +257,20 @@ class WriterAgent(private val deps: AgentDeps) : Agent {
         val results = st.nodes.values.filter { it.id.startsWith("s") }.joinToString("\n") { n ->
             "- ${n.goal}: ${n.status}${if (n.output.isNotBlank()) " → ${n.output.take(600)}" else ""}${n.error?.let { " (error: $it)" } ?: ""}"
         }
-        val q = deps.queue
-        if (q == null || attempt > 2) return NodeOutcome.Ok(template(board.request, st, results))
-        val system = "You are ONYX, an offline phone assistant. Answer the user briefly and helpfully using ONLY the facts and step results. " +
-            "Never claim an action happened unless its step is DONE. Mention queued (offline) or declined steps honestly."
-        val user = "Request: ${board.request}\nFacts:\n${st.facts.filterKeys { it == "context" || it == "memory" }.entries.joinToString("\n") { "${it.key}: ${it.value.take(800)}" }}" +
-            "\nStep results:\n${results.ifBlank { "(no tools used)" }}" + (lastError?.let { "\nFix this problem in your answer: $it" } ?: "")
-        val text = try { q.complete(InferenceQueue.Priority.INTERACTIVE, "writer", system, user, null, 600) }
+        if (deps.queue == null || attempt > 2) return NodeOutcome.Ok(template(board.request, st, results))
+        val direct = results.isBlank()
+        val system = if (direct) "You are ONYX, a private offline phone assistant. Answer the user briefly and helpfully. Use the device facts only when relevant."
+            else "You are ONYX, an offline phone assistant. Answer the user briefly and helpfully using ONLY the facts and step results. " +
+                "Never claim an action happened unless its step is DONE. Mention queued (offline) or declined steps honestly."
+        val user = buildString {
+            if (board.conversation.isNotBlank()) append("Earlier conversation:\n").append(board.conversation.takeLast(1500)).append("\n\n")
+            append("Request: ${board.request}\nFacts:\n")
+            append(st.facts.filterKeys { it == "context" || it == "memory" }.entries.joinToString("\n") { "${it.key}: ${it.value.take(800)}" })
+            append("\nStep results:\n").append(results.ifBlank { "(no tools used)" })
+            lastError?.let { append("\nFix this problem in your answer: $it") }
+        }
+        // Streams token by token into the trace / chat bubble (Blackboard.live["answer"]).
+        val text = try { modelCall(deps, board, AgentRole.WRITER, node.id, InferenceQueue.Priority.INTERACTIVE, "writer", system, user, null, 600) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (e: Exception) { return NodeOutcome.Ok(template(board.request, st, results) + "\n\n(The model could not write the answer: ${e.message?.take(120)})") }
         return if (text.isBlank()) NodeOutcome.Fail("empty answer") else NodeOutcome.Ok(text)
@@ -263,20 +302,33 @@ class VerificationAgent(private val deps: AgentDeps, private val llmCheck: Boole
             if (failedActions.isNotEmpty() && Regex("\\b(done|i have|i've|successfully)\\b", RegexOption.IGNORE_CASE).containsMatchIn(out) &&
                 failedActions.none { f -> out.contains(f.goal, ignoreCase = true) || out.contains("declin", true) || out.contains("fail", true) || out.contains("could not", true) || out.contains("couldn't", true) })
                 issues += "claims success although an action failed or was declined"
+            issues += ClaimCheck.issues(out, st.plan, st.nodes)
         }
         return Report(issues.isEmpty(), issues)
     }
 
+    /**
+     * Phase 5b: rules first, always. The model check runs only for the Writer's answer AND only when a contradiction is
+     * actually possible: a step did not finish cleanly (failed / declined / queued / skipped) or an action ran. A direct
+     * answer, or a read-only run whose steps all succeeded, is accepted on the rules alone (saves one model call).
+     */
+    fun needsModelCheck(node: TaskNode, board: Blackboard): Boolean {
+        if (node.agent != AgentRole.WRITER || !llmCheck || deps.queue == null) return false
+        val steps = board.state.value.nodes.values.filter { it.id.startsWith("s") }
+        if (steps.isEmpty()) return false
+        return steps.any { it.status != NodeStatus.DONE || it.agent == AgentRole.EXECUTOR }
+    }
+
     suspend fun verify(node: TaskNode, outcome: NodeOutcome.Ok, board: Blackboard): Report {
         val rules = ruleCheck(node, outcome, board)
-        if (!rules.passed || node.agent != AgentRole.WRITER || !llmCheck) return rules
-        val q = deps.queue ?: return rules
-        val schema = Schema.Obj(listOf("ok" to Schema.Bool(), "issue" to Schema.Str(maxLength = 160)))
-        val res = runCatching {
-            q.complete(InferenceQueue.Priority.NORMAL, "verifier", "Check an assistant answer. ok=true if it answers the request and does not contradict the step results.",
+        if (!rules.passed || !needsModelCheck(node, board)) return rules
+        val schema = Schema.Obj(listOf("ok" to Schema.Bool(), "issue" to Schema.Str(maxLength = 80)))
+        val res = try {
+            modelCall(deps, board, AgentRole.VERIFIER, "verify:${node.id}", InferenceQueue.Priority.NORMAL, "verifier",
+                "Check an assistant answer. ok=true if it answers the request and does not contradict the step results.",
                 "Request: ${board.request}\nStep results: ${board.state.value.nodes.values.filter { it.id.startsWith("s") }.joinToString { "${it.goal}=${it.status}" }}\nAnswer: ${outcome.output.take(1500)}",
-                Gbnf.of(schema), 80)
-        }.getOrNull() ?: return rules
+                Gbnf.of(schema), 60)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { return rules }
         val o = runCatching { AgentJson.parseToJsonElement(res).jsonObject }.getOrNull() ?: return rules
         val ok = (o["ok"] as? JsonPrimitive)?.booleanOrNull ?: true
         return if (ok) rules else Report(false, listOf("model check: " + ((o["issue"] as? JsonPrimitive)?.content ?: "inconsistent answer")))

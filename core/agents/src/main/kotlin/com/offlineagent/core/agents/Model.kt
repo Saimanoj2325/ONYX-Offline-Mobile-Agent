@@ -123,6 +123,12 @@ data class NodeState(
     val endedAt: Long = 0,
     /** Set when the node was re-delegated to another agent after failures. */
     val delegatedTo: AgentRole? = null,
+    /** Phase 5b: the model text this node produced while working (planner steps, filled arguments, answer draft). */
+    val thought: String = "",
+    /** Phase 5b: why the node is being retried right now (verification issue or tool error), shown as "↻ retry". */
+    val retryReason: String? = null,
+    /** Phase 5b: issues the Verifier found on the last check (empty = passed or not checked). */
+    val issues: List<String> = emptyList(),
 )
 
 @Serializable
@@ -143,6 +149,9 @@ data class TaskCheckpoint(
     val error: String? = null,
     val createdAt: Long = 0,
     val updatedAt: Long = 0,
+    /** Phase 5b: earlier chat turns this task continued from (chat mode). */
+    val conversation: String = "",
+    val route: Route? = null,
 ) {
     fun toJson(): String = AgentJson.encodeToString(serializer(), this)
     companion object { fun fromJson(s: String): TaskCheckpoint = AgentJson.decodeFromString(serializer(), s) }
@@ -155,6 +164,24 @@ sealed interface ActivityEvent {
     data class Message(val message: AgentMessage, override val at: Long) : ActivityEvent
     data class PlanReady(val plan: TaskPlan, override val at: Long) : ActivityEvent
     data class Note(val text: String, override val at: Long) : ActivityEvent
+    /** Phase 5b: one finished model call (real latency + the text it produced) — detail view and harness timings. */
+    data class ModelCall(val agent: AgentRole, val key: String, val label: String?, val millis: Long, val waitedMillis: Long,
+                         val output: String, override val at: Long) : ActivityEvent
+}
+
+/**
+ * Phase 5b: text an agent's model call is producing RIGHT NOW (accumulated), keyed by node id ("plan" for the
+ * planner). [waiting] = queued behind another agent's model call (one shared model).
+ */
+data class LiveThought(val agent: AgentRole, val key: String, val text: String, val waiting: Boolean, val startedAt: Long, val updates: Int = 0)
+
+/** How the orchestrator routed a request (Phase 5b fast paths). */
+@Serializable
+enum class Route(val label: String) {
+    DIRECT("direct answer"),   // no tools needed: skip the planner, Writer answers (1 model call)
+    RULES("rule fast path"),   // one obvious tool step with complete arguments: skip the planner model
+    PLANNED("planned"),        // the Planner model built the task graph
+    FALLBACK("rules"),         // no model / planner failed: deterministic rules
 }
 
 val AgentJson = Json { ignoreUnknownKeys = true; encodeDefaults = true; classDiscriminator = "type" }

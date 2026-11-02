@@ -88,7 +88,15 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
             app.engineController.ensure(ModelRole.CHAT) // loads the chat model once; every agent shares it
             return InferenceAgentLlm(app.inference).complete(system, user, grammar, maxTokens)
         }
+        // Phase 5b: token streaming for live agent thinking / the Writer's answer.
+        override suspend fun stream(system: String, user: String, grammar: String?, maxTokens: Int, onPartial: (String) -> Unit): String {
+            app.engineController.ensure(ModelRole.CHAT)
+            return InferenceAgentLlm(app.inference).stream(system, user, grammar, maxTokens, onPartial)
+        }
     }
+
+    /** Phase 5b: the first-run model onboarding was dismissed (shared by Home and Chat so it shows once). */
+    val onboardingDismissed = MutableStateFlow(false)
     val queue = InferenceQueue(sharedLlm)
 
     private val _plan = MutableStateFlow<RuntimePlan?>(null)
@@ -112,6 +120,8 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
             withContext(Dispatchers.Main) { monitor.start() }
             refreshDevice()
             _hasChatModel.value = runCatching { app.models.active(ModelRole.CHAT) != null }.getOrDefault(false)
+            // Phase 5b: follow downloads / deletes / switches so Home and the agents see a new model immediately.
+            launch { app.models.models.collect { l -> _hasChatModel.value = l.any { it.role == ModelRole.CHAT.name && it.active && java.io.File(it.path).isFile } } }
             // Interrupted runs (process died mid-task) → WorkManager resumes them; open outbox items → drain when online.
             runCatching { if (taskStore.interrupted().isNotEmpty()) TaskResumeWorker.schedule(app, 0) }
             runCatching { if (dao.openOutbox().isNotEmpty()) OutboxWorker.schedule(app) }
@@ -145,20 +155,41 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     private fun orchestrator() = Orchestrator(deps(), OrchestratorConfig(llmVerification = prefs.values.value.llmVerification))
 
     /** Starts a multi-agent task. Returns null (with a reason) when the model is busy with another job. */
-    fun run(request: String): String? {
-        if (isRunning) return "ONYX is already working on a task."
-        if (app.agents.isRunning) return "The chat agent is running; wait for it to finish."
+    fun run(request: String): String? = start(request).error
+
+    data class StartResult(val runId: String?, val error: String?)
+
+    // Boards of this process's runs (Chat looks them up by runId to show the live trace inside the message).
+    private val _boards = MutableStateFlow<Map<String, Blackboard>>(emptyMap())
+    val boards: StateFlow<Map<String, Blackboard>> = _boards.asStateFlow()
+    fun board(runId: String?): Blackboard? = runId?.let { _boards.value[it] }
+    /** Read-only board of a saved run (older chat messages after a restart). */
+    suspend fun loadBoard(runId: String): Blackboard? = board(runId) ?: withContext(Dispatchers.IO) { taskStore.load(runId)?.let { Blackboard.fromCheckpoint(it) } }
+
+    /**
+     * Phase 5b: starts a task from Home or from Chat. [conversation] = earlier chat turns (follow-ups), [onFinished]
+     * is ALWAYS called once — also when the run is stopped — with the final checkpoint.
+     */
+    fun start(request: String, conversation: String = "", onFinished: (suspend (TaskCheckpoint) -> Unit)? = null): StartResult {
+        if (isRunning) return StartResult(null, "ONYX is already working on a task.")
+        if (app.agents.isRunning) return StartResult(null, "The chat agent is running; wait for it to finish.")
         val runId = "task-" + UUID.randomUUID().toString().take(8)
-        val board = Blackboard(runId, request)
+        val board = Blackboard(runId, request, conversation = conversation)
         _current.value = board
+        _boards.value = (_boards.value + (runId to board)).entries.toList().takeLast(30).associate { it.key to it.value }
         activeRunId = runId
         TaskResumeWorker.schedule(app, WATCHDOG_MIN) // resumes it if the process dies mid-run
         job = app.appScope.launch {
             refreshModelState()
-            val cp = orchestrator().run(request, board)
+            val cp = try { orchestrator().run(request, board) }
+            catch (e: kotlinx.coroutines.CancellationException) {
+                withContext(kotlinx.coroutines.NonCancellable) { onFinished?.invoke(board.checkpoint()) }
+                throw e
+            }
             finished(cp)
+            onFinished?.invoke(cp)
         }
-        return null
+        return StartResult(runId, null)
     }
 
     /** Resume from the Tasks screen (in-process) or from [TaskResumeWorker] (after process death). */
@@ -168,8 +199,9 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
         val j = app.appScope.launch {
             val cp = taskStore.load(runId) ?: return@launch
             refreshModelState()
-            val board = Blackboard(runId, cp.request)
+            val board = Blackboard(runId, cp.request, conversation = cp.conversation)
             _current.value = board
+            _boards.value = _boards.value + (runId to board)
             finished(orchestrator().resume(cp, board))
         }
         job = j

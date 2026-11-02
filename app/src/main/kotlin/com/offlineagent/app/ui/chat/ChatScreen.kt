@@ -65,6 +65,7 @@ import com.offlineagent.core.runtime.skills.Skill
 import com.offlineagent.core.runtime.ui.AnswerMode
 import com.offlineagent.core.runtime.ui.OpenUiBridge
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.map
 import java.io.File
 
 private fun tokenLabel(n: Int) = if (n >= 1000) "%.1fK".format(n / 1000.0) else n.toString()
@@ -97,7 +98,7 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     var sheet by rememberSaveable { mutableStateOf<Sheet?>(null) }
-    var onboardingDismissed by rememberSaveable { mutableStateOf(false) }
+    val onboardingDismissed by app.onyx.onboardingDismissed.collectAsStateWithLifecycle()
     val busy = ui.streaming != null || live.isNotEmpty() || vm.busy
 
     // First launch with no chat model: the onboarding sheet recommends one by RAM.
@@ -158,6 +159,13 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
                 val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
                 if (ChatLogic.shouldAutoScroll(last, count, listState.isScrollInProgress) && count > 0) listState.scrollToItem(count - 1, Int.MAX_VALUE / 2)
             }
+            // Phase 5b: follow the agents' live trace / streaming answer when the user is at the bottom.
+            val onyxBoard by app.onyx.current.collectAsStateWithLifecycle()
+            val onyxTick by remember(onyxBoard) { onyxBoard?.live?.map { m -> m.values.sumOf { it.text.length } } ?: kotlinx.coroutines.flow.flowOf(0) }.collectAsStateWithLifecycle(0)
+            LaunchedEffect(onyxTick) {
+                val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                if (onyxTick > 0 && count > 0 && ChatLogic.shouldAutoScroll(last, count, listState.isScrollInProgress)) listState.scrollToItem(count - 1, Int.MAX_VALUE / 2)
+            }
             if (messages.isEmpty() && ui.streaming == null) {
                 EmptyState(Modifier.weight(1f), onPick = { s -> vm.setMode(s.mode); vm.send(s.prompt) })
             } else LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
@@ -181,8 +189,8 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
         Sheet.ATTACH -> AttachSheet(vm, onDismiss = { sheet = null }, onDocuments = { sheet = Sheet.DOCUMENTS })
         Sheet.TOOLS -> ToolsSheet(ui.mode, onPick = { vm.setMode(it); sheet = null }, onDismiss = { sheet = null },
             onOpen = { sheet = it }, onSkill = { s -> sheet = null; vm.runSkill(s, "") }, vm = vm)
-        Sheet.MODELS -> ModelsSheet(app, vm, onDismiss = { sheet = null }, notify = notify)
-        Sheet.ONBOARDING -> OnboardingSheet(app, onDismiss = { sheet = null; onboardingDismissed = true }, onMore = { sheet = Sheet.MODELS })
+        Sheet.MODELS -> com.offlineagent.app.ui.models.ModelsSheet(app, onDismiss = { sheet = null }, notify = notify)
+        Sheet.ONBOARDING -> com.offlineagent.app.ui.models.OnboardingSheet(app, onDismiss = { sheet = null; app.onyx.onboardingDismissed.value = true }, onMore = { sheet = Sheet.MODELS })
         Sheet.DOCUMENTS -> FullSheet("Documents (RAG)", { sheet = null }) { com.offlineagent.app.ui.library.DocumentsScreen(app, notify, Modifier.fillMaxSize()) }
         Sheet.SKILLS -> FullSheet("Skills", { sheet = null }) { com.offlineagent.feature.workflow.SkillsScreen(skillsHost, notify, Modifier.fillMaxSize()) }
         Sheet.RUNS -> FullSheet("Agent runs", { sheet = null }) { com.offlineagent.feature.workflow.RunsScreen(runsHost, notify, Modifier.fillMaxSize()) }
@@ -345,6 +353,7 @@ private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, b
         when (m.kind) {
             "canvas" -> CanvasCard(m, vm, host)
             "agent" -> AgentRunCard(m, vm, live, host, partial)
+            ChatViewModel.KIND_ONYX -> OnyxMessage(m, vm, host)
             ChatViewModel.KIND_AUTOMATION -> AutomationCard(m, partial)
             else -> {
                 if (m.reasoning.isNotBlank()) ThinkingSection(m.reasoning, live = false)
@@ -364,7 +373,7 @@ private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, b
         m.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (m.text.isNotBlank()) TextButton(onClick = { onCopy(com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.text)) }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Copy", style = MaterialTheme.typography.labelMedium) }
-            if (m.kind == "markdown" || m.kind == "canvas" || m.error != null) TextButton(onClick = { vm.regenerate(m.id) }, enabled = !busy, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Regenerate", style = MaterialTheme.typography.labelMedium) }
+            if (m.kind == "markdown" || m.kind == "canvas" || m.kind == ChatViewModel.KIND_ONYX || m.error != null) TextButton(onClick = { vm.regenerate(m.id) }, enabled = !busy, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("Regenerate", style = MaterialTheme.typography.labelMedium) }
             Spacer(Modifier.weight(1f))
             m.statsText?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
@@ -575,11 +584,14 @@ private fun Composer(vm: ChatViewModel, ui: ChatUi, busy: Boolean, thinkingDefau
                     if (ui.editing != null) vm.submitEdit(t) else vm.send(t)
                 }, enabled = text.isNotBlank() || ui.pendingImages.isNotEmpty()) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
                 FilterChip(selected = ui.mode != ComposerMode.CHAT, onClick = onTools, label = { Text(if (ui.mode == ComposerMode.CHAT) "Tools" else ui.mode.label) },
                     trailingIcon = { Icon(Icons.Filled.ArrowDropDown, null) })
                 if (ui.mode != ComposerMode.CHAT) TextButton(onClick = { vm.setMode(ComposerMode.CHAT) }) { Text("✕ back to chat") }
                 if (ui.mode == ComposerMode.CHAT) {
+                    // Phase 5b: multi-agent switch — auto (task-like requests use the agents), always, or never.
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(selected = ui.agents != AgentsMode.OFF, onClick = { vm.cycleAgentsMode() }, label = { Text(ui.agents.label) })
                     // Phase 4b: per-message thinking toggle (Settings → Thinking is the default).
                     val think = ui.thinkOverride ?: thinkingDefault
                     Spacer(Modifier.width(6.dp))
@@ -678,120 +690,24 @@ private fun MacrosSheet(app: OfflineAgentApp, vm: ChatViewModel, onDismiss: () -
     }
 }
 
-// ---------------------------------------------------------------- models & downloads
-
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Phase 5b: a multi-agent turn in the thread — the collapsible live trace (planner, agents, approvals, verification)
+ * and below it the Writer's answer streaming token by token. Older messages load their trace from the task store.
+ */
 @Composable
-private fun ModelsSheet(app: OfflineAgentApp, vm: ChatViewModel, onDismiss: () -> Unit, notify: (String) -> Unit) {
-    val downloads by app.modelDownloads.states.collectAsStateWithLifecycle()
-    val models by app.models.models.collectAsStateWithLifecycle(emptyList())
-    var showImport by remember { mutableStateOf(false) }
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        if (showImport) Column(Modifier.fillMaxHeight(0.92f)) {
-            TextButton(onClick = { showImport = false }) { Text("‹ Back to downloads") }
-            com.offlineagent.app.ui.library.ModelsScreen(app, notify, Modifier.weight(1f))
-        } else Column(Modifier.fillMaxHeight(0.92f).padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Models", style = MaterialTheme.typography.titleLarge)
-            Text("Downloaded once from Hugging Face over HTTPS, then everything runs on this phone. The app makes no other network calls.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            val rec = remember { ModelCatalog.recommendChat(com.offlineagent.engine.llamacpp.DeviceInfo.totalRamBytes()) }
-            ModelCatalog.all.forEach { m ->
-                val installed = models.any { e -> File(e.path).name == m.main.file }
-                CatalogRow(m, recommended = m.id == rec.id, installed = installed, state = downloads[m.id],
-                    onDownload = { app.modelDownloads.start(m) }, onCancel = { app.modelDownloads.cancel(m.id) })
-            }
-            HorizontalDivider()
-            Text("Any GGUF from Hugging Face", style = MaterialTheme.typography.titleMedium)
-            var url by rememberSaveable { mutableStateOf("") }
-            var kind by rememberSaveable { mutableStateOf(ModelKind.CHAT) }
-            OutlinedTextField(url, { url = it }, label = { Text("Paste a huggingface.co …/resolve/… or …/blob/… link") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                ModelKind.entries.forEach { k -> FilterChip(selected = kind == k, onClick = { kind = k }, label = { Text(k.name.lowercase().replaceFirstChar { it.uppercase() }) }) }
-            }
-            val ref = remember(url) { HfUrls.parse(url) }
-            if (url.isNotBlank() && ref == null) Text("Not a Hugging Face .gguf file link.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-            if (kind == ModelKind.VISION) Text("Vision models also need their mmproj file: download it as a second link, then attach it in Settings → Models.", style = MaterialTheme.typography.bodySmall)
-            Button(onClick = { ref?.let { app.modelDownloads.startCustom(it, kind); url = "" } }, enabled = ref != null) { Text("Download") }
-            downloads.values.filter { it.id.startsWith("custom-") }.forEach { d -> DownloadProgressRow(d, onCancel = { app.modelDownloads.cancel(d.id) }) }
-            HorizontalDivider()
-            TextButton(onClick = { showImport = true }) { Text("Import a .gguf file / manage installed models…") }
-            Spacer(Modifier.height(24.dp))
-        }
-    }
-}
-
-@Composable
-private fun CatalogRow(m: com.offlineagent.core.models.CatalogModel, recommended: Boolean, installed: Boolean, state: DownloadState?, onDownload: () -> Unit, onCancel: () -> Unit) {
-    OutlinedCard(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(m.name + if (recommended) "  ★ recommended" else "", style = MaterialTheme.typography.titleSmall)
-                    Text("${formatBytes(m.totalBytes)} · ${m.minRamGb} GB+ RAM · ${m.licence}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                when {
-                    state?.active == true -> TextButton(onClick = onCancel) { Text("Cancel") }
-                    installed -> Text("Installed ✓", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
-                    else -> Button(onClick = onDownload) { Text(if (state?.phase == DownloadState.Phase.CANCELLED || state?.phase == DownloadState.Phase.FAILED) "Resume" else "Download") }
-                }
-            }
-            Text(m.note, style = MaterialTheme.typography.bodySmall)
-            state?.let { DownloadProgressRow(it, null) }
-        }
-    }
-}
-
-@Composable
-private fun DownloadProgressRow(d: DownloadState, onCancel: (() -> Unit)?) {
-    Column(Modifier.fillMaxWidth()) {
-        when (d.phase) {
-            DownloadState.Phase.QUEUED -> LinearProgressIndicator(Modifier.fillMaxWidth())
-            DownloadState.Phase.DOWNLOADING -> d.fraction?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth()) } ?: LinearProgressIndicator(Modifier.fillMaxWidth())
-            DownloadState.Phase.VERIFYING -> LinearProgressIndicator(Modifier.fillMaxWidth())
-            else -> Unit
-        }
-        val txt = when (d.phase) {
-            DownloadState.Phase.QUEUED -> "Waiting…"
-            DownloadState.Phase.DOWNLOADING -> (if (d.fileCount > 1) "File ${d.fileIndex + 1}/${d.fileCount} · " else "") + formatBytes(d.downloaded) + (d.total?.let { " / ${formatBytes(it)}" } ?: "") +
-                if (d.bytesPerSecond > 0) " · ${formatBytes(d.bytesPerSecond.toLong())}/s" else ""
-            DownloadState.Phase.VERIFYING -> "Verifying (GGUF header, size, SHA-256)…"
-            DownloadState.Phase.DONE -> "Downloaded and ready ✓"
-            DownloadState.Phase.FAILED -> "Failed: ${d.error}"
-            DownloadState.Phase.CANCELLED -> "Cancelled (partial file kept — Resume continues)"
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(txt, style = MaterialTheme.typography.labelSmall, color = if (d.phase == DownloadState.Phase.FAILED) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-            if (onCancel != null && d.active) TextButton(onClick = onCancel) { Text("Cancel") }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun OnboardingSheet(app: OfflineAgentApp, onDismiss: () -> Unit, onMore: () -> Unit) {
-    val downloads by app.modelDownloads.states.collectAsStateWithLifecycle()
-    val ram = remember { com.offlineagent.engine.llamacpp.DeviceInfo.totalRamBytes() }
-    val rec = remember { ModelCatalog.recommendChat(ram) }
-    val st = downloads[rec.id]
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 20.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Welcome 👋", style = MaterialTheme.typography.headlineSmall)
-            Text("Your assistant needs one AI model. It downloads once (Wi-Fi recommended) and then works fully offline on this phone.", style = MaterialTheme.typography.bodyMedium)
-            OutlinedCard(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Recommended for your phone (${"%.0f".format(ram / (1024.0 * 1024 * 1024))} GB RAM)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                    Text(rec.name, style = MaterialTheme.typography.titleLarge)
-                    Text("${formatBytes(rec.totalBytes)} · ${rec.licence} · ${rec.note}", style = MaterialTheme.typography.bodySmall)
-                }
-            }
-            if (st == null || !st.active && st.phase != DownloadState.Phase.DONE) {
-                Button(onClick = { app.modelDownloads.start(rec) }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text(if (st?.phase == DownloadState.Phase.FAILED || st?.phase == DownloadState.Phase.CANCELLED) "Resume download" else "Download (${formatBytes(rec.totalBytes)})") }
-            }
-            st?.let { DownloadProgressRow(it, onCancel = { app.modelDownloads.cancel(rec.id) }) }
-            if (st?.phase == DownloadState.Phase.DONE) Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Start chatting") }
-            Row { TextButton(onClick = onMore) { Text("Other models / paste a link / import a file") }; Spacer(Modifier.weight(1f)); TextButton(onClick = onDismiss) { Text("Later") } }
-            Spacer(Modifier.height(12.dp))
-        }
+private fun OnyxMessage(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost) {
+    val app = vm.getApplication<OfflineAgentApp>()
+    val boards by app.onyx.boards.collectAsStateWithLifecycle()
+    var saved by remember(m.runId) { mutableStateOf<com.offlineagent.core.agents.Blackboard?>(null) }
+    LaunchedEffect(m.runId) { val id = m.runId; if (id != null && app.onyx.board(id) == null) saved = app.onyx.loadBoard(id) }
+    val board = m.runId?.let { boards[it] } ?: saved
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (board != null) com.offlineagent.app.ui.onyx.AgentTraceCard(board, initiallyExpanded = !board.state.value.status.isTerminal,
+            canAlwaysAllow = { app.onyx.pending.value?.canAlwaysAllow == true }, onApproval = { allow, always -> app.onyx.answer(allow, always) })
+        else if (m.runId == null && m.text.isBlank() && m.error == null) Text("Starting the agents…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        val streamed = board?.let { com.offlineagent.app.ui.onyx.liveAnswer(it) } ?: ""
+        val text = m.text.ifBlank { streamed }
+        if (text.isNotBlank()) SelectionContainer { OpenUiMessageView(text, streaming = m.text.isBlank(), host = host) }
     }
 }
 

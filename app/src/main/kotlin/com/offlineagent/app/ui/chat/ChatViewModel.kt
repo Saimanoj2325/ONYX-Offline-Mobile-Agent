@@ -117,7 +117,12 @@ data class ChatUi(
     val editing: MessageEntity? = null,
     /** Phase 4b: per-message thinking toggle in the composer (null = use the Settings default). Reset after sending. */
     val thinkOverride: Boolean? = null,
+    /** Phase 5b: multi-agent mode for Chat-mode messages (AUTO = task-like requests go to the ONYX agents). */
+    val agents: AgentsMode = AgentsMode.AUTO,
 )
+
+/** Phase 5b: the composer's "Agents" switch. */
+enum class AgentsMode(val label: String) { AUTO("Agents: auto"), ON("Agents: on"), OFF("Agents: off") }
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
@@ -294,7 +299,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ sending
 
-    val busy: Boolean get() = sending || genJob?.isActive == true || g.agents.isRunning
+    val busy: Boolean get() = sending || genJob?.isActive == true || g.agents.isRunning || g.onyx.isRunning
 
     /** Set synchronously on the main thread before anything else, so a double tap / IME action can't send twice. */
     @Volatile private var sending = false
@@ -345,6 +350,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             com.offlineagent.core.runtime.chat.ComposerMode.AUTOMATION -> { runAutomation(chatId, text); return }
             else -> Unit
         }
+        // Phase 5b: multi-agent mode inside Chat (default AUTO: task-like requests → planner/agents, results stream here).
+        if (mode == com.offlineagent.core.runtime.chat.ComposerMode.CHAT && images.isEmpty() && useAgents(text)) { runOnyx(chatId, text); return }
         val s = g.settings.current()
         try {
             _ui.update { it.copy(streaming = Streaming(if (mode == com.offlineagent.core.runtime.chat.ComposerMode.CANVAS) AnswerMode.CANVAS_NEW else AnswerMode.MARKDOWN, phase = if (images.isNotEmpty()) "Loading vision model…" else "Loading model…")) }
@@ -373,6 +380,67 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------ message actions
 
     fun setMode(m: com.offlineagent.core.runtime.chat.ComposerMode) = _ui.update { it.copy(mode = m) }
+
+    // ------------------------------------------------------------ Phase 5b: ONYX agents in Chat
+
+    fun cycleAgentsMode() = _ui.update { it.copy(agents = AgentsMode.entries[(it.agents.ordinal + 1) % AgentsMode.entries.size]) }
+
+    private fun useAgents(text: String): Boolean = when (_ui.value.agents) {
+        AgentsMode.ON -> true
+        AgentsMode.OFF -> false
+        AgentsMode.AUTO -> com.offlineagent.core.agents.Triage.isTaskLike(text)
+    }
+
+    /** Runs the multi-agent orchestrator for a chat turn; the trace and the streaming answer render inside the message. */
+    private suspend fun runOnyx(chatId: Long, text: String) {
+        val conversation = turns(chatId).takeLast(6).joinToString("\n") { t -> (if (t.role == Role.USER) "User: " else "ONYX: ") + t.text.take(500) }
+        val msgId = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = KIND_ONYX, createdAt = System.currentTimeMillis()))
+        val done = kotlinx.coroutines.CompletableDeferred<com.offlineagent.core.agents.TaskCheckpoint>()
+        val res = g.onyx.start(text, conversation) { cp -> done.complete(cp) }
+        val runId = res.runId ?: run {
+            chats.message(msgId)?.let { chats.updateMessage(it.copy(error = res.error ?: "Could not start the agents.")) }
+            return
+        }
+        chats.message(msgId)?.let { chats.updateMessage(it.copy(runId = runId)) }
+        val cp = try { done.await() } catch (e: CancellationException) { g.onyx.cancel(); throw e }
+        finishOnyxMessage(msgId, cp)
+    }
+
+    private suspend fun finishOnyxMessage(msgId: Long, cp: com.offlineagent.core.agents.TaskCheckpoint) {
+        val m = chats.message(msgId) ?: return
+        val calls = g.onyx.board(cp.runId)?.eventLog()?.count { it is com.offlineagent.core.agents.ActivityEvent.ModelCall } ?: 0
+        val secs = ((cp.updatedAt - cp.createdAt) / 100) / 10.0
+        chats.updateMessage(m.copy(
+            text = cp.answer ?: "",
+            // What later chat turns see (plan, step results, answer): follow-ups never need to re-ask.
+            reasoning = com.offlineagent.core.agents.TaskContext.forChat(cp),
+            statsText = listOfNotNull(cp.route?.label, "$calls model call${if (calls == 1) "" else "s"}", "${secs}s").joinToString(" · "),
+            error = when (cp.status) {
+                com.offlineagent.core.agents.TaskStatus.FAILED -> "Task failed: ${cp.error ?: "unknown error"}"
+                com.offlineagent.core.agents.TaskStatus.CANCELLED -> "Stopped."
+                else -> null
+            },
+        ))
+        chats.touch(m.chatId, System.currentTimeMillis())
+    }
+
+    /**
+     * "Continue in chat" from Home: opens a new chat that already contains the request and the agents' result (with
+     * the plan, step outputs and context as hidden context for follow-ups). Nothing is re-asked or re-run.
+     */
+    fun continueFromTask(runId: String) {
+        if (busy) return notice("Wait for the current answer to finish (or press Stop).")
+        viewModelScope.launch {
+            val cp = g.onyx.board(runId)?.checkpoint() ?: g.onyx.taskStore.load(runId) ?: return@launch notice("That task is no longer available.")
+            openChat(null)
+            val chatId = ensureChat(cp.request)
+            val now = System.currentTimeMillis()
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "user", text = cp.request, createdAt = now))
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = cp.answer ?: "", kind = KIND_ONYX, runId = cp.runId,
+                reasoning = com.offlineagent.core.agents.TaskContext.forChat(cp), statsText = "continued from Home", createdAt = now + 1))
+            chats.touch(chatId, now)
+        }
+    }
 
     /** Regenerate an assistant answer: delete it (and anything after) and answer the same user turn again. */
     fun regenerate(assistantId: Long) {
@@ -448,6 +516,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             when {
                 m.role == "user" -> ChatMessage(Role.USER, m.text.ifBlank { "(photo)" })
                 m.kind == "canvas" && m.uiJson != null -> ChatMessage(Role.ASSISTANT, "(I showed a canvas: ${m.text})")
+                m.kind == KIND_ONYX && m.reasoning.isNotBlank() -> ChatMessage(Role.ASSISTANT, m.reasoning.take(1500))
                 m.text.isNotBlank() -> ChatMessage(Role.ASSISTANT, m.text.take(1500))
                 else -> null
             }
@@ -467,6 +536,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed a canvas: ${m.text})")
                 m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed this UI:)\n" + com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.uiJson?.let { j -> com.offlineagent.core.runtime.ui.OpenUiBridge.toOpenUiSource(j) } ?: m.text).take(1500))
                 m.kind == KIND_AUTOMATION -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(automation) ${m.text}".take(600))
+                m.kind == KIND_ONYX && (m.reasoning.isNotBlank() || m.text.isNotBlank()) -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, m.reasoning.ifBlank { m.text }.take(2000))
                 m.text.isNotBlank() -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT,
                     // OpenUI blocks cost many tokens: older answers are shown to the model as their visible text.
                     (if (com.offlineagent.core.openui.OpenUiMessage.hasProgram(m.text)) com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.text) else m.text).take(4000))
@@ -729,6 +799,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         g.inference.cancel()
         if (g.agents.isRunning) g.agents.cancel()
+        if (g.onyx.isRunning) g.onyx.cancel()
     }
 
     // ------------------------------------------------------------ canvas
@@ -803,6 +874,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         const val KIND_SUMMARY = "summary"
         const val DUPLICATE_WINDOW_MS = 1500L
         const val KIND_AUTOMATION = "automation"
+        /** Phase 5b: a multi-agent (ONYX) turn: runId → live trace; reasoning = task context for follow-ups. */
+        const val KIND_ONYX = "onyx"
         const val SYSTEM_PROMPT = com.offlineagent.core.runtime.chat.ChatPrompts.BASE
     }
 }

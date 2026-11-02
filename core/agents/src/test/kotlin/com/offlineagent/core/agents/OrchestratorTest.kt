@@ -226,7 +226,7 @@ class OrchestratorTest {
                 if (system.startsWith("You plan")) """{"steps":[{"tool":"device_info","goal":"read battery","after":[]}]}""" else error("model unloaded (low memory)")
         }
         val h = Harness(llm)
-        val b = Blackboard("r11", "battery?")
+        val b = Blackboard("r11", "check the battery and then tell me") // multi-step → planner route (5b)
         val cp = h.orchestrator.run(b.request, b)
         assertEquals(TaskStatus.COMPLETED, cp.status)
         assertTrue(cp.answer!!.contains("read battery")); assertTrue(cp.answer!!.contains("could not write"))

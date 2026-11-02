@@ -109,3 +109,13 @@
 - A task resumed in the background that needs approval waits 9 minutes (notification), then counts as declined.
 - Android does not allow toggling Wi-Fi/mobile data/airplane mode or reading other apps' data; ONYX opens Settings panels.
 - The Phase 1–4 chat agent and its key/value memory are unchanged and separate from the Phase 5 memories.
+
+## Phase 5b — see docs/PHASE5.md §10
+- The new agent trace, Agents chip in Chat, Home model card/onboarding and Agents catalogue are compiled but **not yet run on a phone**.
+- Small models still make content mistakes in the final answer (wrong weekday, "queued offline" invented on a retry);
+  the Verifier's model check is a yes/no from the same small model and can miss or over-flag.
+- Coverage repair and the rule planner are English keyword heuristics; unusual phrasing may still lose a step.
+- Planning and argument filling remain separate model calls (a planned 2-tool task ≈ 3–5 calls; simple requests 1).
+- After an app restart, old chat traces show saved states/outputs only (no live thoughts or call timings).
+- Chat "Agents: auto" sends any request with tool words (e.g. "explain how to set up Wi-Fi") to the agents; they answer
+  directly (1 call) but without the Chat mode's rich-UI prompt. Switch to "Agents: off" for pure chat.

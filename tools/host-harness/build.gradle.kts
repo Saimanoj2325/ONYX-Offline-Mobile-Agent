@@ -8,6 +8,7 @@ kotlin { jvmToolchain(17) }
 dependencies {
     implementation(project(":core:inference"))
     implementation(project(":core:runtime"))
+    implementation(project(":core:agents"))
     // Compiled Kotlin classes of :engine:llamacpp (LlamaCppEngine, LlamaNative). Build it first:
     //   ./gradlew :engine:llamacpp:assembleDebug
     implementation(files("../../engine/llamacpp/build/intermediates/aar_main_jar/debug/syncDebugLibJars/classes.jar"))
@@ -48,6 +49,15 @@ tasks.register<JavaExec>("runPhase3") {
 tasks.register<JavaExec>("runPhase4b") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.offlineagent.tools.Phase4bHarnessKt")
+    val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
+    jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
+    args(nativeDir)
+}
+
+// Phase 5b: end-to-end multi-agent orchestration on a real GGUF. Env: MODEL, THREADS, CTX, ONLY.
+tasks.register<JavaExec>("runPhase5b") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.offlineagent.tools.Phase5bHarnessKt")
     val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
     jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
     args(nativeDir)

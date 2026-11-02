@@ -65,7 +65,7 @@ fun TasksScreen(app: OfflineAgentApp, notify: (String) -> Unit, modifier: Modifi
             when (tab) {
                 0 -> {
                     val b = current
-                    if (b != null && onyx.isRunning) item { ActivityTimeline(b) }
+                    if (b != null && onyx.isRunning) item(key = b.runId) { AgentTraceCard(b, canAlwaysAllow = { onyx.pending.value?.canAlwaysAllow == true }, onApproval = { a, al -> onyx.answer(a, al) }) }
                     else item { Empty("Nothing running. Ask ONYX from Home.") }
                 }
                 1 -> if (resumable.isEmpty()) item { Empty("No interrupted tasks. If Android stops ONYX mid-task, it shows up here and resumes automatically.") }

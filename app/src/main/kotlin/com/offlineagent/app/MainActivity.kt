@@ -208,7 +208,7 @@ private fun AppRoot(
         } else androidx.compose.animation.Crossfade(tab, label = "tabs") { t ->
             when (t) {
                 Tab.HOME -> com.offlineagent.app.ui.onyx.HomeScreen(app, voice, speaker,
-                    onContinueInChat = { q -> vm.newChat(); vm.send(q); tab = Tab.CHAT }, onOpenAgents = { showSettings = true }, notify = notify, modifier = m)
+                    onContinueInChat = { runId -> vm.continueFromTask(runId); tab = Tab.CHAT }, onOpenAgents = { showSettings = true }, notify = notify, modifier = m)
                 Tab.CHAT -> ChatScreen(vm, onShare = { text -> launch(IntentRequest.Share(text)) }, onOpenSettings = { showSettings = true },
                     skillsHost = skillsHost, runsHost = runsHost, notify = notify, modifier = m)
                 Tab.TASKS -> com.offlineagent.app.ui.onyx.TasksScreen(app, notify, m)
@@ -221,7 +221,8 @@ private fun AppRoot(
     // Chat-agent approvals are cards in the chat thread; anywhere else they still need an answer.
     if (showSettings || tab != Tab.CHAT) pending?.let { ApprovalDialog(it, onAnswer = { allow, always -> app.agents.answerApproval(allow, always) }) }
     // Multi-agent (ONYX) confirmations: a bottom sheet over every screen.
-    onyxPending?.let { p -> com.offlineagent.app.ui.onyx.ApprovalSheet(p) { allow, always -> app.onyx.answer(allow, always) } }
+    // Phase 5b: on Home the same approval is inline in the agent trace, so the sheet is not stacked on top of it.
+    if (showSettings || tab != Tab.HOME) onyxPending?.let { p -> com.offlineagent.app.ui.onyx.ApprovalSheet(p) { allow, always -> app.onyx.answer(allow, always) } }
 }
 
 @Composable

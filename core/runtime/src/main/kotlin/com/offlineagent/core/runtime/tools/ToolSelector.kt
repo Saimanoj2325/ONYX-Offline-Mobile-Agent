@@ -11,7 +11,7 @@ object ToolSelector {
     val CORE = setOf("calculator", "get_datetime", "render_ui", "canvas_update")
 
     private val synonyms = mapOf(
-        "set_alarm" to "alarm wake morning clock", "set_timer" to "timer countdown minutes seconds", "set_reminder" to "remind reminder remember later notify",
+        "set_alarm" to "alarm wake morning clock", "set_timer" to "timer countdown minutes seconds", "set_reminder" to "remind reminder remember later notify", "schedule_exact_reminder" to "remind reminder later notify alarm at",
         "flashlight" to "torch flashlight light dark", "set_volume" to "volume loud quiet sound mute", "set_ringer_mode" to "silent vibrate ringer mute phone",
         "set_do_not_disturb" to "dnd disturb focus", "open_settings_panel" to "wifi wi-fi bluetooth location gps internet data nfc settings",
         "device_info" to "battery storage space ram memory phone model android charging", "take_photo" to "photo picture camera selfie capture",
@@ -27,6 +27,9 @@ object ToolSelector {
         "create_pdf" to "pdf export document report print save as pdf", "search_docs" to "documents my notes pdf search", "summarize" to "summarise summarize summary",
         "create_note" to "note save note jot", "share_text" to "share send to", "memory_write" to "remember about me preference", "memory_read" to "remember my preferences",
     )
+
+    /** Hand-written synonyms for a tool (empty when none). Phase 5b: also used by the multi-agent planner. */
+    fun hints(name: String): String = synonyms[name] ?: ""
 
     fun select(request: String, specs: List<ToolSpec>, max: Int = 10): List<ToolSpec> {
         if (specs.size <= max) return specs

@@ -70,6 +70,12 @@ data class RunCheckpoint(
 /** One grammar-constrained completion. Implemented over InferenceAdapter in the app; faked in tests. */
 interface AgentLlm {
     suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int): String
+    /**
+     * Phase 5b: like [complete], but reports the visible text generated so far (accumulated, thinking stripped) to
+     * [onPartial] as tokens arrive. Default for engines that cannot stream: one call with the final text.
+     */
+    suspend fun stream(system: String, user: String, grammar: String?, maxTokens: Int, onPartial: (String) -> Unit): String =
+        complete(system, user, grammar, maxTokens).also(onPartial)
 }
 
 interface RunStore {

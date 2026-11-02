@@ -107,10 +107,16 @@ fun AgentsScreen(app: OfflineAgentApp, onOpenSettings: () -> Unit, notify: (Stri
                         }
                     }
                     Text("All agents share one loaded model; it is never loaded twice.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Button(onClick = onOpenSettings) { Text("Models & downloads") }
+                    OutlinedButton(onClick = onOpenSettings) { Text("Import a file / model settings") }
                 }
                 Text("Inference queue: ${q.completed} calls done · ${q.queued} waiting · ${q.prefixReuses} prompt-cache reuses" + (q.pausedReason?.let { " · paused ($it)" } ?: ""),
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        // Phase 5b: the download catalogue lives here again — Download / Use / Delete with live progress.
+        item {
+            SectionCard("Models") {
+                com.offlineagent.app.ui.models.ModelCatalogContent(app, notify, onImport = onOpenSettings)
             }
         }
         item {

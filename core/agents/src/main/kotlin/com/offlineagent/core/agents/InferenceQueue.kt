@@ -5,6 +5,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 
 /**
  * The ONE door to the shared local model. Agents run in parallel coroutines, but llama.cpp has one context, so every
@@ -14,12 +18,22 @@ import kotlinx.coroutines.flow.asStateFlow
  *    still in the KV cache (the engine reuses the matching prefix), so it skips re-reading it;
  *  - then FIFO.
  * [pause] holds new jobs (thermal SEVERE+ or user pause); the running job is never interrupted.
+ *
+ * Phase 5b: the queue is RE-ENTRANT. A job that (indirectly) asks the queue again from inside its own block — e.g. a
+ * model-backed tool run through [run] whose implementation calls [complete] — runs inline instead of waiting for
+ * itself (which used to be a guaranteed deadlock). Approvals are never awaited while holding the queue: agents ask
+ * the user before/after model calls, not inside them.
  */
 class InferenceQueue(private val llm: AgentLlm) {
     enum class Priority(val weight: Int) { BACKGROUND(0), NORMAL(1), PLANNING(2), INTERACTIVE(3) }
 
     data class Stats(val completed: Int = 0, val queued: Int = 0, val running: Boolean = false, val prefixReuses: Int = 0,
-                     val maxDepth: Int = 0, val paused: Boolean = false, val pausedReason: String? = null)
+                     val maxDepth: Int = 0, val paused: Boolean = false, val pausedReason: String? = null,
+                     /** Prefix key / label of the job using the model right now (e.g. "planner", "writer"). */
+                     val runningLabel: String? = null)
+
+    /** Marks coroutines that currently hold this queue (re-entrancy). */
+    private class Holder(val queue: InferenceQueue) : AbstractCoroutineContextElement(Key) { companion object Key : CoroutineContext.Key<Holder> }
 
     private class Waiter(val priority: Priority, val prefixKey: String?, val seq: Long, val gate: CompletableDeferred<Unit>)
 
@@ -38,7 +52,13 @@ class InferenceQueue(private val llm: AgentLlm) {
     suspend fun complete(priority: Priority, prefixKey: String?, system: String, user: String, grammar: String?, maxTokens: Int): String =
         run(priority, prefixKey) { it.complete(system, user, grammar, maxTokens) }
 
-    suspend fun <T> run(priority: Priority, prefixKey: String?, block: suspend (AgentLlm) -> T): T {
+    /** Streaming variant: [onPartial] gets the accumulated visible text; [onStart] fires when the model is granted. */
+    suspend fun stream(priority: Priority, prefixKey: String?, system: String, user: String, grammar: String?, maxTokens: Int,
+                       onStart: () -> Unit = {}, onPartial: (String) -> Unit): String =
+        run(priority, prefixKey, onStart) { it.stream(system, user, grammar, maxTokens, onPartial) }
+
+    suspend fun <T> run(priority: Priority, prefixKey: String?, onStart: () -> Unit = {}, block: suspend (AgentLlm) -> T): T {
+        if (coroutineContext[Holder]?.queue === this) { onStart(); return block(llm) } // re-entrant call: we already hold the model
         val w: Waiter
         synchronized(lock) {
             w = Waiter(priority, prefixKey, seq++, CompletableDeferred())
@@ -56,11 +76,12 @@ class InferenceQueue(private val llm: AgentLlm) {
             throw e
         }
         try {
-            return block(llm)
+            onStart()
+            return withContext(Holder(this)) { block(llm) }
         } finally {
             synchronized(lock) {
                 busy = false
-                _stats.value = _stats.value.copy(completed = _stats.value.completed + 1, running = false)
+                _stats.value = _stats.value.copy(completed = _stats.value.completed + 1, running = false, runningLabel = null)
                 dispatchLocked()
             }
         }
@@ -81,7 +102,7 @@ class InferenceQueue(private val llm: AgentLlm) {
         val reuse = next.prefixKey != null && next.prefixKey == lastPrefix
         lastPrefix = next.prefixKey
         grantOrder += next.prefixKey
-        _stats.value = _stats.value.copy(queued = waiters.size, running = true, prefixReuses = _stats.value.prefixReuses + if (reuse) 1 else 0)
+        _stats.value = _stats.value.copy(queued = waiters.size, running = true, runningLabel = next.prefixKey, prefixReuses = _stats.value.prefixReuses + if (reuse) 1 else 0)
         next.gate.complete(Unit)
     }
 }

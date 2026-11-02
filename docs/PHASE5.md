@@ -160,7 +160,7 @@ Resume: `TaskCheckpoint` (plan + node states + blackboard facts) is saved to Roo
 * A background resume that needs approval waits up to 9 minutes (notification), then treats it as declined.
 * Only explicit "remember …" requests become memories automatically; other facts are not auto-extracted (deliberately conservative).
 * The Phase 5 database is separate (`onyx-agents.db`); the Phase 1–4 chat agent and its key/value memory still exist unchanged.
-* "Continue in chat" re-asks the request in a new chat (it does not move the multi-agent context into the chat).
+* ~~"Continue in chat" re-asks the request~~ — fixed in Phase 5b (§10): the task's plan, step results and answer are carried into the chat.
 * Release (R8) build not produced; only debug APKs.
 
 ## 7. Decisions (continuing DECISIONS.md)
@@ -186,3 +186,88 @@ Resume: `TaskCheckpoint` (plan + node states + blackboard facts) is saved to Roo
 8. Heat: run long tasks; at SEVERE thermal the queue shows "paused: cooling".
 9. Memory: add/edit/pin/delete/export; turn memory off and check recall says "turned off".
 10. Agents screen: tier = High (8 GB), recommended Qwen3 1.7B at 8K.
+
+## 10. Phase 5b — direct model downloads back on top, orchestration fixes, live multi-agent trace
+
+Feedback on Phase 5: (a) the multi-agent thinking UI was not good, (b) orchestration needed fixing, (c) "the direct model
+downloaders were deleted". They were not deleted — Phase 5 opened on Home, so Chat's first-run download sheet and picker
+were buried and Agents only had a "Models & downloads" button into Settings. 5b fixes all three.
+
+### 10.1 Model downloader (reuses `app.modelDownloads` / `core:models`, nothing re-implemented)
+* New `ui/models/ModelHub.kt` holds the downloader UI once; Chat, Home and Agents all use it.
+* **Home**: first launch without a chat model opens the onboarding sheet (recommended model for the phone's RAM,
+  one-tap download with live progress, "Paste a Hugging Face link", "All models"). Home always shows a **model card**:
+  live download progress + Cancel, or the active model with a switcher (installed models, "Download models…"), or a
+  one-tap download of the recommended model. Onboarding shows once across Home/Chat (`onyx.onboardingDismissed`).
+* **Agents**: a "Models" section lists the whole catalogue inline with **Download / Cancel / Use / Delete** (delete asks
+  first) and progress, other installed chat models (Use/Delete), the Hugging Face link field, and Import.
+* **Chat**: top-bar picker + "Download models…" sheet + download strip unchanged (now the shared sheet).
+* `OnyxRuntime.hasChatModel` follows the models table, so a finished download is picked up by the agents immediately.
+
+### 10.2 Orchestration fixes (`:core:agents`)
+| Problem found | Fix |
+|---|---|
+| Multi-agent mode only on Home | Chat composer has an **Agents** chip: *auto* (default — task-like requests go to the agents, `Triage.isTaskLike`), *on*, *off*. The trace and answer stream inside the chat message (`kind = "onyx"`). Earlier chat turns are passed as `conversation` to the Planner and Writer. |
+| "Continue in chat" re-asked the request | `ChatViewModel.continueFromTask(runId)` opens a chat with the request + the agents' answer; the message keeps `TaskContext.forChat(checkpoint)` (plan steps + statuses + tool outputs + recalled memory + answer) as hidden context for follow-ups. No model call, nothing re-run. |
+| Answer only appeared at the end | `AgentLlm.stream` (default = one shot; `InferenceAgentLlm` streams tokens) → `InferenceQueue.stream` → `modelCall()` writes into `Blackboard.live` (throttled to ≥ 50 ms per key in core). The Writer's answer streams token by token; the Planner's JSON streams as readable lines (`PlanPreview`); argument filling and the Verifier's check stream too. Final text is kept on the node (`NodeState.thought`), every call is logged as `ActivityEvent.ModelCall` with its real latency and wait time. |
+| Too many model calls for simple requests | **Fast paths** (`Triage.route`): *direct* (no tool words → Writer only, **1 call**), *rule fast path* (one obvious step with complete rule arguments → no planner call), else *planned*. **Verifier**: rules first on every node; the model double-check of the answer only runs when a contradiction is possible (a step failed / was declined / queued / skipped, or an action ran). |
+| Small planner merges or drops parts of a request (found by the e2e harness: "remind me at 7pm … and tell me tomorrow's plan" → one reminder step; "battery, torch and a note" → only device_info, and the Writer then **claimed** the torch was on) | Planner prompt asks for one step per thing with a short example; **coverage check** (`Coverage.repair`) adds a step for every clause whose best tool is missing and prefers complete rule arguments; **rule planner** fills reminders (`time` + `text`) and "tomorrow's plan" (calendar, 2 days); **ArgRepair** overrides a wrongly filled time with the one the user said ("7pm" → `19:00`; the model had copied the current time); **ClaimCheck** Verifier rule rejects answers that claim an action no DONE step performed (torch on, note saved, reminder set, event added, message sent) → the Writer retries with the issue fed back. |
+| Parallel approvals overwrote each other (one sheet, last write wins; the first waited until the 9-min timeout) and AWAITING status was toggled, not counted | Approvals are serialized per run (`Blackboard.approvalLock`) and counted (`approvalStarted/Ended`); the pending request is on the board (`awaiting`) for the inline card. Never awaited while holding the model queue. |
+| A model-backed tool run through the queue that calls the model again would wait for itself | `InferenceQueue` is **re-entrant** (coroutine-context holder). |
+| Resumed nodes inherited a used-up retry budget; retries invisible | Attempts are counted per run of a node (total kept for display); `NodeState.retryReason` ("↻ retry 2 — reason") and `issues` (Verifier) are surfaced live; re-delegation is shown. |
+| Stop left nodes "running" | Cancel marks unfinished nodes `SKIPPED ("stopped")`, clears live text and the approval, checkpoints `CANCELLED`; `OnyxRuntime.start(onFinished)` always reports the final checkpoint (Chat persists "Stopped."). |
+
+### 10.3 Multi-agent thinking UI (`ui/onyx/AgentTrace.kt`)
+* **AgentTraceCard** (Home, Chat messages, Tasks → Running): collapsible card; header with pulsing avatar of the active
+  agent, live status ("Device: Read battery…", "Waiting for your OK"), elapsed time, route · tool steps · model calls.
+* **Steps view** grouped by DAG level; parallel branches drawn as an indented "IN PARALLEL · n" bracket. Each row:
+  coloured agent avatar (P/M/C/D/V/E/W, pulses when active), goal, state icon with animated transitions — queued ○,
+  thinking (spinner), waiting for approval ⚠, done ✓, verified ✓✓, failed ✕, declined ✕, queued offline ↻, skipped —
+  plus "↻ retry n — reason", Verifier issues, re-delegation, and the **live model text** of that step (monospace, last
+  lines, tap to expand); finished steps have "Show output".
+* **Plan view**: numbered steps with agent, tool and dependencies ("after 1, 2"). While the planner runs, its real
+  streamed output is shown as readable steps.
+* **Inline approval card** inside the trace (risk pill, arguments, effect, Allow once / Deny / Always). The bottom sheet
+  still appears on other screens (not stacked on Home).
+* **Details** opens a full-screen view: per node input (goal/tool/args/deps), model output, tool result, error,
+  Verifier issues, attempts, duration; every model call with latency and output; the raw agent message log.
+* Performance: each row subscribes only to its own node and live entry (`map + distinctUntilChanged`), stable keys,
+  core-side throttling of token updates (50 ms), elapsed timer ticks only its own Text. Nothing is simulated: every
+  label, state and text comes from `Blackboard.state` / `Blackboard.live` / the event log.
+
+### 10.4 End-to-end harness (real model) — `docs/verification/phase5b-e2e.md`
+Real orchestrator + real GGUF via the JNI bridge, fake tools with the app's tool names/schemas. Sandbox host: 2 vCPU
+aarch64, model on a FUSE volume, timings noisy. Run A (Qwen3-1.7B Q8_0, quiet host):
+
+| Prompt | Route | Model calls | Total | Result |
+|---|---|---|---|---|
+| set a reminder at 7pm to call mom and tell me tomorrow's plan | planned + coverage | 3 (plan 6.8 s, answer 9.6 s, verify 5.9 s) | 23.0 s | reminder `19:00 "call mom"` ✓ + calendar ✓; answer mislabels the day ("Tuesday 2 Nov") |
+| summarise my notes about the hackathon | rule fast path | 1 | 10.2 s | good summary |
+| how's my battery? | rule fast path | 1 | 1.8 s | "Your battery is 64% and it's not charging." |
+| what is the capital of Australia? | direct | 1 | 1.5 s | "Canberra" |
+| check my battery, turn on the torch, and save a note saying torch test done | planned + coverage | 4 | 18.1 s | device_info + flashlight + create_note all ran, answer correct |
+
+All checks passed in every run (plan valid, all steps finished, verification ran, answer produced) for 1.7B and 0.6B.
+Honest quality notes: Run B (same model, final code, contended host) — the Verifier rejected a date mistake, and the
+Writer's retry invented "queued offline" (5 calls, 113 s on a loaded host). 0.6B plans poorly (empty plan → rules took
+over) and its answers contain small factual slips. Before the 5b fixes (Run 0) the 1.7B planner dropped steps and the
+Writer claimed actions that never ran — now caught by coverage repair and ClaimCheck.
+
+### 10.5 Tests
+257/257 JVM tests (agents 51 · runtime 112 · inference 45 · openui 29 · models 16 · mcp-http 4). New in `:core:agents`
+(`Phase5bTest.kt`, 18): fast paths (direct = 1 model call, rule path skips the planner and the model check, multi-step
+uses the planner, triage), streaming (Writer tokens stream throttled and the final text is kept, readable planner
+stream, planner thought stored), continue-in-chat context (task context carries steps/outputs/answer; conversation
+reaches planner and writer), no-deadlock (re-entrant queue; parallel actions with slow approvals finish, ask one at a
+time, one model call at a time; cancel while waiting for approval → CANCELLED, nothing left running, action not
+executed; retry reason surfaced; cancelling a paused-queue waiter), plan repair (time parsing, wrong-time repair,
+coverage, claim check). Two Phase 5 tests were adjusted to the new routing (a "battery?" request now takes the rule
+fast path, so the planner-failure test uses a multi-step request).
+
+### 10.6 Still not done / untested
+* Nothing of 5b has run on a phone yet (UI feel, scroll/jank, streaming speed on the OnePlus CPH2569).
+* Planner + argument filling are still separate calls (merging them needs a union grammar of all tool schemas).
+* The Verifier's model check can still accept a slightly wrong answer, and a Writer retry can make it worse (Run B).
+* Clause splitting / coverage are English keyword heuristics.
+* Trace of a chat message after an app restart is rebuilt from the saved checkpoint (states, outputs), but live
+  thoughts and model-call timings of old runs are not persisted.

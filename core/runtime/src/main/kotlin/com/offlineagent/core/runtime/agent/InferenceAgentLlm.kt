@@ -24,7 +24,12 @@ class InferenceAgentLlm(
     private val onPartial: ((String) -> Unit)? = null,
     private val onPrompt: ((done: Int, total: Int) -> Unit)? = null,
 ) : AgentLlm {
-    override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int): String {
+    override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int): String = generate(system, user, grammar, maxTokens, null)
+
+    override suspend fun stream(system: String, user: String, grammar: String?, maxTokens: Int, onPartial: (String) -> Unit): String =
+        generate(system, user, grammar, maxTokens, onPartial)
+
+    private suspend fun generate(system: String, user: String, grammar: String?, maxTokens: Int, extra: ((String) -> Unit)?): String {
         val sb = StringBuilder()
         var n = 0
         adapter.generate(
@@ -39,7 +44,10 @@ class InferenceAgentLlm(
             when (ev) {
                 is GenerationEvent.Token -> {
                     sb.append(ev.text); onToken(++n)
-                    onPartial?.invoke(ThinkSplitter.split(sb.toString()).answer)
+                    if (onPartial != null || extra != null) {
+                        val visible = ThinkSplitter.split(sb.toString()).answer
+                        onPartial?.invoke(visible); extra?.invoke(visible)
+                    }
                 }
                 is GenerationEvent.PromptProgress -> onPrompt?.invoke(ev.done, ev.total)
                 else -> Unit

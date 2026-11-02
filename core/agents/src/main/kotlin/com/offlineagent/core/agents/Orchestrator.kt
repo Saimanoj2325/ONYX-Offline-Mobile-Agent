@@ -73,9 +73,19 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
 
     suspend fun run(request: String, board: Blackboard): TaskCheckpoint = guarded(board) {
         board.working(AgentRole.ORCHESTRATOR, "Understanding your request")
-        board.working(AgentRole.PLANNER, "Planning")
-        val plan = planner.plan(request, board).let { p -> if (p.problems().isEmpty()) p else PlannerAgent.assemble(request, emptyList(), "fallback") }
-        board.working(AgentRole.PLANNER, null)
+        // Phase 5b fast paths: skip the planner model when the request is a plain question (DIRECT) or one obvious
+        // tool step with complete arguments (RULES). Only multi-step / ambiguous requests pay for a planning call.
+        val (route, ruleSteps) = Triage.route(request, deps.tools.specs(), deps.queue != null)
+        board.setRoute(route)
+        val plan = when (route) {
+            Route.DIRECT -> PlannerAgent.assemble(request, emptyList(), "direct")
+            Route.RULES, Route.FALLBACK -> PlannerAgent.assemble(request, ruleSteps, if (route == Route.RULES) "rules (fast path)" else "rules", RulePlanner.wantsScreen(request))
+            Route.PLANNED -> {
+                board.working(AgentRole.PLANNER, "Planning")
+                try { planner.plan(request, board) } finally { board.working(AgentRole.PLANNER, null) }
+            }
+        }.let { p -> if (p.problems().isEmpty()) p else PlannerAgent.assemble(request, emptyList(), "fallback") }
+        board.note("Route: ${route.label} · ${plan.nodes.count { it.id.startsWith("s") }} tool step(s)")
         board.setPlan(plan)
         board.setStatus(TaskStatus.RUNNING)
         deps.store.save(board.checkpoint())
@@ -121,15 +131,20 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
     private suspend fun runNode(node: TaskNode, board: Blackboard) {
         var role = node.agent
         var lastError: String? = null
-        var attempt = board.node(node.id)?.attempts ?: 0
+        // Attempts are counted per run of this node (a resumed node gets its full retry budget again); the stored
+        // counter keeps the total for display.
+        val prior = board.node(node.id)?.attempts ?: 0
+        var tries = 0
+        var total = 0
         val now = deps.clock
-        board.updateNode(node.id) { it.copy(status = NodeStatus.RUNNING, startedAt = now(), error = null) }
+        board.updateNode(node.id) { it.copy(status = NodeStatus.RUNNING, startedAt = now(), error = null, retryReason = null, issues = emptyList()) }
         while (true) {
-            attempt++
+            tries++; total++
+            val attempt = total
             val agent = agents[role] ?: error("no agent for $role")
             board.message(AgentMessage.Delegate(AgentRole.ORCHESTRATOR, role, node, attempt))
             board.working(role, node.goal)
-            board.updateNode(node.id) { it.copy(attempts = attempt) }
+            board.updateNode(node.id) { it.copy(attempts = prior + total, status = NodeStatus.RUNNING) }
             val outcome = try {
                 agent.handle(if (role == node.agent) node else node.copy(agent = role), board, attempt, lastError)
             } catch (e: CancellationException) { throw e } catch (e: Exception) {
@@ -141,14 +156,18 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
                     val report = if (node.verify) {
                         board.updateNode(node.id) { it.copy(status = NodeStatus.VERIFYING) }
                         board.working(AgentRole.VERIFIER, "Checking: ${node.goal}")
-                        verifier.verify(node.copy(agent = role), outcome, board).also { board.working(AgentRole.VERIFIER, null) }
+                        try { verifier.verify(node.copy(agent = role), outcome, board) } finally { board.working(AgentRole.VERIFIER, null) }
                     } else null
-                    if (report != null) board.message(AgentMessage.Verification(AgentRole.VERIFIER, AgentRole.ORCHESTRATOR, node.id, report.passed, report.issues))
+                    if (report != null) {
+                        board.message(AgentMessage.Verification(AgentRole.VERIFIER, AgentRole.ORCHESTRATOR, node.id, report.passed, report.issues))
+                        board.updateNode(node.id) { it.copy(issues = report.issues) }
+                    }
                     // The Writer's last attempt is kept even if unverified (marked), so the user always gets an answer.
-                    val lastTry = attempt >= config.maxAttempts
+                    val lastTry = tries >= config.maxAttempts
                     if (report == null || report.passed || (node.agent == AgentRole.WRITER && lastTry)) {
                         board.message(AgentMessage.Result(role, AgentRole.ORCHESTRATOR, node.id, outcome.output.take(300), outcome.data))
-                        board.updateNode(node.id) { it.copy(status = NodeStatus.DONE, output = outcome.output, verified = report?.passed, endedAt = now(), delegatedTo = role.takeIf { r -> r != node.agent }) }
+                        board.updateNode(node.id) { it.copy(status = NodeStatus.DONE, output = outcome.output, verified = report?.passed, endedAt = now(),
+                            retryReason = null, delegatedTo = role.takeIf { r -> r != node.agent }) }
                         break
                     }
                     lastError = report.issues.joinToString("; ")
@@ -156,27 +175,30 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
                 is NodeOutcome.Fail -> {
                     board.message(AgentMessage.Failure(role, AgentRole.ORCHESTRATOR, node.id, outcome.error, outcome.retryable))
                     lastError = outcome.error
-                    if (!outcome.retryable) attempt = maxOf(attempt, config.maxAttempts)
+                    if (!outcome.retryable) tries = maxOf(tries, config.maxAttempts)
                 }
                 is NodeOutcome.Denied -> {
-                    board.updateNode(node.id) { it.copy(status = NodeStatus.DENIED, error = outcome.reason, endedAt = now()) }
+                    board.updateNode(node.id) { it.copy(status = NodeStatus.DENIED, error = outcome.reason, endedAt = now(), retryReason = null) }
                     break
                 }
                 is NodeOutcome.Queued -> {
-                    board.updateNode(node.id) { it.copy(status = NodeStatus.QUEUED_OFFLINE, output = outcome.note, endedAt = now()) }
+                    board.updateNode(node.id) { it.copy(status = NodeStatus.QUEUED_OFFLINE, output = outcome.note, endedAt = now(), retryReason = null) }
                     break
                 }
             }
-            if (attempt >= config.maxAttempts) {
+            if (tries >= config.maxAttempts) {
                 val fb = fallbackFor(node)
                 if (fb != null && role == node.agent) {
                     board.note("${role.title} could not finish \"${node.goal}\"; re-delegating to ${fb.title}")
+                    board.updateNode(node.id) { it.copy(retryReason = "re-delegated to ${fb.title}: ${lastError?.take(100)}", delegatedTo = fb) }
                     role = fb
+                    tries = config.maxAttempts - 1 // the fallback agent gets one attempt
                     continue
                 }
-                board.updateNode(node.id) { it.copy(status = NodeStatus.FAILED, error = lastError, endedAt = now()) }
+                board.updateNode(node.id) { it.copy(status = NodeStatus.FAILED, error = lastError, endedAt = now(), retryReason = null) }
                 break
             }
+            board.updateNode(node.id) { it.copy(retryReason = lastError?.take(160)) }
         }
         deps.store.save(board.checkpoint())
     }

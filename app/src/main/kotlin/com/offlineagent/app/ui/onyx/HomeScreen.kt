@@ -67,7 +67,7 @@ private val SUGGESTIONS = listOf(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun HomeScreen(app: OfflineAgentApp, voice: VoiceInput, speaker: Speaker, onContinueInChat: (String) -> Unit, onOpenAgents: () -> Unit, notify: (String) -> Unit, modifier: Modifier = Modifier) {
+fun HomeScreen(app: OfflineAgentApp, voice: VoiceInput, speaker: Speaker, onContinueInChat: (runId: String) -> Unit, onOpenAgents: () -> Unit, notify: (String) -> Unit, modifier: Modifier = Modifier) {
     val onyx = app.onyx
     val board by onyx.current.collectAsState()
     val online by onyx.monitor.online.collectAsState()
@@ -119,12 +119,22 @@ fun HomeScreen(app: OfflineAgentApp, voice: VoiceInput, speaker: Speaker, onCont
             if (qstats.paused) Pill("Model paused: cooling", cs.error)
             Pill(if (voice.offlineGuaranteed) "On-device speech" else "Speech: offline pack not guaranteed", if (voice.offlineGuaranteed) OfflineGreen else NetworkAmber)
         }
-        if (!hasModel) Surface(shape = MaterialTheme.shapes.medium, color = cs.errorContainer.copy(alpha = 0.4f)) {
-            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("No chat model yet: ONYX uses simple rules only. Download one for planning and answers.", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                TextButton(onClick = onOpenAgents) { Text("Models") }
+        // Phase 5b: direct model downloading on Home — active model + switcher, live download progress, or one-tap
+        // download of the recommended model; first launch without a model opens the onboarding sheet.
+        var modelsSheet by rememberSaveable { mutableStateOf(false) }
+        var onboarding by rememberSaveable { mutableStateOf(false) }
+        val dismissed by onyx.onboardingDismissed.collectAsState()
+        val downloads by app.modelDownloads.states.collectAsState()
+        LaunchedEffect(hasModel, dismissed) {
+            if (!hasModel && !dismissed && downloads.values.none { it.active }) {
+                kotlinx.coroutines.delay(600)
+                if (!onyx.hasChatModel.value) onboarding = true
             }
         }
+        com.offlineagent.app.ui.models.ModelCard(app, onOpenModels = { modelsSheet = true }, notify = notify)
+        if (onboarding) com.offlineagent.app.ui.models.OnboardingSheet(app, onDismiss = { onboarding = false; onyx.onboardingDismissed.value = true },
+            onMore = { onboarding = false; onyx.onboardingDismissed.value = true; modelsSheet = true })
+        if (modelsSheet) com.offlineagent.app.ui.models.ModelsSheet(app, onDismiss = { modelsSheet = false }, notify = notify)
 
         val b = board
         AnimatedContent(b == null, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "home") { idle ->
@@ -139,9 +149,22 @@ fun HomeScreen(app: OfflineAgentApp, voice: VoiceInput, speaker: Speaker, onCont
                 }
             } else if (b != null) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    ActivityTimeline(b, onContinueInChat = onContinueInChat, onSpeak = { speaker.speak(it) })
+                    Text(b.request, style = MaterialTheme.typography.titleMedium, maxLines = 3)
+                    AgentTraceCard(b, initiallyExpanded = true, canAlwaysAllow = { onyx.pending.value?.canAlwaysAllow == true },
+                        onApproval = { allow, always -> onyx.answer(allow, always) })
+                    val answer = liveAnswer(b)
+                    val bst by b.state.collectAsState()
+                    if (answer.isNotBlank()) Surface(shape = MaterialTheme.shapes.large, color = cs.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(14.dp)) {
+                            com.offlineagent.app.ui.markdown.MarkdownView(answer)
+                            if (bst.status.isTerminal) Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                TextButton(onClick = { onContinueInChat(b.runId) }) { Text("Continue in chat") }
+                                TextButton(onClick = { speaker.speak(answer) }) { Text("Read aloud") }
+                            }
+                        }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (onyx.isRunning) OutlinedButton(onClick = { onyx.cancel() }) { Text("Stop") }
+                        if (onyx.isRunning && !bst.status.isTerminal) OutlinedButton(onClick = { onyx.cancel() }) { Text("Stop") }
                         else OutlinedButton(onClick = { onyx.dismissCurrent() }) { Text("New task") }
                     }
                 }

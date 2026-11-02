@@ -48,9 +48,11 @@ Earlier design: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/PHASE3.md`, `
 
 | Area | Status |
 |---|---|
-| JVM unit tests (`:core:agents`, `:core:runtime`, `:core:inference`, `:core:openui`, `:core:models`, `:core:mcp-http`) | ✅ 239/239 pass in the sandbox (agents 33 · runtime 112 · inference 45 · openui 29 · models 16 · mcp-http 4) |
+| JVM unit tests (`:core:agents`, `:core:runtime`, `:core:inference`, `:core:openui`, `:core:models`, `:core:mcp-http`) | ✅ 257/257 pass in the sandbox (agents 51 · runtime 112 · inference 45 · openui 29 · models 16 · mcp-http 4) — Phase 5b |
+| Multi-agent orchestrator end-to-end on a real GGUF (Qwen3-1.7B / 0.6B, host harness, fake device tools) | ✅ 5/5 prompts complete with valid plans, executed steps, verification and an answer (`docs/verification/phase5b-e2e.md`); answer quality has small slips (see PHASE5 §10.4) |
+| Phase 5b UI (agent trace in Chat/Home, Agents chip, model card/onboarding on Home, catalogue on Agents) | ⚠️ compiles into both APKs; **not run on a device or emulator** |
 | Debug APKs, both flavors (`offline`, `connected`) | ✅ compile and package in the sandbox (aarch64 host, community NDK/aapt2 build) |
-| llama.cpp JNI + real GGUF on an ARM64 Linux host (Phase 2–4b harness) | ✅ earlier phases; not re-run for Phase 5 |
+| llama.cpp JNI + real GGUF on an ARM64 Linux host (Phase 2–4b harness) | ✅ earlier phases; Phase 5b harness above uses the same bridge |
 | **Anything on a real phone** (UI, speed, RAM, heat, voice, TTS, WorkManager resume, outbox, alarms, brightness, calendar insert, accessibility, autofill) | ❌ **untested** — first device: OnePlus CPH2569 (8 GB); checklist in `docs/PHASE5.md` §9 and `docs/DEVICE_TEST_PLAN.md` |
 | Release (R8) build | ❌ not built |
 
@@ -205,6 +207,7 @@ memory → `docs/DEVICE_TEST_PLAN.md` §9–§16.
 
 Host harness: `tools/host-harness/build-native.sh <dir>`, `./gradlew :engine:llamacpp:assembleDebug`, then
 `MODEL=… EMBED=… VLM=… MMPROJ=… ./gradlew -PhostHarness :tools:host-harness:runPhase2 -PnativeDir=<dir>/llama/bin`.
+Phase 5b multi-agent end-to-end: `MODEL=… ./gradlew -PhostHarness :tools:host-harness:runPhase5b -PnativeDir=<dir>/llama/bin` (results: `docs/verification/phase5b-e2e.md`).
 
 ## Licences
 
