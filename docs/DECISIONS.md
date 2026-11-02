@@ -217,3 +217,9 @@ An in-app "Open-source licences" screen is a Phase 8 (release) item.
 - No OkHttp: one class, testable against the JDK's HttpServer. Manual redirects so every hop is checked against the HF
   allow-list and Range headers survive the CDN hop. WorkManager foreground job survives the app going to background;
   no network constraint (that would need ACCESS_NETWORK_STATE, which the offline flavor strips).
+
+## D21–D24 (Phase 5)
+- **D21** ACCESS_NETWORK_STATE in both flavors (online/offline badge + WorkManager CONNECTED constraint for the outbox). Wi-Fi state and change-network permissions stay stripped in `offline`.
+- **D22** Phase 5 state in a separate Room database `onyx-agents.db` (the Phase 1–4 DB is version 1 without migrations; no risk to chats).
+- **D23** `:core:agents` is pure Kotlin; Android supplies ports (tools, memory, context, approvals, network, outbox, audit, task store). Plan-and-execute DAG + blackboard + one serialized inference queue (priority, prefix affinity, thermal pause).
+- **D24** Executor actions are never re-delegated or retried after a denial; every action with risk > NONE asks unless the user "always allowed" a LOW/MEDIUM tool; HIGH/CRITICAL never auto-allowed.

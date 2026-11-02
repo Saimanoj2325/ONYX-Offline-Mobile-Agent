@@ -11,7 +11,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -21,6 +21,9 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -68,13 +71,29 @@ import kotlinx.coroutines.launch
 
 class MainActivity : androidx.fragment.app.FragmentActivity() {
     private val chatVm: ChatViewModel by viewModels()
+    /** Notification taps ("open" extra): onyx → Home, onyx-tasks → Tasks. */
+    private val openRequests = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    private var speaker: com.offlineagent.app.onyx.Speaker? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val app = application as OfflineAgentApp
-        setContent { AppTheme { AppRoot(app, chatVm, ::launchIntent) } }
+        openRequests.value = intent?.getStringExtra("open")
+        val voice = com.offlineagent.app.onyx.VoiceInput(this)
+        val sp = com.offlineagent.app.onyx.Speaker(this).also { speaker = it }
+        setContent {
+            val prefs by app.onyx.prefs.values.collectAsStateWithLifecycle()
+            com.offlineagent.app.ui.theme.OnyxTheme(prefs.theme, prefs.dynamicColor) { AppRoot(app, chatVm, ::launchIntent, voice, sp, openRequests) }
+        }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        openRequests.value = intent.getStringExtra("open")
+    }
+
+    override fun onDestroy() { speaker?.shutdown(); super.onDestroy() }
 
     /**
      * Outgoing intents. Every one was approved by the user in the tool-approval dialog (share, calendar, phone actions:
@@ -95,22 +114,26 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
     }
 }
 
+private enum class Tab(val label: String) { HOME("Home"), CHAT("Chat"), TASKS("Tasks"), MEMORY("Memory"), AGENTS("Agents") }
+
 @Composable
-private fun AppTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
-    val ctx = LocalContext.current
-    val scheme = if (android.os.Build.VERSION.SDK_INT >= 31) {
-        if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
-    } else {
-        if (dark) darkColorScheme() else lightColorScheme()
-    }
-    MaterialTheme(colorScheme = scheme, content = content)
+private fun TabIcon(t: Tab) = when (t) {
+    Tab.HOME -> Icon(androidx.compose.material.icons.Icons.Default.Home, null)
+    Tab.CHAT -> Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.Send, null)
+    Tab.TASKS -> Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.List, null)
+    Tab.MEMORY -> Icon(androidx.compose.material.icons.Icons.Default.Star, null)
+    Tab.AGENTS -> Icon(androidx.compose.material.icons.Icons.Default.Settings, null)
 }
 
 @Composable
-private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequest) -> Unit) {
+private fun AppRoot(
+    app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequest) -> Unit,
+    voice: com.offlineagent.app.onyx.VoiceInput, speaker: com.offlineagent.app.onyx.Speaker,
+    openRequests: kotlinx.coroutines.flow.MutableStateFlow<String?>,
+) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val pending by app.agents.pending.collectAsStateWithLifecycle()
+    val onyxPending by app.onyx.pending.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val notify: (String) -> Unit = { msg -> scope.launch { snackbar.showSnackbar(msg) } }
@@ -118,6 +141,7 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
     LaunchedEffect(ui.notice) { ui.notice?.let { snackbar.showSnackbar(it); vm.notice(null) } }
     LaunchedEffect(Unit) { app.intents.requests.collect { launch(it) } }
     LaunchedEffect(Unit) { app.launcher.requests.collect { launch(it) } }
+    LaunchedEffect(Unit) { app.onyx.speakRequests.collect { speaker.speak(it) } }
     // take_photo tool: open the camera, attach the photo to the current chat.
     var camFile by remember { mutableStateOf<java.io.File?>(null) }
     val camera = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.TakePicture()) { ok ->
@@ -157,24 +181,47 @@ private fun AppRoot(app: OfflineAgentApp, vm: ChatViewModel, launch: (IntentRequ
         }
     }
 
-    // Phase 4: the chat is the whole app; Settings is the only other screen (from the drawer).
+    // Phase 5: bottom navigation (Home · Chat · Tasks · Memory · Agents); the Phase 4 Settings screen opens on top.
+    var tab by rememberSaveable { mutableStateOf(Tab.HOME) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
-    Scaffold(snackbarHost = { SnackbarHost(snackbar) }, contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0)) { padding ->
-        val m = Modifier.padding(padding)
+    val open by openRequests.collectAsStateWithLifecycle()
+    LaunchedEffect(open) {
+        when (open) { "onyx" -> tab = Tab.HOME; "onyx-tasks" -> tab = Tab.TASKS }
+        openRequests.value = null
+    }
+    androidx.activity.compose.BackHandler(enabled = !showSettings && tab != Tab.HOME) { tab = Tab.HOME }
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbar) },
+        bottomBar = {
+            if (!showSettings) NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+                Tab.entries.forEach { t -> NavigationBarItem(selected = tab == t, onClick = { tab = t }, icon = { TabIcon(t) }, label = { Text(t.label) }) }
+            }
+        },
+    ) { padding ->
+        val m = Modifier.padding(padding).consumeWindowInsets(padding)
         if (showSettings) {
             androidx.activity.compose.BackHandler { showSettings = false }
-            Column(m.fillMaxSize().statusBarsPadding()) {
-                TextButton(onClick = { showSettings = false }) { Text("‹ Back to chat") }
+            Column(m.fillMaxSize()) {
+                TextButton(onClick = { showSettings = false }) { Text("‹ Back") }
                 com.offlineagent.app.settings.SettingsScreen(app, notify, Modifier.weight(1f))
             }
-        } else {
-            ChatScreen(vm, onShare = { text -> launch(IntentRequest.Share(text)) }, onOpenSettings = { showSettings = true },
-                skillsHost = skillsHost, runsHost = runsHost, notify = notify, modifier = m)
+        } else androidx.compose.animation.Crossfade(tab, label = "tabs") { t ->
+            when (t) {
+                Tab.HOME -> com.offlineagent.app.ui.onyx.HomeScreen(app, voice, speaker,
+                    onContinueInChat = { q -> vm.newChat(); vm.send(q); tab = Tab.CHAT }, onOpenAgents = { showSettings = true }, notify = notify, modifier = m)
+                Tab.CHAT -> ChatScreen(vm, onShare = { text -> launch(IntentRequest.Share(text)) }, onOpenSettings = { showSettings = true },
+                    skillsHost = skillsHost, runsHost = runsHost, notify = notify, modifier = m)
+                Tab.TASKS -> com.offlineagent.app.ui.onyx.TasksScreen(app, notify, m)
+                Tab.MEMORY -> com.offlineagent.app.ui.onyx.MemoryScreen(app, launch, m)
+                Tab.AGENTS -> com.offlineagent.app.ui.onyx.AgentsScreen(app, onOpenSettings = { showSettings = true }, notify = notify, modifier = m)
+            }
         }
     }
 
-    // Approvals are cards in the chat thread; while Settings is open they still need an answer.
-    if (showSettings) pending?.let { ApprovalDialog(it, onAnswer = { allow, always -> app.agents.answerApproval(allow, always) }) }
+    // Chat-agent approvals are cards in the chat thread; anywhere else they still need an answer.
+    if (showSettings || tab != Tab.CHAT) pending?.let { ApprovalDialog(it, onAnswer = { allow, always -> app.agents.answerApproval(allow, always) }) }
+    // Multi-agent (ONYX) confirmations: a bottom sheet over every screen.
+    onyxPending?.let { p -> com.offlineagent.app.ui.onyx.ApprovalSheet(p) { allow, always -> app.onyx.answer(allow, always) } }
 }
 
 @Composable

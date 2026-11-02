@@ -1,4 +1,60 @@
-# Offline-First Android Agent — Phase 4b
+# ONYX — Offline-First Mobile Agent (Android)
+
+ONYX is a native Android assistant (Kotlin + Jetpack Compose, Material 3) that runs a local **GGUF** language model on the
+phone's CPU through llama.cpp (JNI) and acts on the phone through approval-gated tools. **Inference, memory, planning and
+device actions run on the device**; the network is used only to download models (and, in the separate *connected*
+build, for remote MCP servers and `fetch_url`). No cloud LLM, no telemetry.
+
+> **Status (Phase 5, Nov 2026): built and unit-tested in a Linux sandbox; NOT yet tested on a real phone.**
+> See "Tested / untested" below before relying on anything.
+
+## What it does
+
+- **Multi-agent runtime on ONE model (Phase 5)** — an Orchestrator plans a task graph and delegates to specialised
+  agents: Planner, Memory, Context, Device, Verifier, Executor (+ Writer). Independent branches run in parallel
+  coroutines; every model call goes through a single serialized inference queue (priority + prompt-prefix reuse +
+  thermal pause). Typed messages, a shared blackboard, retries with error feedback, re-delegation and verification.
+- **Resumable tasks** — every step is checkpointed in Room; a WorkManager job resumes tasks interrupted by process death.
+- **User-controlled memory** — view, add, edit, pin, delete, export, or switch memory off. Local RAG over your documents.
+- **Device integration** — voice input (on-device SpeechRecognizer when available) and text-to-speech; alarms, timers,
+  exact reminders, calendar, contacts, notifications (read with opt-in access; post), files (SAF + Downloads), torch,
+  volume, ringer, DND, brightness, settings panels, app launching, message/call drafts, screen reading/automation
+  (AccessibilityService, opt-in), form autofill from an encrypted vault.
+- **Offline-first outbox** — actions that need the internet are queued when offline and run automatically when a
+  validated connection returns (WorkManager `NetworkType.CONNECTED`). Every tool is badged **Offline** or **Needs network**.
+- **Privacy & safety** — risk levels (None → Irreversible), confirmation bottom sheet for every action and sensitive read,
+  high-risk actions can never be "always allowed", audit log, banking/payment apps blocked for automation.
+- **Device-aware runtime** — tier from RAM/cores/SoC, recommended model + context + threads, thermal-status listener
+  (pauses model work when the phone is hot), battery-saver aware.
+- **New UI** — dark-first Material You: Home (greeting, voice orb, suggestion chips, live agent-activity timeline),
+  Chat (Phase 4 ChatGPT-style chat with OpenUI/Canvas answers), Tasks (running · resumable · history · outbox),
+  Memory, Agents (device tier, model picks, agent roster, tool badges, permissions, audit log).
+
+## Architecture (short)
+
+```mermaid
+flowchart LR
+  UI[Compose UI: Home · Chat · Tasks · Memory · Agents] --> OR[OnyxRuntime: Android ports + WorkManager]
+  OR --> AG[":core:agents: Orchestrator · Planner · Memory · Context · Device · Verifier · Executor · Writer · Blackboard · DAG · InferenceQueue"]
+  AG --> RT[":core:runtime: tools · policy · RAG · skills · schema/GBNF"]
+  RT --> INF[":core:inference"] --> ENG[":engine:llamacpp: JNI → llama.cpp"]
+  OR --> DB[(Room: onyx-agents.db + offline-agent.db)]
+```
+
+Full diagram, research notes, requirements and the offline/network capability table: **`docs/PHASE5.md`**.
+Earlier design: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/PHASE3.md`, `docs/PHASE4.md`.
+
+## Tested / untested (honest status)
+
+| Area | Status |
+|---|---|
+| JVM unit tests (`:core:agents`, `:core:runtime`, `:core:inference`, `:core:openui`, `:core:models`, `:core:mcp-http`) | ✅ 239/239 pass in the sandbox (agents 33 · runtime 112 · inference 45 · openui 29 · models 16 · mcp-http 4) |
+| Debug APKs, both flavors (`offline`, `connected`) | ✅ compile and package in the sandbox (aarch64 host, community NDK/aapt2 build) |
+| llama.cpp JNI + real GGUF on an ARM64 Linux host (Phase 2–4b harness) | ✅ earlier phases; not re-run for Phase 5 |
+| **Anything on a real phone** (UI, speed, RAM, heat, voice, TTS, WorkManager resume, outbox, alarms, brightness, calendar insert, accessibility, autofill) | ❌ **untested** — first device: OnePlus CPH2569 (8 GB); checklist in `docs/PHASE5.md` §9 and `docs/DEVICE_TEST_PLAN.md` |
+| Release (R8) build | ❌ not built |
+
+## Feature history (Phases 1–4b)
 
 A native Android app (Kotlin + Jetpack Compose, Material 3) that runs local **GGUF** models **fully offline** on the
 phone's CPU, with:
@@ -55,12 +111,13 @@ and `phase2-host-harness.txt` (real-model test output).
 ## Repository layout
 
 ```
-app/                 Compose UI: one chat screen (ui/chat) + OpenUI renderer (ui/openui) + Settings; downloader worker (models/); diagnostics (diag/)
+app/                 Compose UI: Home/Tasks/Memory/Agents (ui/onyx) + Phase 5 runtime (onyx/) + chat screen (ui/chat) + OpenUI renderer (ui/openui) + Settings; downloader worker (models/); diagnostics (diag/)
 core/openui/         Pure Kotlin OpenUI Lang: streaming parser, library, resolver, forms, prompt generator, GBNF (+ tests)
 core/models/         Pure JVM model catalogue + resumable, verified Hugging Face downloader (+ fake-server tests)
 core/inference/      Pure Kotlin: InferenceAdapter/TokenEngine, templates, grammar/images in requests, EmbeddingService
+core/agents/         Pure Kotlin (Phase 5): orchestrator, agents, task DAG, blackboard, inference queue, outbox, runtime selector (+ tests)
 core/runtime/        Pure Kotlin: UI schema+GBNF+validation, markdown, RAG maths, skills, tools, policy, agent loop (+ tests)
-core/data/           Room database + DataStore settings + agent checkpoint store
+core/data/           Room databases (chats/docs + Phase 5 memories/tasks/outbox/audit) + DataStore settings
 feature/workflow/    Skills editor and agent run history screens
 engine/llamacpp/     JNI bridge (chat, grammar sampling, embeddings, libmtmd images) + CMake build of llama.cpp
 third_party/         llama.cpp b11609 (vendored)
@@ -77,7 +134,7 @@ Requirements: JDK 17, Android SDK 35, **NDK 30.0.16248370**, CMake 3.31.6 (Andro
 
 ```bash
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew :core:inference:test :core:runtime:test :core:mcp-http:test :core:openui:test :core:models:test   # JVM unit tests (see PHASE4.md for counts)
+./gradlew :core:agents:test :core:inference:test :core:runtime:test :core:mcp-http:test :core:openui:test :core:models:test   # JVM unit tests
 ./gradlew :app:assembleOfflineDebug     # → app/build/outputs/apk/offline/debug/app-offline-debug.apk (INTERNET only for the model downloader)
 ./gradlew :app:assembleConnectedDebug   # → app/build/outputs/apk/connected/debug/app-connected-debug.apk (+ LAN/remote MCP)
 ./gradlew :samples:mcp-server-sample:assembleDebug
@@ -85,7 +142,7 @@ echo "sdk.dir=$HOME/Android/Sdk" > local.properties
 
 Native code is always built Release/-O3 (also in the debug APK). `gradle.properties` limits Gradle to `-Xmx3g`, 2 workers.
 
-Check the permissions (since Phase 4 both flavors list INTERNET, used only by the downloader; no ACCESS_NETWORK_STATE):
+Check the permissions (both flavors list INTERNET — used only by the downloader in `offline`; Phase 5 adds ACCESS_NETWORK_STATE for the online/offline badge + outbox, RECORD_AUDIO, SCHEDULE_EXACT_ALARM, WRITE_SETTINGS, WRITE_CALENDAR — each used only after you turn the feature on):
 
 ```bash
 $ANDROID_HOME/build-tools/35.0.0/aapt dump permissions app/build/outputs/apk/offline/debug/app-offline-debug.apk
@@ -93,12 +150,13 @@ $ANDROID_HOME/build-tools/35.0.0/aapt dump permissions app/build/outputs/apk/off
 # uses-permission: SET_ALARM, POST_NOTIFICATIONS, FOREGROUND_SERVICE(+SPECIAL_USE), READ_CONTACTS, READ_CALENDAR,
 #   ACCESS_NOTIFICATION_POLICY, USE_BIOMETRIC/USE_FINGERPRINT, WAKE_LOCK, RECEIVE_BOOT_COMPLETED, USE_MCP_SERVERS (own)
 # + INTERNET (model downloader only) + FOREGROUND_SERVICE_DATA_SYNC (download job)
-# (no ACCESS_NETWORK_STATE, no SMS/call/camera/storage permissions)
+# + Phase 5: ACCESS_NETWORK_STATE, RECORD_AUDIO, SCHEDULE_EXACT_ALARM, WRITE_SETTINGS, WRITE_CALENDAR
+# (no SMS/call/camera/storage permissions)
 ```
 
 ## Install & get a model
 
-1. `adb install -r offline-agent-phase4-offline-debug.apk` (or copy to the phone and open it).
+1. `adb install -r onyx-phase5-offline-debug.apk` (or copy to the phone and open it).
 2. First launch shows a sheet recommending a model for your phone's RAM → **Download** (one-time, Wi-Fi recommended).
    More models: model picker (top bar) → **Download models…** (catalogue below, or paste any Hugging Face GGUF link).
    Importing a .gguf file you already have still works (Models sheet → Import).

@@ -211,7 +211,7 @@ class CatalogTest {
     @Test fun resolveUrlsAndCatalogue() {
         assertEquals("https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf", ModelCatalog.QWEN3_17B.main.url)
         assertEquals("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", ModelCatalog.QWEN3_VL_2B.mmproj!!.url)
-        assertEquals(6, ModelCatalog.all.size)
+        assertEquals(8, ModelCatalog.all.size)
         assertTrue(ModelCatalog.all.all { m -> m.files.all { it.file.endsWith(".gguf") } })
         assertEquals(2, ModelCatalog.SMOLVLM.files.size)
         assertEquals(ModelCatalog.QWEN3_17B, ModelCatalog.byId("qwen3-1.7b"))

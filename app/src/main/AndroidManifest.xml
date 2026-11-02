@@ -25,6 +25,17 @@
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
     <!-- Profile vault unlock -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- Phase 5 -->
+    <!-- Voice input (SpeechRecognizer; on-device recognizer preferred) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Exact reminders (AlarmManager); falls back to inexact when the user has not allowed it -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- Screen brightness (special access "Modify system settings", granted by the user in system settings) -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" tools:ignore="ProtectedPermissions" />
+    <!-- Direct calendar insert (opt-in runtime permission; the intent-based tool needs none) -->
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+    <!-- Online/offline indicator + WorkManager NetworkType.CONNECTED for the outbox (reads connectivity state only) -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Bind to other on-device apps' MCP servers (defined below; dangerous = the user grants it) -->
     <uses-permission android:name="com.offlineagent.permission.USE_MCP_SERVERS" />
 
@@ -46,6 +57,8 @@
         <intent><action android:name="android.intent.action.SET_ALARM" /></intent>
         <intent><action android:name="android.intent.action.SET_TIMER" /></intent>
         <intent><action android:name="android.media.action.IMAGE_CAPTURE" /></intent>
+        <intent><action android:name="android.speech.RecognitionService" /></intent>
+        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
         <package android:name="com.whatsapp" />
         <package android:name="com.whatsapp.w4b" />
     </queries>
@@ -120,6 +133,9 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+
+        <!-- Phase 5 exact reminders -->
+        <receiver android:name=".onyx.ReminderAlarmReceiver" android:exported="false" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

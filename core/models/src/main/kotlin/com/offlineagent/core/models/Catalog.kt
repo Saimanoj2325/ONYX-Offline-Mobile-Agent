@@ -38,6 +38,13 @@ object ModelCatalog {
     val QWEN3_06B = CatalogModel("qwen3-0.6b", "Qwen3 0.6B", ModelKind.CHAT,
         listOf(CatalogFile("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf", 639 * MB)), 3, "Apache-2.0",
         "Fast and small; weak at structured answers.")
+    // Phase 5: more chat models for the device-tier recommender (files checked on Hugging Face, Nov 2026).
+    val LLAMA32_3B = CatalogModel("llama3.2-3b", "Llama 3.2 3B Instruct", ModelKind.CHAT,
+        listOf(CatalogFile("bartowski/Llama-3.2-3B-Instruct-GGUF", "Llama-3.2-3B-Instruct-Q4_K_M.gguf", 1926 * MB)), 8, "Llama 3.2 Community",
+        "Good English writing and tool use; no thinking mode.")
+    val GEMMA3_1B = CatalogModel("gemma3-1b", "Gemma 3 1B", ModelKind.CHAT,
+        listOf(CatalogFile("ggml-org/gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q4_K_M.gguf", 769 * MB)), 4, "Gemma Terms",
+        "Small and quick; fine for short answers on 4 GB phones.")
     val BGE_SMALL = CatalogModel("bge-small-en", "bge-small-en v1.5 (embeddings)", ModelKind.EMBEDDING,
         listOf(CatalogFile("CompendiumLabs/bge-small-en-v1.5-gguf", "bge-small-en-v1.5-q8_0.gguf", 36 * MB)), 2, "MIT",
         "Needed to search your documents (RAG).")
@@ -50,7 +57,7 @@ object ModelCatalog {
             CatalogFile("Qwen/Qwen3-VL-2B-Instruct-GGUF", "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", 445 * MB)), 6, "Apache-2.0",
         "Reads text and charts in photos.")
 
-    val all = listOf(QWEN3_17B, QWEN3_4B, QWEN3_06B, BGE_SMALL, SMOLVLM, QWEN3_VL_2B)
+    val all = listOf(QWEN3_17B, QWEN3_4B, QWEN3_06B, LLAMA32_3B, GEMMA3_1B, BGE_SMALL, SMOLVLM, QWEN3_VL_2B)
 
     fun byId(id: String) = all.firstOrNull { it.id == id }
 

@@ -14,8 +14,8 @@ android {
         applicationId = "com.offlineagent.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0-phase4"
+        versionCode = 5
+        versionName = "0.5.0-phase5"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
@@ -78,6 +78,7 @@ dependencies {
     implementation(project(":mcp-aidl"))
     implementation(project(":core:openui"))
     implementation(project(":core:models"))
+    implementation(project(":core:agents"))
     "connectedImplementation"(project(":core:mcp-http"))
     implementation(libs.pdfbox.android)
 

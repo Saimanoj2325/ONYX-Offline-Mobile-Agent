@@ -100,3 +100,12 @@
 - Thinking is on by default: answers take longer in total (the reasoning is generated first), but text appears at once.
 - The agent card streams raw step output (JSON tool calls look technical); the final answer is formatted as before.
 - StrictMode only logs (debug builds); it does not crash on violations.
+
+## Phase 5 (multi-agent ONYX runtime) — see docs/PHASE5.md §6
+- **Nothing in Phase 5 has run on a phone yet**: new Home/Tasks/Memory/Agents UI, voice (SpeechRecognizer/TTS), WorkManager
+  resume + outbox, AlarmManager exact reminders, brightness, direct calendar insert, thermal listener — compile + JVM tests only.
+- Agents share one model: model-bound steps are sequential; only tool/IO work overlaps. Expect 3–5 model calls per task.
+- Voice is only guaranteed offline with Android's on-device recognizer (API 31+ with a language pack); otherwise the UI warns.
+- A task resumed in the background that needs approval waits 9 minutes (notification), then counts as declined.
+- Android does not allow toggling Wi-Fi/mobile data/airplane mode or reading other apps' data; ONYX opens Settings panels.
+- The Phase 1–4 chat agent and its key/value memory are unchanged and separate from the Phase 5 memories.

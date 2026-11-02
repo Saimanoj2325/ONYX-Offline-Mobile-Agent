@@ -1,5 +1,7 @@
 # Architecture (Phase 2)
 
+> Phase 5 adds the multi-agent ONYX runtime (`:core:agents`, `app/onyx`, `ui/onyx`) on top of this: see docs/PHASE5.md.
+
 Phase 1 was the on-device inference layer. Phase 2 adds persistence, rich Markdown, the Intelligent-UI **Canvas**, local
 RAG, skills + an agent loop with tools, and image input. Everything still runs on the phone with **no INTERNET permission**.
 

@@ -61,6 +61,8 @@ class OfflineAccessibilityService : AccessibilityService(), ScreenDriver {
     override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // Phase 5: the Context agent's "foreground app" (only while the user has this service enabled).
+        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) event.packageName?.toString()?.takeIf { it.isNotBlank() }?.let { lastForegroundPackage = it }
         val rec = recorder ?: return
         val e = event ?: return
         val pkg = e.packageName?.toString() ?: ""
@@ -181,6 +183,8 @@ class OfflineAccessibilityService : AccessibilityService(), ScreenDriver {
         const val MAX_DEPTH = 40
         @Volatile private var ref = WeakReference<OfflineAccessibilityService>(null)
         val instance: OfflineAccessibilityService? get() = ref.get()
+        /** Package of the last window that came to the front (null until the service sees one). */
+        @Volatile var lastForegroundPackage: String? = null
 
         fun isEnabled(ctx: Context): Boolean {
             val flat = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false

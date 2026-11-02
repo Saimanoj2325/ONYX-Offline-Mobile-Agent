@@ -22,6 +22,7 @@ ksp {
 
 dependencies {
     api(project(":core:runtime"))
+    api(project(":core:agents"))
     api(libs.room.runtime)
     implementation(libs.room.ktx)
     ksp(libs.room.compiler)

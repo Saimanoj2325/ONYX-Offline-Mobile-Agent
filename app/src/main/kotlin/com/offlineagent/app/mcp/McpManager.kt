@@ -73,10 +73,15 @@ class McpManager(private val ctx: Context, ports: PhonePorts) {
 
     suspend fun refresh() {
         tools = hub.tools()
+        netTools = hub.all().filter { it.trust == McpTrust.NETWORK }.flatMap { c -> c.tools.map { it.spec.name } }.toSet()
         _status.value = hub.all().map { c ->
             McpServerStatus(c.id, c.displayName, when (c.trust) { McpTrust.BUILT_IN -> "Built-in"; McpTrust.ON_DEVICE_APP -> "On-device app"; McpTrust.NETWORK -> "Network" }, true, c.tools.map { it.spec.name })
         }
     }
+
+    /** Phase 5: tools served by LAN/remote (Streamable HTTP) servers — badged "Needs network", queued in the outbox when offline. */
+    fun networkToolNames(): Set<String> = netTools
+    @Volatile private var netTools: Set<String> = emptySet()
 
     fun groupOf(tool: String): PhoneGroup? = phone.toolGroups[tool]
 }

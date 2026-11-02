@@ -102,6 +102,8 @@ class OfflineAgentApp : Application() {
         ))
     }
     private val createPdfTool by lazy { CreatePdfTool(pdf) }
+    /** Phase 5: multi-agent orchestrator, memories, task checkpoints, outbox, device monitor (see docs/PHASE5.md). */
+    val onyx by lazy { com.offlineagent.app.onyx.OnyxRuntime(this) }
 
     fun automationPolicy() = AutomationPolicy(userAllowed = { cachedSettings.automationAllowedApps }, userBlocked = { cachedSettings.automationBlockedApps })
 
@@ -172,11 +174,13 @@ class OfflineAgentApp : Application() {
         val toolNames = setOf(
             "search_docs", "read_document", "summarize", "calculator", "get_datetime", "create_note", "memory_read",
             "memory_write", "share_text", "create_calendar_event", "render_ui", "canvas_update", "create_pdf", "notes_search",
-        ) + PhoneServers(PhonePorts()).apply { build() }.toolGroups.keys
+            // Phase 5 device tools (+ fetch_url in the connected flavor)
+            "schedule_exact_reminder", "set_brightness", "post_notification", "save_to_downloads", "add_calendar_event_direct",
+        ) + com.offlineagent.app.onyx.NetworkTools.names + PhoneServers(PhonePorts()).apply { build() }.toolGroups.keys
         skills = SkillRepository(db.skills(), toolNames)
         agents = AgentService(
             appScope, inference, engineController, db.agent(), db.chats(), db.misc(), retriever, db.documents(), intents, skills, settings,
-            extraTools = { mcp.tools + createPdfTool },
+            extraTools = { mcp.tools + createPdfTool + onyx.extraTools },
             disabledTools = { mcp.disabledTools(cachedSettings.phoneGroups) },
             onLongTask = { runId, progress ->
                 if (progress == null) LongTasks.finish(this, runId)
@@ -185,6 +189,7 @@ class OfflineAgentApp : Application() {
             },
         )
         Notifications.ensureChannels(this)
+        onyx.start()
         appScope.launch {
             settings.settings.collect {
                 cachedSettings = it
