@@ -147,6 +147,15 @@ data class AppSettings(
     val richUi: String = "AUTO",
     /** Persisted-settings schema version (migrations in [SettingsRepository.migrate]). */
     val settingsVersion: Int = 0,
+    // ---- Phase 6
+    /** n-gram (prompt-lookup) self-speculation: identical output, no extra RAM; auto-off when it does not help. */
+    val ngramSpec: Boolean = true,
+    val ngramDraft: Int = 8,
+    /** Unload the model after this many idle minutes (0 = never). Shorter on low battery / battery saver. */
+    val idleUnloadMinutes: Int = 10,
+    /** ChatGPT-style memory: (a) saved memories extracted from chats, (b) reference all past chats. */
+    val savedMemories: Boolean = true,
+    val referenceChatHistory: Boolean = true,
 ) {
     companion object {
         /** Groups that need no special access are on by default; everything sensitive is opt-in. */
@@ -194,6 +203,11 @@ class SettingsRepository(context: Context) {
         val safeWhy = stringPreferencesKey("safe_mode_reason")
         val richUi = stringPreferencesKey("rich_ui")
         val version = intPreferencesKey("settings_version")
+        val ngram = booleanPreferencesKey("ngram_spec")
+        val ngramDraft = intPreferencesKey("ngram_draft")
+        val idle = intPreferencesKey("idle_unload_min")
+        val savedMem = booleanPreferencesKey("saved_memories")
+        val chatRef = booleanPreferencesKey("reference_chat_history")
     }
 
     /** A value of the wrong type (older app version, corrupted file) reads as "unset" instead of crashing. */
@@ -215,6 +229,8 @@ class SettingsRepository(context: Context) {
         screenVision = p(K.vision) ?: false, automationEnabled = p(K.autoOn) ?: true, mcpServers = p(K.mcp) ?: emptySet(),
         largeContext = p(K.large) ?: false, safeMode = p(K.safe) ?: false, safeModeReason = p(K.safeWhy) ?: "",
         richUi = p(K.richUi) ?: "AUTO", settingsVersion = p(K.version) ?: 0,
+        ngramSpec = p(K.ngram) ?: true, ngramDraft = p(K.ngramDraft) ?: 8, idleUnloadMinutes = p(K.idle) ?: 10,
+        savedMemories = p(K.savedMem) ?: true, referenceChatHistory = p(K.chatRef) ?: true,
     )
 
     /** Never throws: an unreadable settings file yields defaults (and is overwritten on the next save). */
@@ -268,6 +284,8 @@ class SettingsRepository(context: Context) {
             p[K.poll] = n.pollLevel; p[K.groups] = n.phoneGroups; p[K.autoAllow] = n.automationAllowedApps; p[K.autoBlock] = n.automationBlockedApps
             p[K.vision] = n.screenVision; p[K.autoOn] = n.automationEnabled; p[K.mcp] = n.mcpServers
             p[K.large] = n.largeContext; p[K.safe] = n.safeMode; p[K.safeWhy] = n.safeModeReason; p[K.richUi] = n.richUi; p[K.version] = n.settingsVersion
+            p[K.ngram] = n.ngramSpec; p[K.ngramDraft] = n.ngramDraft; p[K.idle] = n.idleUnloadMinutes
+            p[K.savedMem] = n.savedMemories; p[K.chatRef] = n.referenceChatHistory
         }
     }
 

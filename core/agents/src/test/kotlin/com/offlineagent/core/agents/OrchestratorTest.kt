@@ -360,10 +360,13 @@ class RuntimeSelectorTest {
     @Test fun tiersAndPicks() {
         assertEquals(DeviceTier.ENTRY, RuntimeSelector.tier(snap(3.6)))
         assertEquals(DeviceTier.MID, RuntimeSelector.tier(snap(5.5)))
-        val p8 = RuntimeSelector.plan(snap(7.3)) // OnePlus CPH2569 reports ~7.3 GB
+        val p8 = RuntimeSelector.plan(snap(7.3)) // a typical 8 GB phone reports ~7.3 GB
         assertEquals(DeviceTier.HIGH, p8.tier); assertEquals(8192, p8.contextLength); assertEquals(4, p8.threads)
         assertEquals("qwen3-1.7b", p8.picks.first { it.primary }.catalogId)
-        assertEquals("qwen3-4b", RuntimeSelector.plan(snap(11.2)).picks.first { it.primary }.catalogId)
+        // Phase 6: the fast 1.7B stays the primary on 12 GB phones too (battery/speed); 4B-class is an option.
+        val p12 = RuntimeSelector.plan(snap(11.2, avail = 6000)) // 12 GB phones (e.g. OnePlus CPH2569) report ~11.2 GB
+        assertEquals("qwen3-1.7b", p12.picks.first { it.primary }.catalogId)
+        assertTrue(p12.picks.any { it.catalogId == "qwen3-4b-2507" })
         assertEquals(4096, RuntimeSelector.plan(snap(7.3, avail = 1500)).contextLength)
     }
 

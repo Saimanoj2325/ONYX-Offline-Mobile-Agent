@@ -91,6 +91,9 @@ fun AgentsScreen(app: OfflineAgentApp, onOpenSettings: () -> Unit, notify: (Stri
                     Pill("Thermal: ${thermal.name.lowercase()}", if (thermal.ordinal >= 2) NetworkAmber else OfflineGreen)
                     if (saver) Pill("Battery saver", NetworkAmber)
                 }
+                if (s != null && s.freeStorageMb >= 0) Text("Storage free: ${"%.1f".format(s.freeStorageMb / 1024.0)} GB · CPU: " +
+                    (if (s.dotprod) "dot-product" else "no dot-product") + (if (s.i8mm) " + i8mm" else " (no i8mm)"),
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (s != null) Text("${"%.1f".format(s.totalRamMb / 1024.0)} GB RAM (${"%.1f".format(s.availRamMb / 1024.0)} GB free) · ${s.cpuCores} cores (${s.performanceCores} fast) · ${s.soc} · Android API ${s.sdkInt}",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 plan?.let { p ->
@@ -102,7 +105,8 @@ fun AgentsScreen(app: OfflineAgentApp, onOpenSettings: () -> Unit, notify: (Stri
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(m.name + if (m.primary) "  ★" else "", style = MaterialTheme.typography.bodyMedium)
-                                Text(m.why, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(m.why + if (m.residentMb > 0) " · ~${"%.1f".format(m.residentMb / 1024.0)} GB in use" else "", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                m.warning?.let { Text("⚠ $it", style = MaterialTheme.typography.bodySmall, color = NetworkAmber) }
                             }
                         }
                     }
@@ -117,6 +121,32 @@ fun AgentsScreen(app: OfflineAgentApp, onOpenSettings: () -> Unit, notify: (Stri
         item {
             SectionCard("Models") {
                 com.offlineagent.app.ui.models.ModelCatalogContent(app, notify, onImport = onOpenSettings)
+            }
+        }
+        // Phase 6: on-phone benchmark (results stored on the phone, newest first).
+        item {
+            val bs by onyx.benchmark.state.collectAsState()
+            val results by remember { onyx.db.phase6().observeBench() }.collectAsState(initial = emptyList())
+            SectionCard("Benchmark") {
+                Text("Reloads the chat model, then measures prompt speed, generation speed (n-gram speculation off and on), load time, peak memory and heat.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                when (val st = bs) {
+                    is com.offlineagent.app.onyx.Benchmark.State.Running -> Text(st.step, style = MaterialTheme.typography.bodyMedium)
+                    is com.offlineagent.app.onyx.Benchmark.State.Failed -> Text(st.message, style = MaterialTheme.typography.bodySmall, color = NetworkAmber)
+                    else -> Unit
+                }
+                Button(enabled = bs !is com.offlineagent.app.onyx.Benchmark.State.Running, onClick = { scope.launch { onyx.benchmark.run() } }) { Text("Run benchmark") }
+                results.take(6).forEach { r ->
+                    Column {
+                        Text("${r.model} · ${r.threads} threads · ${r.contextLength / 1024}K", style = MaterialTheme.typography.bodyMedium)
+                        Text("Prompt ${"%.1f".format(r.promptTps)} tok/s · Gen ${"%.2f".format(r.genTps)} tok/s · with speculation ${"%.2f".format(r.specGenTps)} tok/s (${r.specAccepted}/${r.specDrafted} accepted)",
+                            style = MaterialTheme.typography.bodySmall)
+                        Text("Load ${r.loadMs} ms · peak ${r.peakRssMb} MB · ${r.thermal.lowercase()} · battery ${r.battery}% · " +
+                            DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(r.at)),
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                if (results.isNotEmpty()) TextButton(onClick = { scope.launch { onyx.db.phase6().clearBench() } }) { Text("Clear results") }
             }
         }
         item {

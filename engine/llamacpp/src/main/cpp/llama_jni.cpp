@@ -103,6 +103,19 @@ struct Session {
     llama_token pending = -1;           // sampled by the target but not yet decoded
     std::deque<llama_token> out_queue;  // accepted tokens waiting to be returned by nativeNext
     long spec_drafted = 0, spec_accepted = 0;
+
+    // Phase 6: n-gram / prompt-lookup self-speculation (no second model, no extra RAM). The last n tokens (n from
+    // ngram_max down to ngram_min) are looked up earlier in the context; the tokens that followed are proposed as drafts
+    // and verified exactly like model drafts. Output is identical to normal decoding (every position is still sampled
+    // from the target). Works with grammars (JSON tool args are where it pays off most). Disabled for recurrent /
+    // hybrid models (their state cannot be rolled back to reject drafts).
+    int  ngram_min = 0, ngram_max = 0, ngram_draft = 0;  // ngram_draft 0 = off
+    bool rollback_ok = true;            // KV can drop tail positions (false for recurrent / hybrid memory)
+    bool ngram_req = false;             // n-gram drafting active for this request
+    int  ngram_rounds = 0;              // rounds that proposed drafts in this request (adaptive auto-off)
+    int  ngram_cur = 0;                 // adaptive draft length: grows after full acceptance, shrinks after a miss
+    std::vector<int> cpus;              // performance cores the pool is pinned to (for live thread changes)
+    int  n_threads = 4;
 };
 
 std::string g_last_error;
@@ -323,8 +336,11 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeLoad(JNIEnv * env, jobje
         return 0;
     }
     s->can_shift = llama_memory_can_shift(llama_get_memory(s->ctx));
+    s->rollback_ok = !llama_model_is_recurrent(s->model) && !llama_model_is_hybrid(s->model);
     s->batch = llama_batch_init(s->n_batch, 0, 1);
     attach_threadpool(s, n_threads, cpus, o[10]);
+    s->cpus = cpus;
+    s->n_threads = n_threads;
 
     if (o[11]) {
         // Warm-up: one tiny decode pages the weights in (mmap) and builds the compute graph, so the first real
@@ -539,7 +555,10 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeBegin(JNIEnv * env, jobj
     if (rc > 0) s->has_logits = true;
     s->n_keep = std::min(s->n_keep, std::max(0, (int) s->n_past - 1));
     const bool has_grammar = jgrammar != nullptr && env->GetArrayLength(jgrammar) > 0;
-    s->spec_active = rc > 0 && s->draft_ctx != nullptr && s->n_draft > 0 && !has_grammar && !s->kv_dirty;
+    s->ngram_rounds = 0;
+    s->ngram_cur = std::max(1, s->ngram_draft / 2);
+    s->ngram_req = rc > 0 && s->draft_ctx == nullptr && s->ngram_draft > 0 && s->rollback_ok && !s->kv_dirty;
+    s->spec_active = (rc > 0 && s->draft_ctx != nullptr && s->n_draft > 0 && !has_grammar && !s->kv_dirty && s->rollback_ok) || s->ngram_req;
     return rc;
 }
 
@@ -655,6 +674,26 @@ static llama_token argmax_logits(const float * logits, int n_vocab) {
     return best;
 }
 
+// Phase 6: prompt-lookup drafts. History = kv_tokens + t0. Finds the most recent earlier occurrence of the last n tokens
+// (longest n first) within the last 4096 tokens and proposes what followed it.
+static void ngram_drafts(const Session * s, llama_token t0, int n_max_draft, std::vector<llama_token> & out) {
+    const std::vector<llama_token> & h = s->kv_tokens;
+    const size_t L = h.size() + 1;
+    auto at = [&](size_t i) { return i < h.size() ? h[i] : t0; };
+    const size_t lo = L > 4096 ? L - 4096 : 0;
+    for (int n = s->ngram_max; n >= s->ngram_min && n >= 1; n--) {
+        if (L < (size_t) n + 1) continue;
+        const size_t key = L - (size_t) n;
+        for (size_t i = key; i-- > lo;) {
+            bool m = true;
+            for (int j = 0; j < n; j++) if (at(i + j) != at(key + j)) { m = false; break; }
+            if (!m) continue;
+            for (size_t q = i + n; q < L && (int) out.size() < n_max_draft; q++) out.push_back(at(q));
+            if (!out.empty()) return;
+        }
+    }
+}
+
 // One speculative round. Fills out_queue with >= 1 accepted token. Returns false on a fatal decode error.
 static bool spec_round(Session * s) {
     if (s->pending < 0) s->pending = sample_token(s, -1);
@@ -662,12 +701,15 @@ static bool spec_round(Session * s) {
     s->pending = -1;
     if (llama_vocab_is_eog(s->vocab, t0)) { s->out_queue.push_back(t0); return true; }
 
-    int n_draft = std::min(s->n_draft, std::max(0, s->max_new - s->generated - 1));
+    int n_draft = std::min(s->draft_ctx ? s->n_draft : (s->ngram_req ? s->ngram_cur : 0), std::max(0, s->max_new - s->generated - 1));
     if (!ensure_room(s, n_draft + 2)) n_draft = std::max(0, s->n_ctx - (int) s->n_past - 2);
     if ((int) s->n_past + 1 >= s->n_ctx) { s->stop = STOP_CONTEXT_FULL; return true; }
 
     std::vector<llama_token> drafts;
-    if (n_draft > 0 && sync_draft(s)) {
+    if (!s->draft_ctx) {
+        if (n_draft > 0) ngram_drafts(s, t0, n_draft, drafts);
+        if (!drafts.empty()) s->ngram_rounds++;
+    } else if (n_draft > 0 && sync_draft(s)) {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(s->draft_model));
         llama_token cur = t0;
         llama_pos pos = s->n_past;
@@ -710,12 +752,19 @@ static bool spec_round(Session * s) {
     for (size_t j = 0; j < k; j++) s->kv_tokens.push_back(drafts[j]);
     s->n_past = old_past + (llama_pos) k + 1;
     // Draft cache: drop rejected positions.
-    llama_memory_seq_rm(llama_get_memory(s->draft_ctx), 0, s->n_past, -1);
-    if ((llama_pos) s->draft_kv.size() > s->n_past) s->draft_kv.resize(s->n_past);
+    if (s->draft_ctx) {
+        llama_memory_seq_rm(llama_get_memory(s->draft_ctx), 0, s->n_past, -1);
+        if ((llama_pos) s->draft_kv.size() > s->n_past) s->draft_kv.resize(s->n_past);
+    }
     s->pending = next;
     s->has_logits = true;
     s->spec_drafted += (long) drafts.size();
     s->spec_accepted += (long) k;
+    if (!s->draft_ctx && !drafts.empty()) {
+        s->ngram_cur = (k == drafts.size()) ? std::min(s->ngram_draft, s->ngram_cur + 2) : std::max(1, (int) k + 1);
+    }
+    // Adaptive auto-off: when n-gram drafts keep missing (free-form prose), stop paying for the wider verify batch.
+    if (!s->draft_ctx && s->ngram_req && s->ngram_rounds >= 8 && s->spec_accepted * 5 < s->spec_drafted) s->ngram_req = false;
     s->out_queue.push_back(t0);
     for (size_t j = 0; j < k; j++) s->out_queue.push_back(drafts[j]);
     return true;
@@ -846,6 +895,39 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativePrefixCache(JNIEnv * env
         }
     }
     return 2;
+}
+
+// Phase 6: change the thread count / busy-poll level live (thermal, battery saver, low battery) without reloading.
+// Must be called between requests (Kotlin calls it on the engine thread under the adapter mutex).
+JNIEXPORT jboolean JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeSetThreads(JNIEnv *, jobject, jlong h, jint n_threads, jint poll) {
+    auto * s = as_session(h);
+    const int n = std::max(1, std::min((int) n_threads, 8));
+    if (s->threadpool) {
+        llama_detach_threadpool(s->ctx);
+        if (s->draft_ctx) llama_detach_threadpool(s->draft_ctx);
+        if (s->tp_free) s->tp_free(s->threadpool);
+        s->threadpool = nullptr;
+    }
+    llama_set_n_threads(s->ctx, n, n);
+    if (s->draft_ctx) llama_set_n_threads(s->draft_ctx, n, n);
+    attach_threadpool(s, n, s->cpus, poll);
+    if (s->draft_ctx && s->threadpool) llama_attach_threadpool(s->draft_ctx, s->threadpool, s->threadpool);
+    s->n_threads = n;
+    LOGI("threads -> %d (poll %d)", n, (int) poll);
+    return JNI_TRUE;
+}
+
+// Phase 6: n-gram self-speculation. n_draft = 0 turns it off. Returns false when the model cannot roll back its state
+// (recurrent / hybrid architectures): speculation then stays off.
+JNIEXPORT jboolean JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeSetNgram(JNIEnv *, jobject, jlong h, jint n_min, jint n_max, jint n_draft) {
+    auto * s = as_session(h);
+    if (!s->rollback_ok) { s->ngram_draft = 0; return n_draft <= 0 ? JNI_TRUE : JNI_FALSE; }
+    s->ngram_min = std::max(1, (int) n_min);
+    s->ngram_max = std::max(s->ngram_min, (int) n_max);
+    s->ngram_draft = std::max(0, std::min((int) n_draft, 16));
+    return JNI_TRUE;
 }
 
 // Speculative decoding: loads a small draft model (same tokenizer family) next to the target. n_draft=0 detaches it.

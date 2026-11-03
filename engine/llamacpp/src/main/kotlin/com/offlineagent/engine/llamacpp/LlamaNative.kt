@@ -47,6 +47,10 @@ object LlamaNative {
     external fun nativeCountTokens(handle: Long, textUtf8: ByteArray): Int
     external fun nativePrefixCache(handle: Long, prefixUtf8: ByteArray, path: String, save: Boolean): Int
     external fun nativeAttachDraft(handle: Long, path: String?, nDraft: Int, nThreads: Int, typeK: Int): Boolean
+    /** Phase 6: n-gram self-speculation; false when the model's memory cannot roll back (recurrent/hybrid). */
+    /** Phase 6: live thread-count / busy-poll change (thermal & battery governor). */
+    external fun nativeSetThreads(handle: Long, nThreads: Int, poll: Int): Boolean
+    external fun nativeSetNgram(handle: Long, nMin: Int, nMax: Int, nDraft: Int): Boolean
     external fun nativeAttachMmproj(handle: Long, mmprojPath: String, nThreads: Int): Boolean
     external fun nativeMediaMarker(): String
     external fun nativeApplyTemplate(handle: Long, roles: Array<String>, contentsUtf8: Array<ByteArray>): ByteArray?

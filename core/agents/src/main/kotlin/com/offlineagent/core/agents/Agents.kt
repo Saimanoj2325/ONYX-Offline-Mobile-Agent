@@ -28,6 +28,9 @@ class AgentDeps(
     val audit: AuditSink,
     val store: TaskStore,
     val clock: () -> Long = System::currentTimeMillis,
+    /** Phase 6: reusable routines (null = off) and learning hooks. */
+    val routines: com.offlineagent.core.agents.memory.RoutineBook? = null,
+    val hooks: AgentHooks = AgentHooks.NONE,
 )
 
 interface Agent {
@@ -92,8 +95,13 @@ class PlannerAgent(private val deps: AgentDeps) {
         )), maxItems = 4)))
         val system = "You plan phone-assistant tasks. Make ONE step per thing the user asks for (a request with \"and\" usually needs several steps), " +
             "at most 4, none if no tool is needed. \"after\" lists earlier step numbers a step needs. " +
-            "Example: \"remind me at 9am to pay rent and show my calendar\" -> steps: schedule_exact_reminder, list_events. Tools:\n" + specs.joinToString("\n") { "- ${it.name}: ${it.description.take(110)}" }
-        val user = if (board.conversation.isBlank()) request else "Earlier conversation:\n${board.conversation.takeLast(1200)}\n\nRequest: $request"
+            "Example: \"remind me at 9am to pay rent and show my calendar\" -> steps: schedule_exact_reminder, list_events. Use only the tools listed in the message."
+        // Phase 6: the tool list moved out of the system prompt so the planner's system prompt is identical for every request
+        // (its KV prefix is cached once per model), and a small saved-memory block is added within a token budget.
+        val known = if (deps.memory.enabled) runCatching { deps.memory.profile(request, 100) }.getOrDefault("") else ""
+        val user = "Tools:\n" + specs.joinToString("\n") { "- ${it.name}: ${it.description.take(110)}" } + "\n\n" +
+            (if (known.isNotBlank()) "$known\n\n" else "") +
+            (if (board.conversation.isBlank()) "Request: $request" else "Earlier conversation:\n${board.conversation.takeLast(1200)}\n\nRequest: $request")
         val out = modelCall(deps, board, AgentRole.PLANNER, "plan", InferenceQueue.Priority.PLANNING, "planner", system, user, Gbnf.of(schema), 300, PlanPreview::readable)
         val steps = (AgentJson.parseToJsonElement(out).jsonObject["steps"] as? JsonArray) ?: return emptyList()
         return steps.mapIndexedNotNull { i, el ->
@@ -154,11 +162,18 @@ object RulePlanner {
 // ------------------------------------------------------------------------------------------------ Memory / Context
 
 class MemoryAgent(private val deps: AgentDeps) : Agent {
+    companion object { const val MEMORY_BUDGET_TOKENS = 300 }
     override val role = AgentRole.MEMORY
     override suspend fun handle(node: TaskNode, board: Blackboard, attempt: Int, lastError: String?): NodeOutcome {
         if (!deps.memory.enabled) { board.fact("memory", "(memory is turned off by the user)"); return NodeOutcome.Ok("Memory is off") }
-        val hits = deps.memory.recall(if (node.goal.startsWith("Recall related")) board.request else node.goal, 5)
-        val text = hits.joinToString("\n") { "- [${it.source}] ${it.title}: ${it.text.take(300)}" }
+        val hits = deps.memory.recall(if (node.goal.startsWith("Recall related")) board.request else node.goal, 6)
+        // Phase 6: token budget for what the Writer gets (~300 tokens), best hits first.
+        var used = 0
+        val text = hits.mapNotNull { h ->
+            val l = "- [${h.source}] ${h.title}: ${h.text.take(300)}"
+            val t = com.offlineagent.core.agents.memory.Text.approxTokens(l)
+            if (used + t > MEMORY_BUDGET_TOKENS) null else { used += t; l }
+        }.joinToString("\n")
         board.fact(if (node.id == "mem") "memory" else "memory_${node.id}", text.ifBlank { "(nothing relevant remembered)" })
         return NodeOutcome.Ok(if (hits.isEmpty()) "Nothing relevant remembered" else "${hits.size} memories/passages found")
     }
@@ -182,8 +197,9 @@ internal suspend fun fillArgs(deps: AgentDeps, node: TaskNode, spec: ToolSpec, b
     if (spec.input.properties.isEmpty()) return Result.success(JsonObject(emptyMap()))
     if (deps.queue == null) return Result.failure(IllegalStateException("load a chat model so I can fill in ${spec.name}'s details"))
     val facts = board.facts().entries.joinToString("\n") { (k, v) -> "$k: ${v.take(500)}" }
-    val system = "Fill the arguments for the tool ${spec.name}: ${spec.description}\nUse the user's request and the facts. Output only JSON."
-    val user = "Request: ${board.request}\nStep: ${node.goal}\nFacts:\n$facts" + (lastError?.let { "\nThe previous attempt failed: $it. Fix the arguments." } ?: "")
+    // Phase 6: static system prompt (one cached KV prefix for every tool); the tool goes into the user message.
+    val system = "Fill the arguments for a phone tool from the user's request and the facts. Output only JSON."
+    val user = "Tool: ${spec.name}: ${spec.description}\nRequest: ${board.request}\nStep: ${node.goal}\nFacts:\n$facts" + (lastError?.let { "\nThe previous attempt failed: $it. Fix the arguments." } ?: "")
     val out = modelCall(deps, board, node.agent, node.id, InferenceQueue.Priority.INTERACTIVE, "args:${spec.name}", system, user, Gbnf.of(spec.input), 256)
     val obj = runCatching { AgentJson.parseToJsonElement(out).jsonObject }.getOrElse { return Result.failure(IllegalArgumentException("model returned invalid JSON")) }
         .let { ArgRepair.fix(spec, it, board.request) }
@@ -227,6 +243,7 @@ internal suspend fun gatedCall(deps: AgentDeps, role: AgentRole, node: TaskNode,
         return NodeOutcome.Queued(id, "$name needs internet: queued, it runs automatically when you are back online")
     }
     val outcome = runTool(deps, name, args).toOutcome()
+    if (outcome is NodeOutcome.Ok) runCatching { deps.hooks.onToolSucceeded(name, args, risk) }
     if (risk > Risk.NONE) deps.audit.record(board.runId, role.title, "ran $name", (if (outcome is NodeOutcome.Ok) "ok" else outcome.toString()).take(300), risk)
     if (outcome is NodeOutcome.Ok) board.fact("${node.id}:$name", outcome.output.take(1500))
     return outcome
@@ -265,7 +282,7 @@ class WriterAgent(private val deps: AgentDeps) : Agent {
         val user = buildString {
             if (board.conversation.isNotBlank()) append("Earlier conversation:\n").append(board.conversation.takeLast(1500)).append("\n\n")
             append("Request: ${board.request}\nFacts:\n")
-            append(st.facts.filterKeys { it == "context" || it == "memory" }.entries.joinToString("\n") { "${it.key}: ${it.value.take(800)}" })
+            append(st.facts.filterKeys { it == "context" || it == "memory" }.entries.joinToString("\n") { "${it.key}: ${it.value.take(1300)}" })
             append("\nStep results:\n").append(results.ifBlank { "(no tools used)" })
             lastError?.let { append("\nFix this problem in your answer: $it") }
         }

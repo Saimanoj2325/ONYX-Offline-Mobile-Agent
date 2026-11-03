@@ -39,6 +39,15 @@ interface InferenceAdapter {
 
     /** Exact token count under the loaded model's tokenizer; null if unavailable right now. */
     suspend fun countTokens(text: String): Int? = null
+
+    /**
+     * Phase 6: n-gram (prompt-lookup) self-speculation for the loaded model; [draftTokens] 0 = off. Returns false when the
+     * model cannot use it (recurrent/hybrid architectures) or nothing is loaded. Takes effect from the next request.
+     */
+    suspend fun setSpeculation(draftTokens: Int, minN: Int = 2, maxN: Int = 4): Boolean = false
+
+    /** Phase 6: live thread count / busy-poll (thermal & battery governor); applied between requests. */
+    suspend fun setThreads(threads: Int, pollLevel: Int): Boolean = false
 }
 
 /**
@@ -80,6 +89,10 @@ interface TokenEngine {
      * saved state matches, otherwise evaluating and saving it. Returns 0/1/2 (see GenerationStats.prefixCache), <0 on error.
      */
     fun prefixCache(prefix: String, cacheFile: String?): Int = -1
+
+    /** Phase 6: n-gram self-speculation (see [InferenceAdapter.setSpeculation]). */
+    fun setNgram(minN: Int, maxN: Int, draftTokens: Int): Boolean = false
+    fun setThreads(threads: Int, pollLevel: Int): Boolean = false
 
     /** Live counters: n_past, n_ctx, context shifts, drafted, accepted, cached tokens. */
     fun runtimeStats(): IntArray = IntArray(6)

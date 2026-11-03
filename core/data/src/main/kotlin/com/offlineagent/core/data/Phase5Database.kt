@@ -25,12 +25,16 @@ import kotlinx.coroutines.flow.Flow
  * is never touched: an upgrade can never lose chats, and this file can be wiped on its own ("Delete all agent data").
  */
 @Database(
-    entities = [AgentMemoryEntity::class, TaskRunEntity::class, TaskStepEntity::class, OutboxEntity::class, AuditEntity::class],
-    version = 1,
+    entities = [AgentMemoryEntity::class, TaskRunEntity::class, TaskStepEntity::class, OutboxEntity::class, AuditEntity::class,
+        // Phase 6 (v2)
+        BenchResultEntity::class, ContactUsageEntity::class, RoutineEntity::class, HistoryChunkEntity::class, ChatMemoryStateEntity::class],
+    version = 2,
     exportSchema = true,
+    autoMigrations = [androidx.room.AutoMigration(from = 1, to = 2)],
 )
 abstract class Phase5Database : RoomDatabase() {
     abstract fun dao(): Phase5Dao
+    abstract fun phase6(): Phase6Dao
 
     companion object {
         fun create(context: Context): Phase5Database =
@@ -50,6 +54,14 @@ data class AgentMemoryEntity(
     val pinned: Boolean = false,
     val createdAt: Long,
     val updatedAt: Long,
+    // ---- Phase 6 (AutoMigration 1→2 adds these with defaults; old rows read as explicit notes)
+    @androidx.room.ColumnInfo(defaultValue = "NOTE") val kind: String = "NOTE",
+    @androidx.room.ColumnInfo(defaultValue = "0") val inferred: Boolean = false,
+    @androidx.room.ColumnInfo(defaultValue = "1.0") val confidence: Double = 1.0,
+    @androidx.room.ColumnInfo(defaultValue = "0") val confirmed: Boolean = false,
+    val slot: String? = null,
+    @androidx.room.ColumnInfo(defaultValue = "0") val useCount: Int = 0,
+    @androidx.room.ColumnInfo(defaultValue = "0") val lastUsedAt: Long = 0,
 )
 
 @Entity(tableName = "task_runs", indices = [Index("status")])

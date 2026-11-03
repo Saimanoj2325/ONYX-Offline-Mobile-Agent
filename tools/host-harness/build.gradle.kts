@@ -62,3 +62,13 @@ tasks.register<JavaExec>("runPhase5b") {
     jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
     args(nativeDir)
 }
+
+// Phase 6: n-gram self-speculation identical-output + speed, benchmark numbers, memory/routine e2e.
+// Env: MODEL, THREADS, CTX, DRAFT, ONLY (spec|bench|memory), OUT.
+tasks.register<JavaExec>("runPhase6") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.offlineagent.tools.Phase6HarnessKt")
+    val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
+    jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
+    args(nativeDir)
+}

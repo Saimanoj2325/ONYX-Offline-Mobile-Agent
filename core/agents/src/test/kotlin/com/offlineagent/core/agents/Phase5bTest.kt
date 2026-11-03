@@ -27,8 +27,8 @@ private class StreamingLlm(var plan: String = """{"steps":[]}""", val answerToke
             systems += system; users += user
             val full = when {
                 system.startsWith("You plan") -> plan
-                system.startsWith("Fill the arguments for the tool flashlight") -> """{"on":true}"""
-                system.startsWith("Fill the arguments for the tool fetch_url") -> """{"url":"https://example.com"}"""
+                user.startsWith("Tool: flashlight") -> """{"on":true}"""
+                user.startsWith("Tool: fetch_url") -> """{"url":"https://example.com"}"""
                 system.startsWith("Check an assistant") -> """{"ok":true,"issue":""}"""
                 else -> null
             }

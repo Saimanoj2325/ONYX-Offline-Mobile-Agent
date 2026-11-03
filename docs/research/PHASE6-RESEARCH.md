@@ -15,7 +15,7 @@ Nothing in this document has been measured on the target phone yet — §B.8 is 
 | CPU | 1× Cortex-A78 2.7 GHz + 3× A78 2.4 GHz + 4× A55 1.8 GHz. ISA flags: `neon, fp16, dotprod` — **no i8mm, no SVE/SME** (ARMv8.2) | Geekbench (above) |
 | GPU | **Adreno 642L** (2 compute units, OpenCL 2.0 driver) | [vovaxa44 bench](https://huggingface.co/datasets/vovaxa44/snapdragon778g-llama-cpp-opencl-bench/blob/main/README.md) |
 | NPU/DSP | **Hexagon 770 = HTP v68** (same die as 778G) | [Qualcomm QAIRT table](https://docs.qualcomm.com/doc/80-63442-10/topic/SNPE_general_overview.html?product=1601111740010412) |
-| RAM | 8 GB (Geekbench sees 7.15 GB). Type is **uncertain**: sources disagree LPDDR5 vs LPDDR4X — measure on device | Kalvo vs devicespecifications |
+| RAM | **12 GB** (Sai's unit; confirmed 2026-11-03 — the 7.15 GB Geekbench run was an 8 GB variant). Type is **uncertain**: sources disagree LPDDR5 vs LPDDR4X — measure on device | Kalvo vs devicespecifications |
 | Storage | UFS 3.1 | Kalvo spec page |
 | OS | Geekbench run shows Android 15 | Geekbench |
 
@@ -197,7 +197,7 @@ policy layer instead of their own.
 
 ---
 
-## Part B — Big models and top optimisation on an 8 GB SD782G phone
+## Part B — Big models and top optimisation on SD782G-class phones (target: every 8 GB phone; Sai's CPH2569 has 12 GB)
 
 ### B.1 Top repositories (Part B)
 

@@ -64,7 +64,23 @@ class ModelDownloads(private val app: OfflineAgentApp) {
 
     fun dirFor(kind: ModelKind): File = File(app.legacyModels.root, when (kind) { ModelKind.CHAT -> "chat"; ModelKind.EMBEDDING -> "embedding"; ModelKind.VISION -> "vision" }).apply { mkdirs() }
 
-    fun start(model: CatalogModel) = enqueue(model.id, model.name, model.kind, model.files)
+    /**
+     * Phase 6: checks free storage first (keeps 1.5 GB free, counts a resumable partial file) — a full phone breaks the
+     * camera, updates and the model itself. Returns the problem, or null when the download was queued.
+     */
+    fun start(model: CatalogModel): String? {
+        val dir = dirFor(model.kind)
+        val free = runCatching { android.os.StatFs(dir.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
+        val partial = model.files.sumOf { f -> dir.listFiles()?.filter { it.name.startsWith(f.file.substringAfterLast('/')) && it.name != f.file.substringAfterLast('/') }?.sumOf { it.length() } ?: 0L }
+        val check = com.offlineagent.core.models.StorageCheck.canDownload(model, free, partial)
+        if (!check.ok) {
+            update(DownloadState(model.id, model.name, DownloadState.Phase.FAILED, error = check.message))
+            Diagnostics.log("download blocked: ${check.message}")
+            return check.message
+        }
+        enqueue(model.id, model.name, model.kind, model.files)
+        return null
+    }
 
     /** A pasted Hugging Face link (role chosen by the user). */
     fun startCustom(ref: HfRef, kind: ModelKind): String {

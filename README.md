@@ -53,7 +53,7 @@ Earlier design: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/PHASE3.md`, `
 | Phase 5b UI (agent trace in Chat/Home, Agents chip, model card/onboarding on Home, catalogue on Agents) | ⚠️ compiles into both APKs; **not run on a device or emulator** |
 | Debug APKs, both flavors (`offline`, `connected`) | ✅ compile and package in the sandbox (aarch64 host, community NDK/aapt2 build) |
 | llama.cpp JNI + real GGUF on an ARM64 Linux host (Phase 2–4b harness) | ✅ earlier phases; Phase 5b harness above uses the same bridge |
-| **Anything on a real phone** (UI, speed, RAM, heat, voice, TTS, WorkManager resume, outbox, alarms, brightness, calendar insert, accessibility, autofill) | ❌ **untested** — first device: OnePlus CPH2569 (8 GB); checklist in `docs/PHASE5.md` §9 and `docs/DEVICE_TEST_PLAN.md` |
+| **Anything on a real phone** (UI, speed, RAM, heat, voice, TTS, WorkManager resume, outbox, alarms, brightness, calendar insert, accessibility, autofill) | ❌ **untested** — first device: OnePlus Nord CE 3 CPH2569 (12 GB); checklist in `docs/PHASE5.md` §9 and `docs/DEVICE_TEST_PLAN.md` |
 | Release (R8) build | ❌ not built |
 
 ## Feature history (Phases 1–4b)

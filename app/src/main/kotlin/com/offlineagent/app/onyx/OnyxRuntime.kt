@@ -99,6 +99,29 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     val onboardingDismissed = MutableStateFlow(false)
     val queue = InferenceQueue(sharedLlm)
 
+    /** Phase 6: on-phone benchmark (Agents → Models). */
+    val benchmark by lazy { Benchmark(app) }
+
+    /** Phase 6: thermal / battery decision applied to the loaded model (threads, batch, speculation, idle unload). */
+    private val _power = MutableStateFlow<com.offlineagent.core.agents.PowerGovernor.Decision?>(null)
+    val power: StateFlow<com.offlineagent.core.agents.PowerGovernor.Decision?> = _power.asStateFlow()
+    @Volatile private var applied: com.offlineagent.core.agents.PowerGovernor.Decision? = null
+    @Volatile private var lastModel: Any? = null
+
+    /** Phase 6: unloads the model after N idle minutes (Settings; shorter on low battery). Never during a task. */
+    val idleUnloader by lazy {
+        com.offlineagent.core.agents.IdleUnloader(app.appScope, System::currentTimeMillis,
+            timeoutMs = {
+                val min = app.cachedSettings.idleUnloadMinutes
+                if (min <= 0) 0L else minOf(min * 60_000L, _power.value?.idleUnloadMs ?: Long.MAX_VALUE)
+            },
+            busy = { isRunning || app.agents.isRunning || app.indexer.isBusy || com.offlineagent.app.work.LongTasks.current.value != null ||
+                app.inference.state.value is com.offlineagent.core.inference.EngineState.Generating },
+            loaded = { app.inference.state.value is com.offlineagent.core.inference.EngineState.Ready },
+            unload = { why -> com.offlineagent.app.diag.Diagnostics.log("idle unload: $why"); app.inference.unload(com.offlineagent.core.inference.UnloadReason.LOW_MEMORY) },
+        )
+    }
+
     private val _plan = MutableStateFlow<RuntimePlan?>(null)
     val runtimePlan: StateFlow<RuntimePlan?> = _plan.asStateFlow()
     private val _hasChatModel = MutableStateFlow(false)
@@ -132,9 +155,41 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
                 val d = ThermalGovernor.decide(t, ps, 4)
                 if (guard && d.pauseInference) queue.pause("Phone is hot (${t.name.lowercase()})") else queue.resume()
                 refreshDevice()
+                runCatching { applyPower() }
+            }
+        }
+        // Phase 6: battery + thermal governor every minute (and on every thermal / saver change): live thread / speculation
+        // changes between requests, idle-unload timeout.
+        app.appScope.launch(Dispatchers.IO) {
+            while (true) {
+                runCatching { applyPower() }
+                kotlinx.coroutines.delay(60_000)
+            }
+        }
+        app.appScope.launch {
+            app.inference.state.collect { st ->
+                if (st is com.offlineagent.core.inference.EngineState.Generating || st is com.offlineagent.core.inference.EngineState.Ready) idleUnloader.touch()
+                // A fresh load already used the current decision (EngineController reads it): remember it as applied.
+                if (st is com.offlineagent.core.inference.EngineState.Ready && st.model !== lastModel) { lastModel = st.model; applied = _power.value }
             }
         }
         app.appScope.launch { monitor.online.collect { if (it) runCatching { if (dao.openOutbox().isNotEmpty()) OutboxWorker.schedule(app) } } }
+    }
+
+    /** Recomputes the power decision; pushes thread / speculation changes to the loaded model when they changed. */
+    suspend fun applyPower(force: Boolean = false) {
+        val (pct, charging) = monitor.battery()
+        val base = app.cachedSettings.threads.takeIf { it > 0 } ?: com.offlineagent.engine.llamacpp.DeviceInfo.recommendedThreads()
+        val d = com.offlineagent.core.agents.PowerGovernor.decide(monitor.thermal.value, monitor.powerSave.value, base, pct, charging, app.cachedSettings.batchSize)
+        _power.value = d
+        val prev = applied
+        if (app.inference.state.value !is com.offlineagent.core.inference.EngineState.Ready) return
+        if (!force && prev != null && prev.threads == d.threads && prev.speculation == d.speculation && prev.pollLevel == d.pollLevel) return
+        val s = app.cachedSettings
+        app.inference.setThreads(d.threads, minOf(s.pollLevel, d.pollLevel))
+        app.inference.setSpeculation(if (s.ngramSpec && d.speculation && !s.safeMode && !s.speculative) s.ngramDraft else 0)
+        applied = d
+        idleUnloader.schedule()
     }
 
     suspend fun refreshDevice() = withContext(Dispatchers.IO) { runCatching { _plan.value = RuntimeSelector.plan(monitor.snapshot()) } }

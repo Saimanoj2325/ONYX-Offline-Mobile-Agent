@@ -158,7 +158,7 @@ Hugging Face under their own licences (Apache-2.0 / MIT for the catalogue).
 
 ## Phase 4b — fast first token, live streaming, reload ANR fix
 
-### What Sai reported (OnePlus CPH2569, Android 15, 8 GB, NEON/FP16/DOTPROD, no SVE/SME)
+### What Sai reported (OnePlus CPH2569, Android 15, 12 GB — earlier docs said 8 GB, NEON/FP16/DOTPROD, no SVE/SME)
 
 * Good: Qwen3-4B Q4_K_M loads at 8K / f16 KV / 4 threads on CPUs 4–7 and the self-test passes ("5" in 1.7 s) — the
   KleidiAI fix works on this phone.

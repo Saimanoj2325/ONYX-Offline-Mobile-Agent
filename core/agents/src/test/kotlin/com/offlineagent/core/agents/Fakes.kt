@@ -47,9 +47,9 @@ class FakeLlm(var plan: String = """{"steps":[]}""", var answer: String = "Your 
             prompts += system.take(30)
             return when {
                 system.startsWith("You plan") -> plan
-                system.startsWith("Fill the arguments for the tool flashlight") -> """{"on":true}"""
-                system.startsWith("Fill the arguments for the tool recent_notifications") -> """{"limit":5,"app":""}"""
-                system.startsWith("Fill the arguments for the tool fetch_url") -> """{"url":"https://example.com"}"""
+                user.startsWith("Tool: flashlight") -> """{"on":true}"""
+                user.startsWith("Tool: recent_notifications") -> """{"limit":5,"app":""}"""
+                user.startsWith("Tool: fetch_url") -> """{"url":"https://example.com"}"""
                 system.startsWith("Check an assistant") -> if (verifierOk) """{"ok":true,"issue":""}""" else """{"ok":false,"issue":"wrong"}"""
                 else -> answer
             }

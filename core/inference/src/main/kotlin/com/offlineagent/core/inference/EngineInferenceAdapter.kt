@@ -61,6 +61,7 @@ class EngineInferenceAdapter(
                 _state.value = EngineState.Loading(config.modelPath)
                 try {
                     val info = engine.load(config)
+                    if (config.ngramDraft > 0) runCatching { engine.setNgram(config.ngramMin, config.ngramMax, config.ngramDraft) }
                     loaded = info
                     _state.value = EngineState.Ready(info)
                     info
@@ -211,6 +212,14 @@ class EngineInferenceAdapter(
     }
 
     override suspend fun systemInfo(): String = withContext(engineDispatcher) { engine.systemInfo() }
+
+    override suspend fun setThreads(threads: Int, pollLevel: Int): Boolean = mutex.withLock {
+        withContext(engineDispatcher) { if (loaded == null) false else engine.setThreads(threads, pollLevel) }
+    }
+
+    override suspend fun setSpeculation(draftTokens: Int, minN: Int, maxN: Int): Boolean = mutex.withLock {
+        withContext(engineDispatcher) { if (loaded == null) false else engine.setNgram(minN, maxN, draftTokens) }
+    }
 
     /** Exact token count with the loaded model's tokenizer (null when no model is loaded or the engine is busy). */
     override suspend fun countTokens(text: String): Int? {

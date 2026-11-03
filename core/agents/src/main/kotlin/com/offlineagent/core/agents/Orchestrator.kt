@@ -81,8 +81,16 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
             Route.DIRECT -> PlannerAgent.assemble(request, emptyList(), "direct")
             Route.RULES, Route.FALLBACK -> PlannerAgent.assemble(request, ruleSteps, if (route == Route.RULES) "rules (fast path)" else "rules", RulePlanner.wantsScreen(request))
             Route.PLANNED -> {
-                board.working(AgentRole.PLANNER, "Planning")
-                try { planner.plan(request, board) } finally { board.working(AgentRole.PLANNER, null) }
+                // Phase 6: a learned routine for this kind of request skips the planning model call.
+                val routine = deps.routines?.let { rb -> runCatching { rb.match(request, deps.tools.specs().map { it.name }.toSet()) }.getOrNull() }
+                if (routine != null) {
+                    board.note("Reusing routine \"${routine.name}\" (${routine.steps.size} steps, no planning call)")
+                    runCatching { deps.routines?.markUsed(routine.id) }
+                    fromRoutine(request, routine)
+                } else {
+                    board.working(AgentRole.PLANNER, "Planning")
+                    try { planner.plan(request, board) } finally { board.working(AgentRole.PLANNER, null) }
+                }
             }
         }.let { p -> if (p.problems().isEmpty()) p else PlannerAgent.assemble(request, emptyList(), "fallback") }
         board.note("Route: ${route.label} · ${plan.nodes.count { it.id.startsWith("s") }} tool step(s)")
@@ -90,6 +98,17 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
         board.setStatus(TaskStatus.RUNNING)
         deps.store.save(board.checkpoint())
         execute(plan, board)
+    }
+
+    private fun fromRoutine(request: String, r: com.offlineagent.core.agents.memory.Routine): TaskPlan {
+        val specs = deps.tools.specs()
+        val steps = r.steps.mapNotNull { st ->
+            val spec = specs.firstOrNull { it.name == st.tool } ?: return@mapNotNull null
+            PlannerAgent.Step(if (isActionTool(spec)) AgentRole.EXECUTOR else AgentRole.DEVICE, st.tool, st.goal, st.after)
+        }
+        // Rule arguments for this request (times, texts) are taken over where the rules know the tool.
+        val middle = Coverage.repair(request, steps, RulePlanner.steps(request, specs), specs)
+        return PlannerAgent.assemble(request, middle, "routine: ${r.name}", RulePlanner.wantsScreen(request))
     }
 
     /** Continues a checkpointed run: finished nodes are kept, the rest run again (actions ask for approval again). */
@@ -125,6 +144,16 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
         val cp = board.checkpoint()
         deps.store.save(cp)
         if (status == TaskStatus.COMPLETED && deps.memory.enabled) runCatching { deps.memory.remember("Asked: ${board.request.take(200)}", "task:${board.runId}") }
+        // Phase 6: a fully successful multi-step plan becomes (or strengthens) a routine.
+        val tools = plan.nodes.filter { it.id.startsWith("s") && it.tool != null }
+        if (status == TaskStatus.COMPLETED && deps.routines != null && tools.size >= 2 &&
+            tools.all { st.nodes[it.id]?.status == NodeStatus.DONE } && (plan.source.startsWith("model") || plan.source.startsWith("routine"))) {
+            runCatching {
+                deps.routines?.recordSuccess(board.request, tools.map { n ->
+                    com.offlineagent.core.agents.memory.RoutineStep(n.tool!!, n.goal, n.dependsOn.filter { it.startsWith("s") }.mapNotNull { it.drop(1).toIntOrNull() })
+                })
+            }
+        }
         return cp
     }
 

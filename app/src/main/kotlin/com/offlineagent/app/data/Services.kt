@@ -100,6 +100,8 @@ class EngineController(
     private val models: ModelStore,
     private val settings: SettingsRepository,
     private val onPrefixCacheInvalid: () -> Unit = {},
+    /** Phase 6: current thermal/battery decision (null = unknown). */
+    private val powerDecision: () -> com.offlineagent.core.agents.PowerGovernor.Decision? = { null },
 ) {
     private val mutex = Mutex()
     private val _loaded = MutableStateFlow<ModelEntity?>(null)
@@ -167,14 +169,19 @@ class EngineController(
         val trained = arch?.trainedContext ?: 0
         val draft = if (!s.safeMode && s.speculative && role == ModelRole.CHAT) models.active(ModelRole.DRAFT)?.path?.takeIf { it != model.path } else null
         val yarn = !s.safeMode && s.yarn && s.largeContext && trained > 0 && ctx > trained
-        val threads = if (s.safeMode) threads().coerceIn(1, 4) else threads()
+        // Phase 6: thermal / battery saver / low battery scale threads + batch at load time (live changes: OnyxRuntime).
+        val power = powerDecision()
+        val threads = (if (s.safeMode) threads().coerceIn(1, 4) else threads()).let { t -> power?.let { minOf(t, it.threads) } ?: t }
+        val batch = (if (s.safeMode) 512 else s.batchSize).let { b -> power?.let { minOf(b, maxOf(64, it.batch)) } ?: b }
+        val ngram = if (!s.safeMode && s.ngramSpec && draft == null && (power?.speculation != false)) s.ngramDraft.coerceIn(1, 16) else 0
         return LoadConfig(
-            model.path, contextLength = ctx, threads = threads, batchSize = if (s.safeMode) 512 else s.batchSize,
-            ubatchSize = if (s.safeMode) 512 else s.ubatchSize.coerceAtMost(s.batchSize),
+            model.path, contextLength = ctx, threads = threads, batchSize = batch,
+            ubatchSize = (if (s.safeMode) 512 else s.ubatchSize).coerceAtMost(batch),
             mmprojPath = if (role == ModelRole.VISION) model.mmprojPath else null, kvCacheType = kv, flashAttention = fa,
             ropeScaling = if (yarn) com.offlineagent.core.inference.RopeScaling.YARN else com.offlineagent.core.inference.RopeScaling.MODEL,
             yarnOriginalContext = if (yarn) trained else 0, cpuIds = if (s.safeMode) emptyList() else DeviceInfo.performanceCoreIds(),
-            pollLevel = if (s.safeMode) 0 else s.pollLevel, draftModelPath = draft, draftTokens = s.draftTokens,
+            pollLevel = if (s.safeMode) 0 else minOf(s.pollLevel, power?.pollLevel ?: 100), draftModelPath = draft, draftTokens = s.draftTokens,
+            ngramDraft = ngram,
         ).also { lastConfig = it }
     }
 

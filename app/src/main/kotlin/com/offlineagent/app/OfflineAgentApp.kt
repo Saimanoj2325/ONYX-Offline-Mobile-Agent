@@ -151,7 +151,8 @@ class OfflineAgentApp : Application() {
         settings = SettingsRepository(this)
         legacyModels = ModelRepository(this).also { it.cleanupPartials() }
         models = ModelStore(db.misc(), legacyModels)
-        engineController = EngineController(inference, models, settings, onPrefixCacheInvalid = { LlamaCppEngine.clearPrefixCache(this) })
+        engineController = EngineController(inference, models, settings, onPrefixCacheInvalid = { LlamaCppEngine.clearPrefixCache(this) },
+            powerDecision = { runCatching { onyx.power.value }.getOrNull() })
         com.offlineagent.app.diag.Diagnostics.context = {
             "settings: ${cachedSettings.let { "ctx=${it.contextLength} kv=${it.kvCache} fa=${it.flashAttention} large=${it.largeContext} safe=${it.safeMode} threads=${it.threads} batch=${it.batchSize}/${it.ubatchSize} prefixCache=${it.prefixCache} spec=${it.speculative}" }}\n" +
                 "last load: ${engineController.lastConfig}"

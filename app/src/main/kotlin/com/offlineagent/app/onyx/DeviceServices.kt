@@ -114,6 +114,9 @@ class DeviceMonitor(private val ctx: Context) {
             totalRamMb = mi.totalMem / (1024 * 1024), availRamMb = mi.availMem / (1024 * 1024), lowRamDevice = am.isLowRamDevice,
             cpuCores = Runtime.getRuntime().availableProcessors(), performanceCores = DeviceInfo.recommendedThreads(), soc = soc,
             sdkInt = Build.VERSION.SDK_INT, thermal = _thermal.value, powerSave = _powerSave.value, batteryPercent = pct, charging = charging,
+            // Phase 6: free storage (models live in app-internal storage) + CPU features (dotprod / i8mm) for the tier picker.
+            freeStorageMb = runCatching { android.os.StatFs(ctx.filesDir.absolutePath).availableBytes / (1024 * 1024) }.getOrDefault(-1L),
+            cpuFeatures = DeviceInfo.cpuFeatures(),
         )
     }
 }

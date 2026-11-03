@@ -41,6 +41,17 @@ interface MemoryStore {
     val enabled: Boolean
     suspend fun recall(query: String, limit: Int): List<MemoryHit>
     suspend fun remember(text: String, source: String) {}
+    /**
+     * Phase 6: a short "known about the user" block (saved memories only, BM25-ranked) for the Planner, within
+     * [budgetTokens]. Empty when memory is off or nothing matches.
+     */
+    suspend fun profile(query: String, budgetTokens: Int): String = ""
+}
+
+/** Phase 6: learning hooks (frequent contacts from approved calls/messages, etc.). Never throw. */
+interface AgentHooks {
+    suspend fun onToolSucceeded(tool: String, args: JsonObject, risk: Risk) {}
+    companion object { val NONE = object : AgentHooks {} }
 }
 
 @Serializable

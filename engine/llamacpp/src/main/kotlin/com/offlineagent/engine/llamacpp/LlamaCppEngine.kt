@@ -26,7 +26,7 @@ import java.util.concurrent.Executors
 
 /** One file per (model, context settings, system prompt). Old ones are pruned to [MAX_FILES]. */
 object PrefixCacheFiles {
-    const val MAX_FILES = 8
+    const val MAX_FILES = 16 // Phase 6: one per agent role prompt (planner/args/writer/verifier) + chat + skills
     /** Everything else that changes the KV layout/contents (flash attention, batch, CPU variant, cache format). */
     @Volatile var configTag: String = ""
 
@@ -167,6 +167,16 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         val h = handle.takeIf { it != 0L } ?: return -1
         cacheFile?.let { File(it).parentFile?.mkdirs() }
         return LlamaNative.nativePrefixCache(h, prefix.toByteArray(Charsets.UTF_8), cacheFile ?: "", cacheFile != null)
+    }
+
+    override fun setThreads(threads: Int, pollLevel: Int): Boolean {
+        val h = handle.takeIf { it != 0L } ?: return false
+        return runCatching { LlamaNative.nativeSetThreads(h, threads, pollLevel) }.getOrDefault(false)
+    }
+
+    override fun setNgram(minN: Int, maxN: Int, draftTokens: Int): Boolean {
+        val h = handle.takeIf { it != 0L } ?: return false
+        return runCatching { LlamaNative.nativeSetNgram(h, minN, maxN, draftTokens) }.getOrDefault(false)
     }
 
     override fun prefillProgress(): IntArray? {

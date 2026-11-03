@@ -67,6 +67,10 @@ data class LoadConfig(
     val draftTokens: Int = 6,
     /** Directory for on-disk prompt-prefix KV caches (system prompt + skills). null = off. */
     val prefixCacheDir: String? = null,
+    /** Phase 6: n-gram self-speculation draft length (0 = off) and the n-gram sizes looked up. */
+    val ngramDraft: Int = 0,
+    val ngramMin: Int = 2,
+    val ngramMax: Int = 4,
 ) {
     init {
         require(contextLength in 256..MAX_CONTEXT_LENGTH) { "contextLength out of range: $contextLength" }

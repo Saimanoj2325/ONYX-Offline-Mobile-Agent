@@ -1,6 +1,6 @@
 # Phase 5 — ONYX multi-agent runtime, device integration, offline-first outbox, new UI
 
-Status: **built and unit-tested in the sandbox; not yet run on a phone** (target: OnePlus CPH2569, 8 GB). See §9.
+Status: **built and unit-tested in the sandbox; not yet run on a phone** (target: OnePlus CPH2569 — 12 GB RAM, corrected in Phase 6). See §9.
 
 ## 1. What Phase 5 adds (summary)
 
@@ -44,7 +44,7 @@ Status: **built and unit-tested in the sandbox; not yet run on a phone** (target
 | MLC LLM | GPU (OpenCL/Vulkan) compiled models, good speed | Per-model compilation, large toolchain, no grammar parity | Not now. |
 | ONNX Runtime GenAI / ExecuTorch | NPU paths on some SoCs | Model conversion effort, uneven Android support | Not now. |
 
-Model recommendations by tier (`RuntimeSelector`): Entry ≤4 GB → Qwen3 0.6B (Gemma 3 1B alternative) at 2K; Mid 6 GB → Qwen3 1.7B Q4_K_M at 4K; **High 8 GB (CPH2569) → Qwen3 1.7B Q4_K_M at 8K** (Llama 3.2 3B / Qwen3 4B as slower options); Flagship 12 GB+ → Qwen3 4B at 16K. Llama 3.2 3B (bartowski Q4_K_M) and Gemma 3 1B (ggml-org Q4_K_M) were added to the download catalogue (files checked on Hugging Face). Gemma 3n / "Gemma 4" are not in the catalogue: Gemma 3n E2B is ~3 GB at Q4 and untested with this llama.cpp build, and no Gemma 4 GGUF was verified.
+Model recommendations by tier (`RuntimeSelector`): Entry ≤4 GB → Qwen3 0.6B (Gemma 3 1B alternative) at 2K; Mid 6 GB → Qwen3 1.7B Q4_K_M at 4K; **High 8 GB → Qwen3 1.7B Q4_K_M at 8K** (CPH2569 is actually 12 GB → Flagship tier; corrected in Phase 6) (Llama 3.2 3B / Qwen3 4B as slower options); Flagship 12 GB+ → Qwen3 4B at 16K. Llama 3.2 3B (bartowski Q4_K_M) and Gemma 3 1B (ggml-org Q4_K_M) were added to the download catalogue (files checked on Hugging Face). Gemma 3n / "Gemma 4" are not in the catalogue: Gemma 3n E2B is ~3 GB at Q4 and untested with this llama.cpp build, and no Gemma 4 GGUF was verified.
 
 ### 2.3 Orchestration patterns considered
 
@@ -185,7 +185,7 @@ Resume: `TaskCheckpoint` (plan + node states + blackboard facts) is saved to Roo
 7. Voice orb: check the on-device recognizer pill and that speech works in airplane mode.
 8. Heat: run long tasks; at SEVERE thermal the queue shows "paused: cooling".
 9. Memory: add/edit/pin/delete/export; turn memory off and check recall says "turned off".
-10. Agents screen: tier = High (8 GB), recommended Qwen3 1.7B at 8K.
+10. Agents screen: tier = Flagship (12 GB+) on the CPH2569 (12 GB), recommended Qwen3 1.7B at 8K.
 
 ## 10. Phase 5b — direct model downloads back on top, orchestration fixes, live multi-agent trace
 
