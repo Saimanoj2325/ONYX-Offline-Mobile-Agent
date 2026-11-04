@@ -324,6 +324,8 @@ interface HistoryRepo {
     suspend fun all(): List<HistoryChunk>
     suspend fun add(c: HistoryChunk): Long
     suspend fun deleteChat(chatId: Long)
+    /** Removes only the rolling-summary chunks of [chatId] (used to replace a chat's summary instead of appending). */
+    suspend fun deleteSummaries(chatId: Long)
     suspend fun deleteMatching(phrase: String): Int
     suspend fun deleteAll()
 }
@@ -333,6 +335,7 @@ class InMemoryHistoryRepo : HistoryRepo {
     override suspend fun all() = synchronized(items) { items.toList() }
     override suspend fun add(c: HistoryChunk): Long = synchronized(items) { val id = next++; items += c.copy(id = id); id }
     override suspend fun deleteChat(chatId: Long) { synchronized(items) { items.removeAll { it.chatId == chatId } } }
+    override suspend fun deleteSummaries(chatId: Long) { synchronized(items) { items.removeAll { it.chatId == chatId && it.summary } } }
     override suspend fun deleteMatching(phrase: String): Int = synchronized(items) { val n = items.size; items.removeAll { it.text.contains(phrase, true) }; n - items.size }
     override suspend fun deleteAll() { synchronized(items) { items.clear() } }
 }
@@ -355,10 +358,20 @@ class ChatHistoryIndex(private val repo: HistoryRepo, private val clock: () -> L
 
     suspend fun addSummary(chatId: Long, title: String, summary: String, scope: MemoryScope) {
         if (!scope.writes || summary.isBlank()) return
+        // One summary per chat: the new rolling summary REPLACES the old one (it already folds the old one in).
+        repo.deleteSummaries(chatId)
+        idx().removeIf { it.chatId == chatId && it.summary }
         val c = HistoryChunk(chatId = chatId, chatTitle = title, text = "Summary: ${summary.take(1200)}", createdAt = clock(), summary = true)
         val id = repo.add(c)
         idx().add(c.copy(id = id), title + " " + c.text)
     }
+
+    /** "Threads" on the Memory screen: the current summary of each chat, newest first. */
+    suspend fun threads(): List<HistoryChunk> =
+        repo.all().filter { it.summary }.groupBy { it.chatId }.map { (_, v) -> v.maxBy { it.createdAt } }.sortedByDescending { it.createdAt }
+
+    /** Deletes a thread from memory: its summary and every indexed exchange of that chat (the chat itself stays). */
+    suspend fun deleteThread(chatId: Long) = deleteChat(chatId)
 
     suspend fun search(query: String, limit: Int, excludeChatId: Long? = null): List<HistoryChunk> {
         val now = clock()

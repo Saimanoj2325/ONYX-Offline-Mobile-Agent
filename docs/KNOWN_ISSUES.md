@@ -119,3 +119,13 @@
 - After an app restart, old chat traces show saved states/outputs only (no live thoughts or call timings).
 - Chat "Agents: auto" sends any request with tool words (e.g. "explain how to set up Wi-Fi") to the agents; they answer
   directly (1 call) but without the Chat mode's rich-UI prompt. Switch to "Agents: off" for pure chat.
+
+## Phase 6 — see docs/PHASE6.md
+- **No device test yet**: tiers, speculation, power governor, benchmark, the Memory screen (Threads, contacts, routines),
+  memory chips and temporary chat are compiled and JVM-tested only. Speculation numbers are from a 2-vCPU sandbox host.
+- With Qwen3 1.7B greedy code-edit prompts, output differs when n-gram speculation is on (probably numeric drift from
+  batched verification vs single-token decode).
+- Memory extraction is English rules plus an optional small-model pass; unusual phrasing can be missed or mis-worded
+  (inferred memories are marked until confirmed).
+- Chat-history retrieval is keyword (BM25), not semantic: paraphrases with no shared words are not found.
+- Deleting a thread forgets its summary and snippets; the chat's next summary (if it keeps growing) is re-indexed.

@@ -208,6 +208,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteChat(id: Long) = viewModelScope.launch {
         chats.deleteChat(id)
+        runCatching { g.onyx.longMemory.onChatDeleted(id) } // Phase 6: its history, summary and chat state go too
         if (_ui.value.chatId == id) openChat(null)
     }
 

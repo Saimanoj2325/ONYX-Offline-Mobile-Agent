@@ -110,6 +110,8 @@ interface Phase6Dao {
     @Query("SELECT * FROM history_chunks ORDER BY createdAt DESC LIMIT 5000") suspend fun history(): List<HistoryChunkEntity>
     @androidx.room.Insert suspend fun insertHistory(h: HistoryChunkEntity): Long
     @Query("DELETE FROM history_chunks WHERE chatId = :chatId") suspend fun deleteHistoryOfChat(chatId: Long)
+    @Query("DELETE FROM history_chunks WHERE chatId = :chatId AND summary = 1") suspend fun deleteSummariesOfChat(chatId: Long)
+    @Query("SELECT * FROM history_chunks WHERE summary = 1 ORDER BY createdAt DESC") fun observeSummaries(): Flow<List<HistoryChunkEntity>>
     @Query("DELETE FROM history_chunks WHERE text LIKE '%' || :phrase || '%'") suspend fun deleteHistoryMatching(phrase: String): Int
     @Query("DELETE FROM history_chunks") suspend fun deleteAllHistory()
     @Query("SELECT COUNT(*) FROM history_chunks") fun observeHistoryCount(): Flow<Int>
@@ -118,6 +120,8 @@ interface Phase6Dao {
     @Query("SELECT * FROM chat_memory_state WHERE chatId = :chatId") fun observeChatState(chatId: Long): Flow<ChatMemoryStateEntity?>
     @Upsert suspend fun upsertChatState(s: ChatMemoryStateEntity)
     @Query("DELETE FROM chat_memory_state") suspend fun deleteAllChatStates()
+    @Query("DELETE FROM chat_memory_state WHERE chatId = :chatId") suspend fun deleteChatState(chatId: Long)
+    @Query("UPDATE chat_memory_state SET summary = '', summarizedTurns = 0 WHERE chatId = :chatId") suspend fun clearSummaryOf(chatId: Long)
     @Query("UPDATE chat_memory_state SET summary = '', summarizedTurns = 0") suspend fun clearSummaries()
 }
 
@@ -160,6 +164,7 @@ class RoomHistoryRepo(private val dao: Phase6Dao) : HistoryRepo {
     override suspend fun all() = dao.history().map { HistoryChunk(it.id, it.chatId, it.chatTitle, it.text, it.createdAt, it.summary) }
     override suspend fun add(c: HistoryChunk) = dao.insertHistory(HistoryChunkEntity(0, c.chatId, c.chatTitle, c.text, c.createdAt, c.summary))
     override suspend fun deleteChat(chatId: Long) = dao.deleteHistoryOfChat(chatId)
+    override suspend fun deleteSummaries(chatId: Long) = dao.deleteSummariesOfChat(chatId)
     override suspend fun deleteMatching(phrase: String) = dao.deleteHistoryMatching(phrase)
     override suspend fun deleteAll() = dao.deleteAllHistory()
 }

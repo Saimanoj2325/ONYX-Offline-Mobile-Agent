@@ -56,6 +56,8 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
     val contacts by remember { onyx.db.phase6().observeContacts() }.collectAsState(initial = emptyList())
     val routines by remember { onyx.db.phase6().observeRoutines() }.collectAsState(initial = emptyList())
     val historyCount by remember { onyx.db.phase6().observeHistoryCount() }.collectAsState(initial = 0)
+    val threads by remember { onyx.db.phase6().observeSummaries() }.collectAsState(initial = emptyList())
+    var viewingThread by remember { mutableStateOf<com.offlineagent.core.data.HistoryChunkEntity?>(null) }
     var renaming by remember { mutableStateOf<com.offlineagent.core.data.RoutineEntity?>(null) }
     var confirmWipe by remember { mutableStateOf(false) }
 
@@ -114,6 +116,27 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
                 }
             }
             if (memories.isNotEmpty()) item { TextButton(onClick = { confirmClear = true }) { Text("Delete all memories", color = MaterialTheme.colorScheme.error) } }
+            // Phase 6: threads = rolling summaries of past chats (what "reference chat history" recalls first)
+            item {
+                SectionCard {
+                    Text("Threads", style = MaterialTheme.typography.titleSmall)
+                    Text("Summaries of your chats that ONYX can recall in new chats. Deleting a thread forgets it here; the chat itself stays.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (threads.isEmpty()) Text("None yet — long chats get a summary once older turns leave the context window.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    threads.distinctBy { it.chatId }.take(30).forEach { t ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(t.chatTitle, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
+                                Text(t.text.removePrefix("Summary: "), style = MaterialTheme.typography.labelSmall, maxLines = 2,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            TextButton(onClick = { viewingThread = t }) { Text("View") }
+                            IconButton(onClick = { scope.launch { onyx.longMemory.deleteThread(t.chatId) } }) { Icon(Icons.Default.Delete, "Delete thread") }
+                        }
+                    }
+                }
+            }
             // Phase 6: frequent contacts (learned only from approved calls / messages)
             item {
                 SectionCard {
@@ -181,6 +204,13 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
             text = { OutlinedTextField(name, { name = it }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { scope.launch { onyx.longMemory.routines.rename(r.id, name) }; renaming = null }) { Text("Save") } },
             dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } })
+    }
+    viewingThread?.let { t ->
+        AlertDialog(onDismissRequest = { viewingThread = null }, title = { Text(t.chatTitle) },
+            text = { Text(t.text.removePrefix("Summary: ")) },
+            confirmButton = { TextButton(onClick = { viewingThread = null }) { Text("Close") } },
+            dismissButton = { TextButton(onClick = { scope.launch { onyx.longMemory.deleteThread(t.chatId) }; viewingThread = null }) {
+                Text("Delete", color = MaterialTheme.colorScheme.error) } })
     }
     if (confirmWipe) AlertDialog(onDismissRequest = { confirmWipe = false }, title = { Text("Wipe all memory?") },
         text = { Text("Deletes saved memories, the chat-history index, rolling summaries, frequent contacts and routines. Chats themselves stay. This cannot be undone.") },

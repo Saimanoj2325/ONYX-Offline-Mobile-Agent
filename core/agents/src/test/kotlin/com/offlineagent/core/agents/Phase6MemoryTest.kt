@@ -260,4 +260,51 @@ class Phase6MemoryTest {
         assertTrue(users.single().contains("Prefers short answers"))
         assertTrue(users.single().contains("Tools:"))
     }
+
+    // ---------------------------------------------------------------- M2: summaries replace, chat deletion, threads
+    @Test fun newSummaryReplacesOldOneInHistoryIndex() = runBlocking {
+        val repo = InMemoryHistoryRepo()
+        val hist = ChatHistoryIndex(repo, clock)
+        hist.addExchange(7, "Trip", "plan goa trip", "ok", MemoryScope.NORMAL)
+        hist.addSummary(7, "Trip", "Planning a Goa trip in December with Anu", MemoryScope.NORMAL)
+        now += 1000
+        hist.addSummary(7, "Trip", "Goa trip moved to January; train booked", MemoryScope.NORMAL)
+        now += 1000
+        hist.addSummary(8, "Other", "Fixing a Gradle build", MemoryScope.NORMAL)
+        val sums = repo.all().filter { it.summary && it.chatId == 7L }
+        assertEquals(1, sums.size)
+        assertTrue(sums.single().text.contains("January"))
+        assertEquals(1, repo.all().count { !it.summary && it.chatId == 7L }) // exchanges are untouched
+        // the in-memory BM25 index forgot the old summary too
+        assertTrue(hist.search("december goa anu", 5).none { it.summary && it.text.contains("December") })
+        assertTrue(hist.search("goa january train", 5).any { it.summary && it.chatId == 7L })
+        val threads = hist.threads()
+        assertEquals(listOf(8L, 7L), threads.map { it.chatId })
+    }
+
+    @Test fun deletingChatDeletesItsHistoryAndSummaries() = runBlocking {
+        val repo = InMemoryHistoryRepo()
+        val hist = ChatHistoryIndex(repo, clock)
+        hist.addExchange(1, "Bike", "my bike needs a chain service", "Book a service at the shop", MemoryScope.NORMAL)
+        hist.addSummary(1, "Bike", "Bike chain service planned", MemoryScope.NORMAL)
+        hist.addExchange(2, "Exam", "ML exam on Friday", "Revise CNNs", MemoryScope.NORMAL)
+        assertTrue(hist.search("bike chain service", 5).isNotEmpty())
+        hist.deleteChat(1)
+        assertTrue(repo.all().none { it.chatId == 1L })
+        assertTrue(hist.search("bike chain service", 5).isEmpty())
+        assertTrue(hist.threads().none { it.chatId == 1L })
+        assertEquals(1, repo.all().count { it.chatId == 2L })
+        // deleting a thread from the Memory screen works the same way
+        hist.addSummary(2, "Exam", "ML exam Friday, revising CNNs", MemoryScope.NORMAL)
+        hist.deleteThread(2)
+        assertTrue(repo.all().isEmpty())
+    }
+
+    @Test fun temporaryChatSummaryIsNeverIndexed() = runBlocking {
+        val repo = InMemoryHistoryRepo()
+        val hist = ChatHistoryIndex(repo, clock)
+        hist.addSummary(3, "Secret", "Surprise party plans", MemoryScope.TEMPORARY)
+        assertTrue(repo.all().isEmpty())
+        assertTrue(hist.threads().isEmpty())
+    }
 }

@@ -186,6 +186,20 @@ class OnyxMemory(private val app: OfflineAgentApp, private val runtime: OnyxRunt
         (learned + book).distinctBy { it.second?.filter(Char::isDigit)?.takeLast(10) ?: it.first }
     }
 
+    // ---------------------------------------------------------------- threads + chat deletion
+    /** Deleting a chat deletes everything memory kept about it: indexed exchanges, its summary and its chat state. */
+    suspend fun onChatDeleted(chatId: Long) = withContext(Dispatchers.IO) {
+        runCatching { history.deleteChat(chatId) }
+        runCatching { p6.deleteChatState(chatId) }
+        temporary.remove(chatId)
+    }
+
+    /** Memory screen → Threads → delete: forgets the chat's summary and indexed snippets; the chat itself stays. */
+    suspend fun deleteThread(chatId: Long) = withContext(Dispatchers.IO) {
+        runCatching { history.deleteThread(chatId) }
+        runCatching { p6.clearSummaryOf(chatId) }
+    }
+
     // ---------------------------------------------------------------- wipe
     /** Deletes EVERYTHING memory-related: saved memories, chat-history index, summaries, contacts, routines. */
     suspend fun wipeAll() = withContext(Dispatchers.IO) {
