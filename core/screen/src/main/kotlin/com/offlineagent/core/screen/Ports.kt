@@ -38,6 +38,10 @@ interface ScreenPort {
     suspend fun awaitIdle(timeoutMs: Long)
     /** Human label of [pkg] for approval sheets. */
     fun appLabel(pkg: String): String = pkg
+    /** Phase 6.1: opens a Settings page by its entry intent (first action the phone resolves). False when none works. */
+    suspend fun openSettings(actions: List<String>): Boolean = false
+    /** Package of the phone's Settings app (what a Settings page shows up as). */
+    fun settingsPackage(): String = "com.android.settings"
 }
 
 /** UI side: floating overlay (step preview, per-step Allow/Deny, take-over hand-off). */
@@ -53,7 +57,11 @@ interface ScreenHost {
 fun interface ScreenAudit { suspend fun record(action: String, detail: String, risk: Risk) }
 
 /** Kill switch: the overlay Stop button or the Settings switch. Checked before every action. */
-fun interface KillSwitch { fun engaged(): Boolean }
+fun interface KillSwitch {
+    fun engaged(): Boolean
+    /** Why it is engaged, in words the user can act on (which switch to turn back on). */
+    fun reason(): String = "screen automation was stopped by you (kill switch). Turn it back on to continue."
+}
 
 /** Optional model access for screen_extract (fallback) and screen_do (grounded early exit). */
 interface ScreenLlm {

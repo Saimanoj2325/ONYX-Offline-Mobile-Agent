@@ -77,13 +77,23 @@ class PlannerAgent(private val deps: AgentDeps) {
         // Phase 5b: small models often merge or drop parts of a multi-part request ("…at 7pm and tell me tomorrow's
         // plan" → one reminder step). Coverage repair adds a step for every clause whose best tool is missing and
         // takes complete rule arguments (e.g. time "19:00") over model-filled ones.
-        val middle = Coverage.repair(request, base, rules, specs)
+        val middle = Coverage.repair(request, base, rules, specs).let { m -> screenRepair(request, m, specs) }
         val source = when { llmPlan.isNullOrEmpty() -> "rules"; middle.size > base.size -> "model + coverage check"; else -> "model" }
         if (middle.size > base.size) board.note("Coverage check added ${middle.size - base.size} step(s) the planner missed")
         return assemble(request, middle, source, screen = RulePlanner.wantsScreen(request))
     }
 
     data class Step(val agent: AgentRole, val tool: String?, val goal: String, val after: List<Int>, val args: JsonObject = JsonObject(emptyMap()))
+
+    /** Phase 6.1: an in-app request whose plan only opens the app gets the screen steps instead (when available). */
+    private fun screenRepair(request: String, steps: List<Step>, specs: List<ToolSpec>): List<Step> {
+        val p = InAppRequest.parse(request) ?: return steps
+        if (steps.any { it.tool in InAppRequest.IN_APP_TOOLS }) return steps
+        val screen = InAppRequest.steps(p, specs).ifEmpty { return steps }
+        return steps.filter { it.tool !in InAppRequest.OPEN_ONLY_TOOLS && it.after.isEmpty() }.take(4 - screen.size).let { rest ->
+            screen + rest.map { it.copy(after = emptyList()) }
+        }
+    }
 
     private suspend fun llmSteps(@Suppress("UNUSED_PARAMETER") q: InferenceQueue, request: String, all: List<ToolSpec>, board: Blackboard): List<Step> {
         val specs = (ToolSelector.relevant(request, all, 10) + all.filter { it.name in setOf("get_datetime", "device_info", "search_docs") }).distinctBy { it.name }
@@ -276,7 +286,10 @@ class WriterAgent(private val deps: AgentDeps) : Agent {
         }
         if (deps.queue == null || attempt > 2) return NodeOutcome.Ok(template(board.request, st, results))
         val direct = results.isBlank()
-        val system = if (direct) "You are ONYX, a private offline phone assistant. Answer the user briefly and helpfully. Use the device facts only when relevant."
+        val inAppMissing = InAppRequest.isInApp(board.request) && !InAppCheck.inAppDone(st.plan, st.nodes)
+        val system = if (inAppMissing) "You are ONYX, an offline phone assistant. The user asked for steps INSIDE an app, but no step tapped or typed in it " +
+                "(at most the app was opened). Say plainly that the in-app part was not done and why, using ONLY the step results. Never claim it was done."
+            else if (direct) "You are ONYX, a private offline phone assistant. Answer the user briefly and helpfully. Use the device facts only when relevant."
             else "You are ONYX, an offline phone assistant. Answer the user briefly and helpfully using ONLY the facts and step results. " +
                 "Never claim an action happened unless its step is DONE. Mention queued (offline) or declined steps honestly."
         val user = buildString {
@@ -290,7 +303,11 @@ class WriterAgent(private val deps: AgentDeps) : Agent {
         val text = try { modelCall(deps, board, AgentRole.WRITER, node.id, InferenceQueue.Priority.INTERACTIVE, "writer", system, user, null, 600) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (e: Exception) { return NodeOutcome.Ok(template(board.request, st, results) + "\n\n(The model could not write the answer: ${e.message?.take(120)})") }
-        return if (text.isBlank()) NodeOutcome.Fail("empty answer") else NodeOutcome.Ok(text)
+        if (text.isBlank()) return NodeOutcome.Fail("empty answer")
+        // Phase 6.1: on the last try, an in-app request whose in-app part never ran gets an explicit line (small models
+        // keep writing "Done!" after only app_open ran).
+        if (attempt >= 2 && InAppCheck.issues(board.request, text, st.plan, st.nodes).isNotEmpty()) return NodeOutcome.Ok(text.trimEnd() + "\n\n" + InAppCheck.notDone(board.request))
+        return NodeOutcome.Ok(text)
     }
 
     private fun template(request: String, st: Blackboard.State, results: String) =
@@ -326,6 +343,7 @@ class VerificationAgent(private val deps: AgentDeps, private val llmCheck: Boole
                 failedActions.none { f -> out.contains(f.goal, ignoreCase = true) || out.contains("declin", true) || out.contains("fail", true) || out.contains("could not", true) || out.contains("couldn't", true) })
                 issues += "claims success although an action failed or was declined"
             issues += ClaimCheck.issues(out, st.plan, st.nodes)
+            issues += InAppCheck.issues(board.request, out, st.plan, st.nodes)
         }
         return Report(issues.isEmpty(), issues)
     }

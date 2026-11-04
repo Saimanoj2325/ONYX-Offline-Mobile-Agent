@@ -142,6 +142,35 @@
 - The secure-window (FLAG_SECURE) check (`takeScreenshot` probe) is untested on a device.
 - `awaitIdle` polls the accessibility tree every 120 ms instead of listening to window events.
 - No vision fallback: screens without an accessibility tree (games, canvases, some WebViews) cannot be operated.
-- With the toggle on, the legacy chat agent (Phase 1–4 path) can still see the `screen_*` tools; only the Onyx planner hides them.
-- The shared AppSafetyPolicy blocks the whole Settings app and Play Store for screen use (`Use.SCREEN`), so v2 cannot change even harmless settings pages (Wi-Fi etc.) by screen; device tools cover those.
+- With the toggle on, the legacy chat agent (Phase 1–4 path) can still see the `screen_*` tools; in-app requests no longer reach it (6.1 routes them to ONYX), but an explicit `/skill` run still uses the legacy loop.
+- ~~The shared AppSafetyPolicy blocks the whole Settings app~~ — 6.1: Settings is page-gated (see below). The Play Store stays blocked for screen use.
 - The Android side (ports, overlay host, settings card) is compiled, not phone-tested.
+
+## Phase 6.1 (0.6.1) — screen agent routing, Settings allowlist, macro launcher fix — see docs/PHASE6.md §6.1
+- **Fixed: "screen control only opens apps".** Causes: (1) the Screen-automation phone group is off by default, so with only
+  the Agents toggle and the accessibility service on, the kill switch refused every `screen_*` call (STOPPED) and `app_open`
+  was the only tool that worked; (2) the planner (Qwen3 1.7B, ≤4 one-shot steps, tools picked by word overlap) chose
+  `app_open` for "open X and …", and nothing in the plan could do a multi-step in-app loop (`screen_do` is one step;
+  `run_phone_task` is hidden while v2 is on); (3) the verifier accepted "opened the app" as done; (4) Chat's Agent/Phone
+  modes used the legacy agent, which only had intent openers. 6.1: Agents toggle on → Screen-automation group allowed;
+  `Triage` routes in-app requests to `screen_open_app` → `screen_task` (new perceive→act loop) without a planner call;
+  Chat sends them to ONYX in every mode; `InAppCheck` + the Writer never report `app_open` alone as done; a status banner
+  (Chat + Agents) shows service/toggle/kill-switch mismatches with fix buttons.
+- `InAppRequest` is English, pattern-based ("open X and …", "in X, …", "… on X"). Phrasings it misses still go to the
+  planner, which is repaired (opener-only plan → screen steps) but can still pick wrong tools on a small model.
+- `screen_task` stops before Send/Submit/Enter unless the goal asks to send; then the step still needs the per-step OK.
+  A list row whose text contains words like "call" or "share" counts as irreversible and stops the loop early.
+- Loop guard: same action on the same screen 3× → STUCK; ≤12 actions by default (max 25).
+- **Settings allowlist** (screen only; AppBridge still never opens Settings): allowed Wi-Fi, Bluetooth, Display, Sound,
+  Do Not Disturb, Battery saver; ask every step: Location, Airplane mode, Mobile data, Hotspot; everything else blocked
+  incl. the Settings home and search. Pages are entered only by their entry intent and identified by the window title
+  (top 22% of the screen / toolbar ids) — English titles only; OxygenOS titles are a best guess and untested on a phone.
+  An unknown title blocks (Back still needs the user). `TETHER_SETTINGS` / `DATA_ROAMING_SETTINGS` fall back to
+  `WIRELESS_SETTINGS` when the phone lacks them.
+- **Fixed: macro recorded from the home screen failed at step 1** ("Open com.android.launcher → failed"). The launcher has
+  no launch intent. The recorder now skips launcher/systemui/ONYX windows, turns a home-screen icon tap into "open <app>",
+  and returning home into a HOME step; the runner replays a launcher step as Home and explains open failures; saved macros
+  are migrated on load (and re-saved). Home is detected with `resolveActivity(ACTION_MAIN + CATEGORY_HOME)` (needs the
+  new `<queries>` entry). An icon whose label matches no launchable app is dropped from the recording.
+- Still not run on a phone: the OnePlus Nord CE 3 checks are in docs/PHASE6.md §6.1.
+

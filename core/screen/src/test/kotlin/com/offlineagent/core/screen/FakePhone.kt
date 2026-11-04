@@ -62,6 +62,33 @@ class ChatApp : FakeApp("com.example.chat", "ChatApp") {
     }
 }
 
+/** Phase 6.1: the Settings app with a few pages (opened by entry intent through FakePhone.openSettings). */
+class SettingsApp : FakeApp("com.android.settings", "Settings") {
+    var page = "home"
+    var darkMode = false
+    var location = true
+    override fun tree(): ScreenNode = node("android.widget.FrameLayout", kids = arrayOf(when (page) {
+        "display" -> group("", group("com.android.settings:id/action_bar", text("Display")),
+            node("androidx.recyclerview.widget.RecyclerView", scroll = true, kids = arrayOf(
+                text("Brightness level"), node("android.widget.Switch", text = "Dark mode", click = true), text("Screen timeout"))))
+        "location" -> group("", group("com.android.settings:id/action_bar", text("Location")),
+            node("android.widget.Switch", text = "Use location", click = true), text("Recent access"))
+        "developer" -> group("", group("com.android.settings:id/action_bar", text("Developer options")),
+            node("android.widget.Switch", text = "USB debugging", click = true))
+        else -> group("", text("Settings"), node("android.widget.EditText", hint = "Search settings", click = true, edit = true),
+            button("Display"), button("Battery"), button("Apps"))
+    }))
+    override fun perform(n: ScreenNode, op: NodeOp, text: String): Boolean {
+        if (op == NodeOp.CLICK && n.label == "Dark mode") darkMode = !darkMode
+        if (op == NodeOp.CLICK && n.label == "Use location") location = !location
+        return op == NodeOp.CLICK
+    }
+    companion object {
+        val ACTIONS = mapOf("android.settings.DISPLAY_SETTINGS" to "display", "android.settings.LOCATION_SOURCE_SETTINGS" to "location",
+            "android.settings.APPLICATION_DEVELOPMENT_SETTINGS" to "developer")
+    }
+}
+
 class FakePhone(vararg apps: FakeApp) : ScreenPort {
     val apps = apps.associateBy { it.pkg }
     var foreground: String = apps.first().pkg
@@ -104,6 +131,25 @@ class FakePhone(vararg apps: FakeApp) : ScreenPort {
     override suspend fun share(text: String, pkg: String): Boolean { shared += pkg to text; return pkg in apps }
     override suspend fun awaitIdle(timeoutMs: Long) {}
     override fun appLabel(pkg: String) = apps[pkg]?.label ?: pkg
+    override suspend fun openSettings(actions: List<String>): Boolean {
+        val st = apps.values.filterIsInstance<SettingsApp>().firstOrNull() ?: return false
+        val page = actions.firstNotNullOfOrNull { SettingsApp.ACTIONS[it] } ?: return false
+        st.page = page; foreground = st.pkg; performed += "settings:$page"; return true
+    }
+}
+
+/** Scripted screen model: one line per stream call, then "Action: done". Records each prompt. */
+class ScriptLlm(vararg outs: String) : ScreenLlm {
+    private val q = ArrayDeque(outs.toList())
+    val users = mutableListOf<String>()
+    val systems = mutableListOf<String>()
+    override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int) = ""
+    override suspend fun stream(system: String, user: String, maxTokens: Int, onPartial: (String) -> Boolean): String {
+        systems += system; users += user
+        val o = q.removeFirstOrNull() ?: "Action: done"
+        onPartial(o)
+        return o
+    }
 }
 
 class FakeHost(var confirmAnswer: Boolean = true, var takeOverAnswer: Boolean = false) : ScreenHost {

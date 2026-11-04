@@ -374,6 +374,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun respond(chatId: Long, text: String, images: List<File>, mode: com.offlineagent.core.runtime.chat.ComposerMode, thinkOverride: Boolean? = null) {
         if (turnStartedAt == 0L) turnStartedAt = System.currentTimeMillis()
+        // Phase 6.1: with the Screen agent on, an in-app request ("open WhatsApp and type hi to Mom") always goes to the
+        // ONYX orchestrator, whose screen route runs screen_open_app → screen_task. The legacy chat agent and plain chat
+        // only had intent openers (app_open), so they opened the app and stopped.
+        if (images.isEmpty() && com.offlineagent.core.agents.ChatRouting.screenTask(text, mode, g.onyx.screen.enabled())) { runOnyx(chatId, text); return }
         when (mode) {
             com.offlineagent.core.runtime.chat.ComposerMode.AGENT -> { runAgent(chatId, text, null); return }
             com.offlineagent.core.runtime.chat.ComposerMode.PHONE -> { runAgent(chatId, "Use the phone action tools for this request (ask for approval where needed): $text", null); return }
@@ -928,3 +932,4 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         const val SYSTEM_PROMPT = com.offlineagent.core.runtime.chat.ChatPrompts.BASE
     }
 }
+

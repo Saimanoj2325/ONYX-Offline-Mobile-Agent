@@ -59,6 +59,9 @@ object Triage {
     fun isMultiStep(request: String): Boolean = MULTI.containsMatchIn(request)
 
     fun route(request: String, specs: List<ToolSpec>, hasModel: Boolean): Pair<Route, List<PlannerAgent.Step>> {
+        // Phase 6.1: "open X and do Y inside it" goes to the screen agent (screen_open_app → screen_task), never to a
+        // plain intent opener — with or without a model (screen_task reports NO_MODEL itself).
+        InAppRequest.parse(request)?.let { p -> InAppRequest.steps(p, specs).takeIf { it.isNotEmpty() }?.let { return Route.SCREEN to it } }
         val rules = RulePlanner.steps(request, specs)
         if (!hasModel) return Route.FALLBACK to rules
         if (!isTaskLike(request) && rules.isEmpty()) return Route.DIRECT to emptyList()

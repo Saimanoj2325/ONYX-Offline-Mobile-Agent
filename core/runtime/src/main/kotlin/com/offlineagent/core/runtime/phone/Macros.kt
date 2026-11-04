@@ -89,7 +89,18 @@ sealed interface RecordedEvent {
  * (the final text, not every keystroke), scrolls merged, and the user's own app (the recorder overlay) ignored.
  * Typed values that the user marks as variables become {{placeholders}}. Password fields are never recorded.
  */
-class MacroRecorder(private val ownPackage: String, private val policy: AutomationPolicy = AutomationPolicy()) {
+class MacroRecorder(
+    private val ownPackage: String,
+    private val policy: AutomationPolicy = AutomationPolicy(),
+    /**
+     * Phase 6.1: the home screen / launcher (the app finds it with PackageManager.resolveActivity(ACTION_MAIN +
+     * CATEGORY_HOME), never by name). Launcher windows are never a starting app: a tap on a home-screen icon becomes
+     * OPEN_APP of that app, returning to the home screen becomes HOME, everything else there is dropped.
+     */
+    private val isHome: (String) -> Boolean = { false },
+    /** Launcher icon label → package with a launch intent ("WhatsApp" → com.whatsapp); null when unknown. */
+    private val appForLabel: (String) -> String? = { null },
+) {
     private val steps = ArrayList<MacroStep>()
     private var startPackage = ""
     private var lastTime = 0L
@@ -102,11 +113,12 @@ class MacroRecorder(private val ownPackage: String, private val policy: Automati
             is RecordedEvent.WindowChanged -> e.packageName; is RecordedEvent.Clicked -> e.packageName
             is RecordedEvent.TextChanged -> e.packageName; is RecordedEvent.Scrolled -> e.packageName; is RecordedEvent.GlobalBack -> lastPackage
         }
-        if (pkg == ownPackage || pkg.startsWith("com.android.systemui")) return
+        if (MacroApps.isSystemChrome(pkg, ownPackage)) return
         val time = when (e) {
             is RecordedEvent.WindowChanged -> e.time; is RecordedEvent.Clicked -> e.time; is RecordedEvent.TextChanged -> e.time
             is RecordedEvent.Scrolled -> e.time; is RecordedEvent.GlobalBack -> e.time
         }
+        if (pkg.isNotEmpty() && isHome(pkg)) { onHome(e, time); return }
         if (startPackage.isEmpty() && pkg.isNotEmpty()) {
             startPackage = pkg
             steps += MacroStep(MacroStepKind.OPEN_APP, value = pkg)
@@ -135,6 +147,29 @@ class MacroRecorder(private val ownPackage: String, private val policy: Automati
         if (pkg.isNotEmpty()) lastPackage = pkg
     }
 
+    /** Launcher events: icon tap → OPEN_APP(app); coming back to the home screen mid-demo → HOME; the rest is dropped. */
+    private fun onHome(e: RecordedEvent, time: Long) {
+        when (e) {
+            is RecordedEvent.Clicked -> {
+                val label = e.node.label.ifBlank { e.node.contentDescription }.trim()
+                val target = label.takeIf { it.isNotBlank() }?.let(appForLabel)?.takeIf { !isHome(it) && !MacroApps.isSystemChrome(it, ownPackage) }
+                if (target != null) {
+                    if (startPackage.isEmpty()) startPackage = target
+                    if (!(steps.lastOrNull()?.kind == MacroStepKind.OPEN_APP && steps.last().value == target)) steps += MacroStep(MacroStepKind.OPEN_APP, value = target)
+                    lastPackage = target // the app's own window event that follows is not a second switch
+                    lastTime = time
+                }
+            }
+            is RecordedEvent.WindowChanged -> {
+                // Pressing Home in the middle of a demonstration (before: nothing recorded yet → nothing to replay).
+                if (steps.isNotEmpty() && steps.last().kind != MacroStepKind.HOME) steps += MacroStep(MacroStepKind.HOME)
+                lastPackage = e.packageName
+                lastTime = time
+            }
+            else -> Unit
+        }
+    }
+
     /** Replace literal typed values with placeholders: values -> parameter names. */
     fun build(id: String, name: String, description: String, variables: Map<String, String> = emptyMap(), now: Long = System.currentTimeMillis()): Macro {
         val params = ArrayList<String>()
@@ -144,11 +179,51 @@ class MacroRecorder(private val ownPackage: String, private val policy: Automati
                 if (v != null) { if (v.key !in params) params += v.key; s.copy(value = "{{${v.key}}}") } else s
             } else s
         }
-        return Macro(id, name, description, startPackage, finalSteps, params, createdAt = now)
+        return Macro(id, name, description, startPackage, finalSteps.dropLastWhile { it.kind == MacroStepKind.HOME }, params, createdAt = now)
     }
 
     companion object {
         fun selector(n: ScreenNode, pkg: String) = NodeSelector(pkg, n.viewId, n.text.take(80).takeIf { !n.editable } ?: "", n.contentDescription.take(80), n.className, n.hint.take(80))
+    }
+}
+
+/** Phase 6.1: which packages a macro may treat as an app, and the migration of macros recorded before 6.1. */
+object MacroApps {
+    /** Status bar / notification shade and ONYX itself are never part of a macro. */
+    fun isSystemChrome(pkg: String, ownPackage: String): Boolean =
+        pkg.isNotEmpty() && (pkg == ownPackage || pkg.startsWith("$ownPackage.") || pkg.startsWith("com.android.systemui"))
+
+    /**
+     * Fixes a macro recorded on the home screen (6.0 made "open com.android.launcher" its first step, which has no launch
+     * intent): leading launcher OPEN_APPs are dropped, later ones become HOME, a launcher icon TAP becomes OPEN_APP of the
+     * app behind the icon (when [appForLabel] knows it), and [Macro.startPackage] becomes the first real app.
+     * Returns the macro unchanged (same instance) when there is nothing to fix.
+     */
+    fun migrate(m: Macro, ownPackage: String, isHome: (String) -> Boolean, appForLabel: (String) -> String? = { null }): Macro {
+        fun home(p: String) = p.isNotEmpty() && (isHome(p) || isSystemChrome(p, ownPackage))
+        val touches = home(m.startPackage) || m.steps.any { st ->
+            (st.kind == MacroStepKind.OPEN_APP && home(st.value)) || (st.selector?.packageName?.let(::home) == true)
+        }
+        if (!touches) return m
+        val out = ArrayList<MacroStep>()
+        for (st in m.steps) {
+            val selPkg = st.selector?.packageName.orEmpty()
+            when {
+                st.kind == MacroStepKind.OPEN_APP && home(st.value) -> if (out.isNotEmpty() && out.last().kind != MacroStepKind.HOME) out += MacroStep(MacroStepKind.HOME)
+                st.kind == MacroStepKind.TAP && home(selPkg) -> {
+                    val label = st.selector?.let { sel -> sel.text.ifBlank { sel.contentDescription } }.orEmpty()
+                    val target = label.takeIf { it.isNotBlank() }?.let(appForLabel)?.takeIf { !home(it) }
+                    if (target != null) { if (!(out.lastOrNull()?.kind == MacroStepKind.OPEN_APP && out.last().value == target)) out += MacroStep(MacroStepKind.OPEN_APP, value = target, waitMillis = st.waitMillis) }
+                    else { if (out.lastOrNull()?.kind != MacroStepKind.HOME) out += MacroStep(MacroStepKind.HOME); out += st }
+                }
+                (st.kind == MacroStepKind.TYPE || st.kind == MacroStepKind.SCROLL) && home(selPkg) -> Unit // launcher search / page swipes
+                else -> out += st
+            }
+        }
+        while (out.firstOrNull()?.kind == MacroStepKind.HOME) out.removeAt(0)
+        val start = out.firstOrNull { it.kind == MacroStepKind.OPEN_APP }?.value
+            ?: out.firstNotNullOfOrNull { it.selector?.packageName?.takeIf { p -> p.isNotBlank() && !home(p) } } ?: ""
+        return m.copy(startPackage = start, steps = out)
     }
 }
 
@@ -185,6 +260,11 @@ class MacroPlayer(
     private val findTimeoutMillis: Long = 6000,
     private val clock: () -> Long = System::currentTimeMillis,
     private val sleep: suspend (Long) -> Unit = { kotlinx.coroutines.delay(it) },
+    /** Phase 6.1: the launcher (an OPEN_APP of it replays as Home). */
+    private val isHome: (String) -> Boolean = { false },
+    /** Why [pkg] cannot be opened (not installed, no launch screen, hidden by package visibility, blocked), or null. */
+    private val openProblem: (String) -> String? = { null },
+    private val appLabel: (String) -> String = { it },
 ) {
     suspend fun play(m: Macro, params: Map<String, String>, unattended: Boolean = false): String {
         val missing = m.params.filter { params[it].isNullOrBlank() }
@@ -195,7 +275,13 @@ class MacroPlayer(
             val action: ScreenAction
             var snap: ScreenSnapshot? = null
             when (st.kind) {
-                MacroStepKind.OPEN_APP -> action = ScreenAction.OpenApp(st.value)
+                MacroStepKind.OPEN_APP -> {
+                    if (st.value.isBlank()) return fail("step $step has no app to open", step)
+                    action = if (isHome(st.value)) ScreenAction.Home else {
+                        openProblem(st.value)?.let { why -> return fail("can't open ${appLabel(st.value)} (${st.value}): $why", step) }
+                        ScreenAction.OpenApp(st.value)
+                    }
+                }
                 MacroStepKind.BACK -> action = ScreenAction.Back
                 MacroStepKind.HOME -> action = ScreenAction.Home
                 MacroStepKind.WAIT -> action = ScreenAction.Wait(st.waitMillis)
@@ -226,7 +312,14 @@ class MacroPlayer(
                 if (st.irreversible && action !is ScreenAction.Tap) { /* marked steps are taps; nothing else */ }
                 val ok = driver.perform(action, s)
                 log.add(AutomationLogEntry(clock(), step, s.packageName, action.describe(s), if (ok) "ok (macro ${m.name})" else "failed (macro ${m.name})"))
-                if (!ok) return fail("step $step failed", step)
+                if (!ok) return fail(when (action) {
+                    is ScreenAction.OpenApp -> "could not open ${appLabel(action.app)} (${action.app}) — Android has no launch screen for it, or it is hidden from ONYX"
+                    is ScreenAction.Tap -> "tapping \"${action.describe(s).removePrefix("Tap ").take(40)}\" did nothing (the control is gone or not tappable)"
+                    is ScreenAction.Type -> "could not type into that field"
+                    ScreenAction.Home -> "could not go to the home screen"
+                    ScreenAction.Back -> "could not press Back"
+                    else -> "${action.describe(s)} failed"
+                }, step)
             } else return fail("cannot read the screen", step)
             sleep(500)
         }

@@ -146,6 +146,7 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
                 },
             )
             SafetyBanners(vm)
+            com.offlineagent.app.onyx.screen.ScreenAgentStatusBanner(vm.getApplication())
             ui.unfinishedRun?.let { r ->
                 Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
                     Row(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {

@@ -82,11 +82,19 @@ class FileAutomationLog(ctx: Context) : AutomationLog {
     @Synchronized fun clear() { file.delete(); _recent.value = emptyList() }
 }
 
-class MacroStore(ctx: Context) {
+class MacroStore(ctx: Context, private val migrate: (Macro) -> Macro = { it }) {
     private val dir = File(ctx.filesDir, "macros").apply { mkdirs() }
     private val _macros = MutableStateFlow(load())
     val macros: StateFlow<List<Macro>> = _macros.asStateFlow()
-    private fun load() = dir.listFiles { f -> f.extension == "json" }?.mapNotNull { runCatching { MacroCodec.decode(it.readText()) }.getOrNull() }?.sortedBy { it.name } ?: emptyList()
+    /** Phase 6.1: macros recorded on the home screen (first step "open <launcher>") are fixed on load and saved back. */
+    private fun load() = dir.listFiles { f -> f.extension == "json" }?.mapNotNull { f ->
+        runCatching {
+            val m = MacroCodec.decode(f.readText())
+            val fixed = runCatching { migrate(m) }.getOrDefault(m)
+            if (fixed !== m) runCatching { f.writeText(fixed.toJson()) }
+            fixed
+        }.getOrNull()
+    }?.sortedBy { it.name } ?: emptyList()
     fun save(m: Macro) { File(dir, "${m.id}.json").writeText(m.toJson()); _macros.value = load() }
     fun delete(id: String) { File(dir, "$id.json").delete(); _macros.value = load() }
     fun find(nameOrId: String): Macro? = _macros.value.firstOrNull { it.id == nameOrId } ?: _macros.value.firstOrNull { it.name.equals(nameOrId, true) }
@@ -99,7 +107,8 @@ class MacroStore(ctx: Context) {
  * irreversible steps), is visible in the overlay with Pause/Stop, is logged, and is kept alive by the foreground service.
  */
 class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
-    val macros = MacroStore(app)
+    val launcher = LauncherInfo(app)
+    val macros = MacroStore(app) { m -> com.offlineagent.core.runtime.phone.MacroApps.migrate(m, app.packageName, launcher::isHome, launcher::appForLabel) }
     private var running: ScreenAgent? = null
     private var job: Job? = null
     private val _recording = MutableStateFlow(false)
@@ -226,7 +235,9 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
         val taskId = "macro-" + m.id
         LongTasks.start(app, LongTask(taskId, "Running macro", m.name))
         try {
-            return MacroPlayer(s, host(s, "Macro: ${m.name}") { null }, app.automationPolicy(), app.automationLog).play(m, values, unattended)
+            val policy = app.automationPolicy()
+            return MacroPlayer(s, host(s, "Macro: ${m.name}") { null }, policy, app.automationLog,
+                isHome = launcher::isHome, openProblem = { pkg -> launcher.openProblem(pkg, policy::isBlockedApp) }, appLabel = launcher::label).play(m, values, unattended)
         } finally { LongTasks.finish(app, taskId) }
     }
 
@@ -234,7 +245,7 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
 
     fun startRecording(onSaved: (Macro?) -> Unit) {
         val s = service()
-        val rec = MacroRecorder(app.packageName, app.automationPolicy())
+        val rec = MacroRecorder(app.packageName, app.automationPolicy(), isHome = launcher::isHome, appForLabel = launcher::appForLabel)
         s.recorder = rec
         _recording.value = true
         s.overlay().showRecording(onSave = {

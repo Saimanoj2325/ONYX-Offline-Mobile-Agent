@@ -79,6 +79,7 @@ class Orchestrator(private val deps: AgentDeps, private val config: Orchestrator
         board.setRoute(route)
         val plan = when (route) {
             Route.DIRECT -> PlannerAgent.assemble(request, emptyList(), "direct")
+            Route.SCREEN -> PlannerAgent.assemble(request, ruleSteps, "screen agent (in-app task)")
             Route.RULES, Route.FALLBACK -> PlannerAgent.assemble(request, ruleSteps, if (route == Route.RULES) "rules (fast path)" else "rules", RulePlanner.wantsScreen(request))
             Route.PLANNED -> {
                 // Phase 6: a learned routine for this kind of request skips the planning model call.

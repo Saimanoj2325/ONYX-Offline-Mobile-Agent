@@ -1,7 +1,9 @@
 package com.offlineagent.core.screen
 
 import com.offlineagent.core.apps.AppSafetyPolicy
+import com.offlineagent.core.apps.SettingsPages
 import com.offlineagent.core.runtime.phone.ScreenNode
+import com.offlineagent.core.runtime.phone.ScreenSnapshot
 
 sealed interface SafetyVerdict {
     data object Allow : SafetyVerdict
@@ -23,6 +25,11 @@ interface ScreenSafetyPolicy {
     fun screenVerdict(frame: ScreenFrame): SafetyVerdict
     /** True when activating [node] likely commits something (send/submit/pay/delete…). */
     fun isIrreversible(node: ScreenNode): Boolean = Irreversible.matches(node)
+    /**
+     * Phase 6.1: a reason when acting on [node] in [frame] must be confirmed by the user EVERY time (Settings "ask each
+     * time" pages: location, airplane mode, mobile data, hotspot). Null = no extra confirmation.
+     */
+    fun confirmReason(frame: ScreenFrame, node: ScreenNode?): String? = null
     /** Typing into this field must be done by the user (password / one-time code). */
     fun needsUserInput(node: ScreenNode): String? = when {
         node.password -> "this is a password field — please type it yourself"
@@ -74,6 +81,8 @@ class DefaultScreenSafetyPolicy(
         val p = pkg.lowercase()
         if (p.isBlank()) return SafetyVerdict.Allow
         if (p == selfPackage.lowercase() || p.startsWith(selfPackage.lowercase() + ".")) return SafetyVerdict.Block("ONYX itself is on screen and never operates itself — open the app you want (or name it so I can open it with screen_open_app)")
+        // Phase 6.1: the Settings app is page-gated (allowlisted pages only, checked per window in screenVerdict).
+        if (isPageGatedSettings(pkg)) return if (pkg in userBlocked()) SafetyVerdict.Block("you blocked $pkg for automation") else SafetyVerdict.Allow
         sharedVerdict(pkg)?.let { return it }
         if (p in HARD_BLOCKED || PASSWORD_MANAGERS.any { p == it } || AUTHENTICATORS.any { p == it } || HARD_WORDS.any { w -> tokens(p).any { it.contains(w) } })
             return SafetyVerdict.Block("$pkg holds passwords, one-time codes or system permissions; screen automation is never allowed there")
@@ -91,6 +100,10 @@ class DefaultScreenSafetyPolicy(
         val pkg = frame.packageName.lowercase()
         if (pkg in SETTINGS_PACKAGES && SETTINGS_FORBIDDEN.any { it in text })
             return SafetyVerdict.Block("this Settings page controls accessibility, device admin, unknown sources or developer options — ONYX never changes those")
+        if (isPageGatedSettings(frame.packageName)) {
+            val v = settingsPage(frame.snapshot)
+            if (v.access == SettingsPages.Access.BLOCK) return SafetyVerdict.Block(v.reason)
+        }
         if (pkg == "com.android.vending" && PLAY_PURCHASE.any { it in text })
             return SafetyVerdict.Block("this is a Play Store purchase screen")
         if (frame.secure) return SafetyVerdict.TakeOver("this screen is protected (secure window) — please do this part yourself")
@@ -99,6 +112,21 @@ class DefaultScreenSafetyPolicy(
     }
 
     private fun tokens(p: String) = p.split('.', '_')
+
+    /** Settings app whose only block is the shared `system_admin` category (or no shared policy in tests). */
+    fun isPageGatedSettings(pkg: String): Boolean = SettingsPages.isSettingsApp(pkg) &&
+        (shared?.isPageGatedSettings(pkg, runCatching { labelOf(pkg) }.getOrNull()) ?: true)
+
+    /** Page verdict for a Settings window (through the shared AppSafetyPolicy when there is one). */
+    fun settingsPage(s: ScreenSnapshot): SettingsPages.Verdict =
+        shared?.checkSettingsPage(settingsTitles(s), s.allText) ?: SettingsPages.classify(settingsTitles(s), s.allText)
+
+    override fun confirmReason(frame: ScreenFrame, node: ScreenNode?): String? {
+        if (!isPageGatedSettings(frame.packageName)) return null
+        val v = settingsPage(frame.snapshot)
+        if (v.access == SettingsPages.Access.ASK) return v.reason
+        return node?.let { SettingsPages.elementNeedsConfirm(it.label) }
+    }
 
     /** Shared AppSafetyPolicy (Use.SCREEN). Null = not blocked there (the local rules below still apply). */
     private fun sharedVerdict(pkg: String): SafetyVerdict? {
@@ -130,6 +158,19 @@ class DefaultScreenSafetyPolicy(
         )
         val BANK_WORDS = listOf("bank", "upi", "wallet", "paytm", "phonepe", "payzapp", "netbanking", "banking", "trading", "demat", "bhim")
         val PLAY_PURCHASE = listOf("buy", "purchase", "subscribe", "one-tap buy", "payment methods")
+        /**
+         * Candidate page titles of a Settings window, top of the screen first: toolbar / collapsing-toolbar title views,
+         * then non-interactive text in the top 22% of the window (OxygenOS SubSettings pages carry the title there).
+         */
+        fun settingsTitles(s: ScreenSnapshot): List<String> {
+            val all = s.elements.map { it.node }
+            val rootTop = s.root.bounds.top
+            val h = s.root.bounds.height.takeIf { it > 0 } ?: all.maxOfOrNull { it.bounds.bottom }?.takeIf { it > 0 } ?: 1
+            val byId = all.filter { n -> val id = n.viewId.substringAfterLast('/').lowercase(); n.text.isNotBlank() && (id == "title" && n.bounds.top - rootTop <= h * 0.22 ||
+                id.contains("toolbar") || id.contains("action_bar") || id.contains("collapsing") || id == "header_title" || id == "app_bar_title") }
+            val top = all.filter { n -> n.text.isNotBlank() && !n.editable && !n.clickable && n.bounds.top - rootTop <= h * 0.22 }
+            return (byId + top).distinct().sortedBy { it.bounds.top }.map { it.text }
+        }
         val CAPTCHA = listOf("captcha", "i'm not a robot", "i am not a robot", "verify you are human", "verify you're human", "are you a robot", "hcaptcha")
     }
 }

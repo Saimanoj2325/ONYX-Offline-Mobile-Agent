@@ -221,9 +221,10 @@ class SafetyTest {
             assertTrue(pkg, p.appVerdict(pkg) is SafetyVerdict.Block)
         assertTrue(p.appVerdict("com.whatsapp") is SafetyVerdict.Allow)
         assertTrue(p.screenVerdict(frame("com.android.settings", "Accessibility", "Downloaded apps")) is SafetyVerdict.Block)
-        // The shared AppSafetyPolicy blocks the whole Settings app for Use.SCREEN; the local page-level rules (still used
-        // when no shared policy is passed) allow harmless pages.
-        assertTrue(p.screenVerdict(frame("com.android.settings", "Wi-Fi", "Bluetooth")) is SafetyVerdict.Block)
+        // Phase 6.1: Settings is page-gated — allowlisted pages (Wi-Fi…) are allowed, the Settings home and unknown pages are not.
+        assertTrue(p.screenVerdict(frame("com.android.settings", "Wi-Fi", "Bluetooth")) is SafetyVerdict.Allow)
+        assertTrue(p.screenVerdict(frame("com.android.settings", "Settings", "Wi-Fi", "Display")) is SafetyVerdict.Block)
+        assertTrue(p.screenVerdict(frame("com.android.settings", "Apps", "Downloaded apps")) is SafetyVerdict.Block)
         val localOnly = DefaultScreenSafetyPolicy("com.onyx.agent", shared = null)
         assertTrue(localOnly.screenVerdict(frame("com.android.settings", "Wi-Fi", "Bluetooth")) is SafetyVerdict.Allow)
         assertTrue(localOnly.screenVerdict(frame("com.android.settings", "Accessibility", "Downloaded apps")) is SafetyVerdict.Block)

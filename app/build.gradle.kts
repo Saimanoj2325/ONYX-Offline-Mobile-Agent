@@ -14,8 +14,8 @@ android {
         applicationId = "com.offlineagent.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.6.0-phase6"
+        versionCode = 7
+        versionName = "0.6.1-phase6"
         ndk { abiFilters += listOf("arm64-v8a") }
         // Phase 6 screen tools v2 (autonomous accessibility agent). SIDELOAD ONLY: Google Play bans autonomous
         // accessibility agents, so a Play build must pass -PscreenAgent=false. Even when compiled in it is OFF until the

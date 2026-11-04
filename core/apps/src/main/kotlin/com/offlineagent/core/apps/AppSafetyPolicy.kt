@@ -74,6 +74,20 @@ class AppSafetyPolicy(
 
     fun isBlocked(pkg: String, label: String? = null, use: Use = Use.INTENT) = !checkPackage(pkg, label, use).allowed
 
+    /**
+     * Phase 6.1: Settings is `system_admin` as a whole, but the screen agent may operate a short allowlist of its pages
+     * (see [SettingsPages]). True when [pkg] is the Settings app and the only reason it is blocked for SCREEN use is that
+     * category: the caller must then gate every window with [checkSettingsPage].
+     */
+    fun isPageGatedSettings(pkg: String, label: String? = null): Boolean {
+        if (!SettingsPages.isSettingsApp(pkg)) return false
+        val v = checkPackage(pkg, label, Use.SCREEN) as? SafetyVerdict.Blocked ?: return true
+        return v.category == Category.SYSTEM_ADMIN && userBlocked().none { it.equals(pkg, ignoreCase = true) }
+    }
+
+    /** Page check for a Settings window (titles top-first, all visible text). */
+    fun checkSettingsPage(titles: List<String>, allText: String): SettingsPages.Verdict = SettingsPages.classify(titles, allText)
+
     /** Notification text from these apps is never shown to the model (OTPs, balances, passwords). */
     fun isSensitiveNotificationSource(pkg: String, label: String? = null): Boolean =
         (checkPackage(pkg, label, Use.NOTIFICATION) as? SafetyVerdict.Blocked)?.category.let {

@@ -46,7 +46,8 @@ class ScreenToolkit(
 
     /** Which app a call will touch (for scoped approvals): the app it opens / transfers to, else the foreground app. */
     suspend fun targetPackage(tool: String, args: JsonObject): String? = when (tool) {
-        "screen_open_app" -> portRef.resolveApp(args.str("app"))
+        "screen_open_app" -> session.resolveTarget(args.str("app"))
+        "screen_task" -> args.str("app").takeIf { it.isNotBlank() }?.let { session.resolveTarget(it) } ?: session.currentPackage()
         "screen_transfer" -> portRef.resolveApp(args.str("to_app"))
         "screen_app_card" -> null
         else -> session.currentPackage()
@@ -56,7 +57,9 @@ class ScreenToolkit(
     fun risk(name: String, args: JsonObject): Risk? = when (name) {
         "screen_snapshot", "screen_find", "screen_wait", "screen_assert", "screen_extract" -> Risk.MEDIUM
         "screen_app_card" -> Risk.LOW
-        "screen_open_app" -> Risk.HIGH
+        "screen_open_app" -> if (askPage(args.str("app"))) Risk.CRITICAL else Risk.HIGH
+        "screen_task" -> if (InAppGoal.allowsCommit(args.str("goal")) || askPage(args.str("app")) ||
+            (args.str("app").isBlank() && session.latest?.let { v -> session.policy.confirmReason(v.frame, null) } != null)) Risk.CRITICAL else Risk.HIGH
         "screen_transfer" -> if (args.str("method") == "share") Risk.CRITICAL else Risk.HIGH
         "screen_do" -> if (Irreversible.text(args.str("instruction"))) Risk.CRITICAL else Risk.HIGH
         "screen_act" -> {
@@ -70,12 +73,17 @@ class ScreenToolkit(
             }
             when {
                 action == "enter" -> Risk.CRITICAL
+                action in setOf("tap", "long_press", "type") && v != null && session.policy.confirmReason(v.frame, el?.node) != null -> Risk.CRITICAL
                 (action == "tap" || action == "long_press") && (el?.let { session.policy.isIrreversible(it.node) } ?: Irreversible.text(args.str("target"))) -> Risk.CRITICAL
                 else -> Risk.HIGH
             }
         }
         else -> null
     }
+
+    /** A Settings page that asks every time (location, airplane, mobile data, hotspot). */
+    private fun askPage(app: String) = app.isNotBlank() && com.offlineagent.core.apps.SettingsPages.isSettingsRequest(app) &&
+        com.offlineagent.core.apps.SettingsPages.pageFor(app)?.access == com.offlineagent.core.apps.SettingsPages.Access.ASK
 
     private fun key(name: String, args: JsonObject) = name + "|" + args.toString()
 
@@ -106,7 +114,13 @@ class ScreenToolkit(
             obj("fields" to Schema.Arr(s(40, 1), minItems = 1, maxItems = 8)), Permission.SENSITIVE_READ, "Reads values from the screen.")) { a ->
             session.extract((a["fields"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content?.takeIf { s -> s.isNotBlank() } } ?: emptyList())
         },
-        tool(ToolSpec("screen_open_app", "Open or switch to an installed app by name (launch intent) and read its screen.",
+        tool(ToolSpec("screen_task", "Do a task INSIDE an app by tapping and typing step by step (open WhatsApp and type a message, turn on dark mode in Settings > Display). Stops before Send/Submit unless asked.",
+            obj("goal" to s(300, 3, "what to do inside the app"), "app" to s(80, d = "app to work in (e.g. WhatsApp, Settings > Display), or empty for the app on screen"),
+                "max_steps" to Schema.Num(min = 1.0, max = 25.0, integer = true)),
+            Permission.SCREEN_ACTION, "Taps and types in another app on your behalf, step by step.", timeoutMs = 600_000)) { a ->
+            session.task(a.str("goal"), a.str("app"), a.int("max_steps", 12), key("screen_task", a), a)
+        },
+        tool(ToolSpec("screen_open_app", "Open or switch to an installed app by name (launch intent) and read its screen. Settings pages: \"Settings > Display\".",
             obj("app" to s(80, 1)), Permission.EXTERNAL_INTENT, "Opens another app.")) { a -> session.openApp(a.str("app")) },
         tool(ToolSpec("screen_act", "Tap, long-press, type, press enter, scroll, back or home on the screen. Target an element by ref (@e12) or label; expect = text that should appear after.",
             obj("ref" to s(16, d = "element ref like @e12, or empty"), "target" to s(80, d = "element label when no ref, or empty"),
@@ -141,9 +155,11 @@ class ScreenToolkit(
 
     companion object {
         val NAMES = setOf("screen_snapshot", "screen_find", "screen_wait", "screen_assert", "screen_extract", "screen_open_app", "screen_act",
-            "screen_transfer", "screen_do", "screen_app_card")
+            "screen_transfer", "screen_do", "screen_app_card", "screen_task")
         /** Tools that call the model inside (run through the InferenceQueue). */
-        val MODEL_TOOLS = setOf("screen_extract", "screen_do")
+        val MODEL_TOOLS = setOf("screen_extract", "screen_do", "screen_task")
+        /** Tools that actually do something inside an app (opening it is not one of them). */
+        val IN_APP_TOOLS = setOf("screen_act", "screen_do", "screen_transfer", "screen_task")
         /** The Phase 3 inner-loop screen agent; hidden from the orchestrator while screen tools v2 are on. */
         val LEGACY = setOf("run_phone_task")
     }

@@ -182,6 +182,7 @@ enum class Route(val label: String) {
     RULES("rule fast path"),   // one obvious tool step with complete arguments: skip the planner model
     PLANNED("planned"),        // the Planner model built the task graph
     FALLBACK("rules"),         // no model / planner failed: deterministic rules
+    SCREEN("screen agent"),    // Phase 6.1: in-app request → screen_open_app + screen_task (no planner call)
 }
 
 val AgentJson = Json { ignoreUnknownKeys = true; encodeDefaults = true; classDiscriminator = "type" }

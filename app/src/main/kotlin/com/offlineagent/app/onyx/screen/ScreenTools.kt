@@ -39,6 +39,7 @@ import com.offlineagent.core.screen.ScreenToolkit
 import com.offlineagent.core.screen.ScreenView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -72,9 +73,19 @@ class ScreenTools(private val app: OfflineAgentApp, private val onyx: OnyxRuntim
     }
 
     /** Settings kill switch, the Screen-automation group, or the overlay's Stop for the current task. */
-    private val kill = KillSwitch {
-        val s = app.cachedSettings
-        !s.automationEnabled || PhoneGroup.SCREEN_AUTOMATION.name !in s.phoneGroups || (stoppedRun != null && stoppedRun == runId())
+    private val kill = object : KillSwitch {
+        override fun engaged(): Boolean {
+            val s = app.cachedSettings
+            return !s.automationEnabled || PhoneGroup.SCREEN_AUTOMATION.name !in s.phoneGroups || (stoppedRun != null && stoppedRun == runId())
+        }
+        override fun reason(): String {
+            val s = app.cachedSettings
+            return when {
+                !s.automationEnabled -> "Phone automation is switched off (kill switch in Settings → Phone actions). Turn it back on to continue."
+                PhoneGroup.SCREEN_AUTOMATION.name !in s.phoneGroups -> "Screen automation is not allowed in Settings → Phone actions. Turn it on (or switch Screen agent off and on in the Agents tab)."
+                else -> "you stopped this task from the overlay."
+            }
+        }
     }
 
     private val llm: () -> ScreenLlm? = {
@@ -104,6 +115,29 @@ class ScreenTools(private val app: OfflineAgentApp, private val onyx: OnyxRuntim
     }
 
     fun enabled() = available && prefs.enabled.value
+
+    /**
+     * Phase 6.1: the Agents toggle is the user's opt-in, so turning it on also allows the Screen-automation phone group
+     * (without it the kill switch refused every screen step and only app_open was left). Turning the group off in
+     * Settings stays the kill switch.
+     */
+    fun setEnabled(on: Boolean) {
+        prefs.setEnabled(on)
+        if (on) app.appScope.launch {
+            runCatching { app.settings.update { st -> if (PhoneGroup.SCREEN_AUTOMATION.name in st.phoneGroups) st else st.copy(phoneGroups = st.phoneGroups + PhoneGroup.SCREEN_AUTOMATION.name) } }
+        }
+    }
+
+    /** Status for the banner (Chat + Agents tab). */
+    fun status(): com.offlineagent.core.screen.ScreenAgentStatus.Status {
+        val st = app.cachedSettings
+        return com.offlineagent.core.screen.ScreenAgentStatus.of(
+            available = available, agentOn = enabled(),
+            serviceEnabledInSettings = runCatching { OfflineAccessibilityService.isEnabled(app) }.getOrDefault(false),
+            serviceConnected = OfflineAccessibilityService.instance != null,
+            automationOn = st.automationEnabled, screenGroupOn = PhoneGroup.SCREEN_AUTOMATION.name in st.phoneGroups,
+        )
+    }
 
     fun tools(): List<Tool> = if (available) toolkit.tools() else emptyList()
 
@@ -274,6 +308,20 @@ class AndroidScreenPort(private val app: OfflineAgentApp) : ScreenPort {
             delay(120)
         }
     }
+
+    override suspend fun openSettings(actions: List<String>): Boolean = withContext(Dispatchers.Main) {
+        val ctx: Context = (svc() as Context?) ?: app
+        for (a in actions) {
+            val i = Intent(a).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            if (runCatching { ctx.startActivity(i); true }.getOrDefault(false)) return@withContext true
+        }
+        false
+    }
+
+    override fun settingsPackage(): String = runCatching {
+        @Suppress("DEPRECATION")
+        app.packageManager.resolveActivity(Intent(android.provider.Settings.ACTION_SETTINGS), 0)?.activityInfo?.packageName
+    }.getOrNull() ?: "com.android.settings"
 
     override fun appLabel(pkg: String): String = runCatching { app.packageManager.getApplicationLabel(app.packageManager.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
 }

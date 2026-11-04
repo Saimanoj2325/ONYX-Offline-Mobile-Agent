@@ -160,3 +160,107 @@ JVM unit tests, all modules run with `--rerun-tasks` (2026-11-04): **366/366 pas
 screen 38 · apps 35 · agents 83 · runtime 112 · inference 45 · openui 29 · models 20 · mcp-http 4.
 
 Open gaps: `docs/KNOWN_ISSUES.md` → Phase 6, Phase 6 AppBridge, Phase 6 screen tools v2.
+
+---
+
+## 6.1 — screen agent routing, status banner, Settings allowlist, macro launcher fix (0.6.1-phase6, versionCode 7)
+
+Two bugs from testing 0.6.0 on a OnePlus Nord CE 3 (OxygenOS, Android 14/15).
+
+### Bug 1: screen control only opened apps
+
+Accessibility service "Offline Agent screen automation" on, Screen agent on in Agents; "open WhatsApp and type hi to
+Mom" only opened WhatsApp.
+
+**Root causes (several, all on the path):**
+1. **Kill switch.** `ScreenTools.kill` treats a missing `SCREEN_AUTOMATION` phone group as "stopped by you", and that group
+   is *not* in `DEFAULT_PHONE_GROUPS`. With only the Agents toggle on, every `screen_*` call returned `STOPPED`. The
+   AppBridge `app_open` intent was the only tool that could succeed.
+2. **Routing / planner.** The ONYX planner sees ≤10 tools picked by word overlap and plans ≤4 one-shot steps. For "open X
+   and …" Qwen3 1.7B picks `app_open` (exact "open" match). No tool could run a multi-step loop inside the app:
+   `screen_do` is one step, and the legacy `run_phone_task` loop is hidden while v2 is on.
+3. **Verification.** The Writer said "Done", and no rule checked that an in-app step ran.
+4. **Chat.** Chat's Agent / Phone / Automation modes used the legacy chat agent (intent `open_app`/`app_open` only). Only
+   Chat-mode "Agents: Auto" reached the ONYX orchestrator.
+
+Checked and **not** the cause: the prefs key (Agents card and `ScreenTools` share one `ScreenPrefs("onyx_screen","enabled")`),
+and the manifest (it declares `.automation.OfflineAccessibilityService`, the class whose `instance` the port uses).
+
+**Fixes**
+- `ScreenTools.setEnabled(true)` (the Agents switch) also allows the Screen-automation group. Turning the group or Phone
+  automation off in Settings stays the kill switch, and `KillSwitch.reason()` now says which switch is off.
+- New `screen_task(goal, app, max_steps)` (`ScreenSession.task`): opens the app if needed, then loops snapshot → one
+  model-chosen action (grounded early exit, same overlay/safety/approval path as `screen_act`) → re-read. It stops before
+  Send/Submit/Enter unless the goal asks to send ("type hi to Mom" stops before Send; "send hi to Mom" asks on the overlay).
+  It also stops on a 3× repeated step (STUCK). Its subgoal passes only after a real in-app action: opening alone is never
+  success.
+- `:core:agents` `InAppRequest` + `Triage`: in-app requests take the new `Route.SCREEN` →
+  `screen_open_app(app)` → `screen_task(goal, app)`, with no planner call. With v2 off and Screen automation allowed, the
+  route is the legacy `run_phone_task`. A model plan for an in-app request that only opens the app is repaired with the
+  screen steps.
+- `InAppCheck` (Verifier) + Writer: when no in-app step ran, the Writer is told so up front, and on its last try an explicit
+  "I did not … inside <app>" line is added.
+- Chat: `ChatRouting.screenTask` sends in-app turns to ONYX in Chat/Agent/Phone/Automation modes when the Screen agent is on.
+- Status banner (`ScreenAgentStatus` + `ScreenAgentStatusBanner`, in Chat and on the Agents card). It covers: agent on but
+  service off, service enabled but not connected (OxygenOS killed it), kill switch off, group off, or service on but agent
+  off. Each has buttons: Open Accessibility settings, Battery → Unrestricted, Turn automation back on, Allow screen
+  automation, Turn on Screen agent.
+
+**Settings allowlist** (MIKA-COMPARISON §6), via `AppSafetyPolicy.isPageGatedSettings` / `checkSettingsPage` →
+`SettingsPages` and `DefaultScreenSafetyPolicy.screenVerdict` / `confirmReason`:
+
+| Access | Pages |
+|---|---|
+| allow | Wi-Fi (saved networks; a Wi-Fi password field is a take-over), Bluetooth (paired), Display, Sound & vibration, Do Not Disturb, Battery saver |
+| ask every step (CRITICAL, never scoped) | Location, Airplane mode, Mobile data, Hotspot (+ Airplane/Mobile data/Hotspot/Location/Forget/Unpair controls on allowed pages) |
+| block | everything else, incl. the Settings home and search, accessibility, developer options, accounts, security |
+
+`screen_open_app("Settings > Display")` (or "Settings > turn on dark mode") opens the page's entry intent. A plain
+"Settings" is refused. AppBridge (`app_open`, intents) still never opens Settings.
+
+### Bug 2: recorded macro stopped at step 1
+
+"New macro, 11 steps in com.android.launcher" → "Macro stopped at step 1: step 1 failed"; the log showed
+"app · Open com.android.launcher → failed".
+
+**Root cause.** `startRecording` presses Home first, so the first window event came from the launcher, and `MacroRecorder`
+made "open com.android.launcher" the first step and `startPackage`. The launcher has no launch intent
+(`getLaunchIntentForPackage` returns null; its label also matches nothing), so `openApp` failed, and the player only said
+"step 1 failed". The icon tap that followed was recorded as a TAP in the launcher instead of "open WhatsApp".
+
+**Fixes** (`Macros.kt`, `LauncherInfo.kt`):
+- The home app comes from `PackageManager.resolveActivity(ACTION_MAIN + CATEGORY_HOME)` plus home activities with
+  priority ≥ 0, excluding Settings' FallbackHome and "android". A new `<queries>` entry makes it visible on Android 11+.
+- Recorder: launcher, systemui and ONYX windows never start a macro. A home-screen icon tap becomes `OPEN_APP <app>`
+  (label → launch intent). Going home mid-demo becomes `HOME`, and a trailing HOME is dropped.
+- Runner: an `OPEN_APP` of the launcher replays as Home. Before launching, it checks for "no launch screen", "not
+  installed / hidden by package visibility" or "banking app, blocked", and gives that reason. A refused open, tap or type
+  now gets a readable message.
+- `MacroStore` migrates saved macros on load and saves them back: leading launcher opens are dropped, later ones become
+  HOME, and launcher icon taps become `OPEN_APP`.
+
+### Tests (JVM, fake phone + scripted model)
+- `:core:agents` `ScreenRoutingTest` (7): parsing, Triage → SCREEN route, legacy fallback, Chat routing, the
+  orchestrator runs `screen_open_app` → `screen_task` and never `app_open`, an `app_open`-only run is reported as not
+  done, and plan repair.
+- `:core:screen` `ScreenTaskTest` (11): types and stops before Send, sends only when asked (with confirmation), opens
+  first and "opening alone" fails, service-not-connected reported before opening, stuck loop and kill switch, Settings page classification, Settings home blocked and
+  Display allowed, ask pages confirm every step, status banner states, and end to end "open ChatApp and type hi…" and
+  "open Settings > Display and turn on dark mode".
+- `:core:runtime` `MacroLauncherTest` (5): home-screen start, Home mid-demo, unknown icon, migration of a saved launcher
+  macro, and runner Home and readable failures.
+
+JVM unit tests, all modules with `--rerun-tasks` (2026-11-04): **389/389 pass** — screen 49 · apps 35 · agents 90 ·
+runtime 117 · inference 45 · openui 29 · models 20 · mcp-http 4. Both debug APKs compile and package. Nothing in 6.1 has
+run on a phone yet.
+
+### On the phone (OnePlus Nord CE 3), after installing 0.6.1
+1. Install over 0.6.0. Android may switch the accessibility service off after an update: if the banner says so, tap
+   **Open Accessibility settings** and turn "Offline Agent screen automation" back on.
+2. OxygenOS kills background accessibility services: Settings → Apps → ONYX → Battery → **Unrestricted** (the banner's
+   Battery button opens that page).
+3. Agents → Screen agent: switch it off and on once. That also allows Settings → Phone actions → Screen automation (the
+   banner offers it too).
+4. Try "open WhatsApp and type hi to Mom" (it should stop before Send) and "open Settings > Display and turn on dark mode".
+5. The old launcher macro is fixed on first load. If it still starts wrong, record it again from the home screen.
+

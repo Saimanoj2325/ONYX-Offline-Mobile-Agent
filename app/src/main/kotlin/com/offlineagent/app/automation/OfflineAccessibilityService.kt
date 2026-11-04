@@ -148,6 +148,8 @@ class OfflineAccessibilityService : AccessibilityService(), ScreenDriver {
     }
 
     private fun openApp(app: String): Boolean {
+        // Phase 6.1: the launcher has no launch intent — "open the launcher" means go home.
+        if ((application as? OfflineAgentApp)?.automation?.launcher?.isHome(app) == true) return performGlobalAction(GLOBAL_ACTION_HOME)
         val pm = packageManager
         val launch = pm.getLaunchIntentForPackage(app) ?: run {
             val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
