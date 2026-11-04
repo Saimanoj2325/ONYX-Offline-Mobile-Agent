@@ -54,10 +54,10 @@ class TransferLlm : AgentLlm {
                 {"tool":"screen_extract","goal":"Copy the order ID from the order page","after":[1]},
                 {"tool":"screen_transfer","goal":"Paste it into the chat with Ravi in ChatApp","after":[2]},
                 {"tool":"screen_assert","goal":"Check the order ID is in the message box","after":[3]}]}"""
-            system.startsWith("Fill the arguments for the tool screen_open_app") -> """{"app":"ShopApp"}"""
-            system.startsWith("Fill the arguments for the tool screen_extract") -> """{"fields":["order id"]}"""
-            system.startsWith("Fill the arguments for the tool screen_transfer") -> """{"text":"My order {{order id}} has not arrived","to_app":"ChatApp","target":"Message","method":"auto"}"""
-            system.startsWith("Fill the arguments for the tool screen_assert") -> """{"text":"{{order id}}","present":true}"""
+            user.startsWith("Tool: screen_open_app:") -> """{"app":"ShopApp"}"""
+            user.startsWith("Tool: screen_extract:") -> """{"fields":["order id"]}"""
+            user.startsWith("Tool: screen_transfer:") -> """{"text":"My order {{order id}} has not arrived","to_app":"ChatApp","target":"Message","method":"auto"}"""
+            user.startsWith("Tool: screen_assert:") -> """{"text":"{{order id}}","present":true}"""
             system.startsWith("Check an assistant") -> """{"ok":true,"issue":""}"""
             else -> "I copied order 405-7781234 from ShopApp into your chat with Ravi in ChatApp. It is not sent yet."
         }
@@ -110,7 +110,7 @@ class CrossAppWorkflowTest {
         val llm = object : AgentLlm {
             override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int) = when {
                 system.startsWith("You plan") -> """{"steps":[{"tool":"screen_act","goal":"Tap Send in ChatApp","after":[]}]}"""
-                system.startsWith("Fill the arguments for the tool screen_act") -> """{"ref":"","target":"Send","action":"tap","text":"","expect":"On my way"}"""
+                user.startsWith("Tool: screen_act:") -> """{"ref":"","target":"Send","action":"tap","text":"","expect":"On my way"}"""
                 system.startsWith("Check an assistant") -> """{"ok":true,"issue":""}"""
                 else -> "Sent your message."
             }
@@ -132,7 +132,7 @@ class CrossAppWorkflowTest {
         val llm = object : AgentLlm {
             override suspend fun complete(system: String, user: String, grammar: String?, maxTokens: Int) = when {
                 system.startsWith("You plan") -> """{"steps":[{"tool":"screen_act","goal":"Send and wait for the read receipt","after":[]}]}"""
-                system.startsWith("Fill the arguments for the tool screen_act") -> """{"ref":"","target":"Send","action":"tap","text":"","expect":"Seen"}"""
+                user.startsWith("Tool: screen_act:") -> """{"ref":"","target":"Send","action":"tap","text":"","expect":"Seen"}"""
                 system.startsWith("Check an assistant") -> """{"ok":true,"issue":""}"""
                 else -> "I sent it but did not see it being read."
             }

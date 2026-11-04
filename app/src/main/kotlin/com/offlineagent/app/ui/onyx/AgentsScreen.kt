@@ -192,6 +192,7 @@ fun AgentsScreen(app: OfflineAgentApp, onOpenSettings: () -> Unit, notify: (Stri
             }
         }
         item { SectionCard { com.offlineagent.app.onyx.apps.AppBridgeCard(app) } } // Phase 6 AppBridge
+        item { SectionCard { com.offlineagent.app.onyx.screen.ScreenAgentCard(app) } } // Phase 6 screen tools v2 (sideload only)
         item {
             SectionCard("Tools (${tools.size})") {
                 Text("Badges show what works offline. Risky tools always ask on a confirmation sheet first.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

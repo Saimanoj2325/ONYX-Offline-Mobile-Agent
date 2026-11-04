@@ -12,6 +12,7 @@ kotlin { jvmToolchain(17) }
 dependencies {
     api(project(":core:agents"))
     api(project(":core:runtime"))
+    api(project(":core:apps"))     // shared AppSafetyPolicy blocklist (one list for AppBridge + screen tools)
     api(libs.kotlinx.serialization.json)
     api(libs.kotlinx.coroutines.core)
     testImplementation(libs.junit)

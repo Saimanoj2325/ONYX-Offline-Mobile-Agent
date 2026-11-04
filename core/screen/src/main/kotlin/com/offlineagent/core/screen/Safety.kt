@@ -1,5 +1,6 @@
 package com.offlineagent.core.screen
 
+import com.offlineagent.core.apps.AppSafetyPolicy
 import com.offlineagent.core.runtime.phone.ScreenNode
 
 sealed interface SafetyVerdict {
@@ -59,12 +60,21 @@ class DefaultScreenSafetyPolicy(
     /** Packages the user explicitly allowed although they look like banking/payment (existing Phone-actions list). */
     private val userAllowed: () -> Set<String> = { emptySet() },
     private val userBlocked: () -> Set<String> = { emptySet() },
+    /**
+     * The ONE shared blocklist (`:core:apps` AppSafetyPolicy), consulted with Use.SCREEN. Its payment/banking hits can be
+     * overridden by [userAllowed] (same as the local banking list); every other category (password managers,
+     * authenticators, system admin/installer, store purchase, ONYX itself, user-blocked) always blocks. Pass null only in tests.
+     */
+    private val shared: AppSafetyPolicy? = AppSafetyPolicy.default(selfPackages = setOf(selfPackage)),
+    /** App label lookup for the shared policy's LABEL rules (e.g. "… Bank"). */
+    private val labelOf: (String) -> String? = { null },
 ) : ScreenSafetyPolicy {
 
     override fun appVerdict(pkg: String): SafetyVerdict {
         val p = pkg.lowercase()
         if (p.isBlank()) return SafetyVerdict.Allow
         if (p == selfPackage.lowercase() || p.startsWith(selfPackage.lowercase() + ".")) return SafetyVerdict.Block("ONYX itself is on screen and never operates itself — open the app you want (or name it so I can open it with screen_open_app)")
+        sharedVerdict(pkg)?.let { return it }
         if (p in HARD_BLOCKED || PASSWORD_MANAGERS.any { p == it } || AUTHENTICATORS.any { p == it } || HARD_WORDS.any { w -> tokens(p).any { it.contains(w) } })
             return SafetyVerdict.Block("$pkg holds passwords, one-time codes or system permissions; screen automation is never allowed there")
         if (pkg in userBlocked()) return SafetyVerdict.Block("you blocked $pkg for automation")
@@ -89,6 +99,13 @@ class DefaultScreenSafetyPolicy(
     }
 
     private fun tokens(p: String) = p.split('.', '_')
+
+    /** Shared AppSafetyPolicy (Use.SCREEN). Null = not blocked there (the local rules below still apply). */
+    private fun sharedVerdict(pkg: String): SafetyVerdict? {
+        val v = shared?.checkPackage(pkg, runCatching { labelOf(pkg) }.getOrNull(), AppSafetyPolicy.Use.SCREEN) as? AppSafetyPolicy.SafetyVerdict.Blocked ?: return null
+        if (v.category == AppSafetyPolicy.Category.PAYMENT && pkg in userAllowed() && pkg !in userBlocked()) return null
+        return SafetyVerdict.Block(v.reason)
+    }
 
     companion object {
         val SETTINGS_PACKAGES = setOf("com.android.settings", "com.oplus.settings", "com.coloros.settings", "com.samsung.android.settings",

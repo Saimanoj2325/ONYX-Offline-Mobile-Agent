@@ -82,10 +82,13 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     private val outboxStore by lazy { RoomOutboxStore(dao) }
 
     /** Phase 5 device tools (joined into the shared tool registry in OfflineAgentApp). */
-    val extraTools: List<Tool> by lazy { Phase5Tools(app) { i -> app.launcher.launch(i, "settings") }.all() + NetworkTools.create() + appBridge.tools }
+    val extraTools: List<Tool> by lazy { Phase5Tools(app) { i -> app.launcher.launch(i, "settings") }.all() + NetworkTools.create() + appBridge.tools + screen.tools() }
 
     /** Phase 6 AppBridge (app catalogue, intents, notification bridge, scoped approvals) — see onyx/apps/AppBridgeTools.kt. */
     val appBridge by lazy { com.offlineagent.app.onyx.apps.AppBridgeTools(app) }
+
+    /** Phase 6 screen tools v2 (sideload only, off by default) — see onyx/screen/ScreenTools.kt. */
+    val screen by lazy { com.offlineagent.app.onyx.screen.ScreenTools(app, this) }
 
     // ---------------------------------------------------------------- one model, one queue
     private val sharedLlm = object : AgentLlm {
@@ -212,7 +215,7 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     private fun deps(temporary: Boolean = false): AgentDeps = AgentDeps(
         queue = if (_hasChatModel.value) queue else null,
         tools = gateway, memory = if (temporary) noMemory else memory, context = context,
-        approvals = { r -> askUser(r) },
+        approvals = screen.wrap(com.offlineagent.core.agents.ApprovalGate { r -> askUser(r) }), // screen scopes in front of AppBridge scopes + the sheet
         network = { monitor.online.value },
         outbox = { runId, tool, args, risk ->
             OutboxProcessor(outboxStore, gateway, { monitor.online.value }).enqueue(runId, tool, args, risk).also { OutboxWorker.schedule(app) }
@@ -323,11 +326,11 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
 
     val gateway = object : ToolGateway {
         private fun tools(): List<Tool> = app.agents.registry(null).let { reg -> reg.names.mapNotNull { reg[it] } }
-        override fun specs(): List<ToolSpec> = tools().map { it.spec }
+        override fun specs(): List<ToolSpec> = tools().map { it.spec }.filter { screen.visible(it.name) }
         override fun spec(name: String): ToolSpec? = app.agents.registry(null)[name]?.spec
         override fun requiresNetwork(name: String) = name in networkTools()
-        override fun usesModel(name: String) = name in modelTools
-        override fun risk(name: String, args: JsonObject): Risk = appBridge.risk(name, args) ?: spec(name)?.let { s -> riskOf(s).let { if (requiresNetwork(name) && it < Risk.MEDIUM) Risk.MEDIUM else it } } ?: Risk.HIGH
+        override fun usesModel(name: String) = name in modelTools || screen.usesModel(name)
+        override fun risk(name: String, args: JsonObject): Risk = screen.risk(name, args) ?: appBridge.risk(name, args) ?: spec(name)?.let { s -> riskOf(s).let { if (requiresNetwork(name) && it < Risk.MEDIUM) Risk.MEDIUM else it } } ?: Risk.HIGH
         override suspend fun execute(name: String, args: JsonObject): ToolResult {
             val t = app.agents.registry(null)[name] ?: return ToolResult.Error("tool $name is not available", retryable = false)
             return withTimeoutOrNull(t.spec.timeoutMs) { t.execute(args, ToolContext("onyx", null)) } ?: ToolResult.Error("$name timed out")

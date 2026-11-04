@@ -91,10 +91,13 @@ class ScreenTools(private val app: OfflineAgentApp, private val onyx: OnyxRuntim
     }
 
     val toolkit: ScreenToolkit by lazy {
+        val port = AndroidScreenPort(app)
         ScreenToolkit(
-            port = AndroidScreenPort(app),
+            port = port,
             host = OverlayScreenHost { stop() },
-            policy = DefaultScreenSafetyPolicy(app.packageName, { app.cachedSettings.automationAllowedApps }, { app.cachedSettings.automationBlockedApps }),
+            // One shared blocklist: AppBridge's AppSafetyPolicy (:core:apps) is consulted with Use.SCREEN, then the screen rules.
+            policy = DefaultScreenSafetyPolicy(app.packageName, { app.cachedSettings.automationAllowedApps }, { app.cachedSettings.automationBlockedApps },
+                shared = onyx.appBridge.policy, labelOf = { pkg -> port.appLabel(pkg).takeIf { it != pkg } }),
             audit = audit, kill = kill, cards = cards, llm = llm,
             config = { ScreenConfig(enabled = enabled(), stepsPerScope = prefs.stepsPerScope) },
         )

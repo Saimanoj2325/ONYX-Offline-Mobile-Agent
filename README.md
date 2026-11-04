@@ -48,8 +48,9 @@ Earlier design: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/PHASE3.md`, `
 
 | Area | Status |
 |---|---|
-| JVM unit tests (`:core:agents`, `:core:runtime`, `:core:inference`, `:core:openui`, `:core:models`, `:core:mcp-http`) | ✅ 257/257 pass in the sandbox (agents 51 · runtime 112 · inference 45 · openui 29 · models 16 · mcp-http 4) — Phase 5b |
+| JVM unit tests (`:core:screen`, `:core:apps`, `:core:agents`, `:core:runtime`, `:core:inference`, `:core:openui`, `:core:models`, `:core:mcp-http`) | ✅ 366/366 pass in the sandbox (screen 38 · apps 35 · agents 83 · runtime 112 · inference 45 · openui 29 · models 20 · mcp-http 4) — Phase 6 |
 | Multi-agent orchestrator end-to-end on a real GGUF (Qwen3-1.7B / 0.6B, host harness, fake device tools) | ✅ 5/5 prompts complete with valid plans, executed steps, verification and an answer (`docs/verification/phase5b-e2e.md`); answer quality has small slips (see PHASE5 §10.4) |
+| Phase 6 screen tools v2 (sideload only, off by default; `-PscreenAgent=false` for Play) | ⚠️ JVM-tested on a fake phone; Android side compiles into both APKs, **not run on a device** |
 | Phase 5b UI (agent trace in Chat/Home, Agents chip, model card/onboarding on Home, catalogue on Agents) | ⚠️ compiles into both APKs; **not run on a device or emulator** |
 | Debug APKs, both flavors (`offline`, `connected`) | ✅ compile and package in the sandbox (aarch64 host, community NDK/aapt2 build) |
 | llama.cpp JNI + real GGUF on an ARM64 Linux host (Phase 2–4b harness) | ✅ earlier phases; Phase 5b harness above uses the same bridge |
@@ -136,7 +137,7 @@ Requirements: JDK 17, Android SDK 35, **NDK 30.0.16248370**, CMake 3.31.6 (Andro
 
 ```bash
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew :core:agents:test :core:inference:test :core:runtime:test :core:mcp-http:test :core:openui:test :core:models:test   # JVM unit tests
+./gradlew :core:screen:test :core:apps:test :core:agents:test :core:inference:test :core:runtime:test :core:mcp-http:test :core:openui:test :core:models:test   # JVM unit tests
 ./gradlew :app:assembleOfflineDebug     # → app/build/outputs/apk/offline/debug/app-offline-debug.apk (INTERNET only for the model downloader)
 ./gradlew :app:assembleConnectedDebug   # → app/build/outputs/apk/connected/debug/app-connected-debug.apk (+ LAN/remote MCP)
 ./gradlew :samples:mcp-server-sample:assembleDebug

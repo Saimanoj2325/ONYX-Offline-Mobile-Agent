@@ -135,3 +135,13 @@
 - The app catalogue is in memory only (rebuilt on start / package changes, not persisted).
 - `clipboard_get` works only while ONYX is in the foreground (Android 10+).
 - `notif_reply` (inline RemoteInput reply) is untested on a device; the AppBridge Android side is compiled, not phone-tested.
+
+## Phase 6 screen tools v2 — see docs/PHASE6-SCREEN.md
+- Sideload only: Google Play bans autonomous accessibility agents. Build a Play APK with `-PscreenAgent=false`.
+- Overlay **Pause** is a no-op for v2 (only Stop works).
+- The secure-window (FLAG_SECURE) check (`takeScreenshot` probe) is untested on a device.
+- `awaitIdle` polls the accessibility tree every 120 ms instead of listening to window events.
+- No vision fallback: screens without an accessibility tree (games, canvases, some WebViews) cannot be operated.
+- With the toggle on, the legacy chat agent (Phase 1–4 path) can still see the `screen_*` tools; only the Onyx planner hides them.
+- The shared AppSafetyPolicy blocks the whole Settings app and Play Store for screen use (`Use.SCREEN`), so v2 cannot change even harmless settings pages (Wi-Fi etc.) by screen; device tools cover those.
+- The Android side (ports, overlay host, settings card) is compiled, not phone-tested.

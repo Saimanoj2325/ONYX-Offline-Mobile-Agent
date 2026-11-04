@@ -6,11 +6,15 @@ Version: `0.6.0-phase6` (versionCode 6).
 | Milestone | Commit | What |
 |---|---|---|
 | M1 | `fdc1cef` | Device tiers, new catalogue entries, n-gram speculation, power governor, on-phone benchmark, memory engine (pure Kotlin) |
-| M2 | this phase | Long memory wired into the app: saved memories, chat-history reference, threads, routines, frequent contacts, temporary chat |
+| M2 | `462d8c2` and earlier | Long memory wired into the app: saved memories, chat-history reference, threads, routines, frequent contacts, temporary chat |
+| AppBridge | `462d8c2` | App intents, notifications, quick ask, the shared AppSafetyPolicy ([PHASE6-APPS.md](PHASE6-APPS.md)) |
+| Screen tools v2 | this commit | `:core:screen`: 10 `screen_*` tools in the task graph, scoped approvals, shared blocklist — sideload only ([PHASE6-SCREEN.md](PHASE6-SCREEN.md)) |
 
 ---
 
 AppBridge (app intents, notifications, quick ask): see [PHASE6-APPS.md](PHASE6-APPS.md).
+
+Screen tools v2 (sideload only): see [PHASE6-SCREEN.md](PHASE6-SCREEN.md).
 
 ## M1 — device-adaptive model runtime
 
@@ -143,3 +147,16 @@ routines, the budgeted context block, plus M2: summary replacement, chat/thread 
 ### 4. Known gaps
 
 See `docs/KNOWN_ISSUES.md` → Phase 6.
+
+---
+
+## Phase 6 complete
+
+Phase 6 is done in the sandbox: device-adaptive runtime (M1), long memory (M2), AppBridge, and screen tools v2
+(sideload only; Play builds use `-PscreenAgent=false`). Both debug APKs (`offline`, `connected`) compile and package.
+Nothing in Phase 6 has run on a phone yet.
+
+JVM unit tests, all modules run with `--rerun-tasks` (2026-11-04): **366/366 pass** —
+screen 38 · apps 35 · agents 83 · runtime 112 · inference 45 · openui 29 · models 20 · mcp-http 4.
+
+Open gaps: `docs/KNOWN_ISSUES.md` → Phase 6, Phase 6 AppBridge, Phase 6 screen tools v2.

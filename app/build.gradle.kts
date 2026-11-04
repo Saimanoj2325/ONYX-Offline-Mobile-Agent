@@ -17,6 +17,10 @@ android {
         versionCode = 6
         versionName = "0.6.0-phase6"
         ndk { abiFilters += listOf("arm64-v8a") }
+        // Phase 6 screen tools v2 (autonomous accessibility agent). SIDELOAD ONLY: Google Play bans autonomous
+        // accessibility agents, so a Play build must pass -PscreenAgent=false. Even when compiled in it is OFF until the
+        // user enables it in Agents -> Screen agent.
+        buildConfigField("boolean", "SCREEN_AGENT_V2", project.findProperty("screenAgent")?.toString() ?: "true")
     }
 
     // Two products from one code base:
@@ -80,6 +84,7 @@ dependencies {
     implementation(project(":core:models"))
     implementation(project(":core:agents"))
     implementation(project(":core:apps"))
+    implementation(project(":core:screen"))
     "connectedImplementation"(project(":core:mcp-http"))
     implementation(libs.pdfbox.android)
 

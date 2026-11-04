@@ -221,13 +221,49 @@ class SafetyTest {
             assertTrue(pkg, p.appVerdict(pkg) is SafetyVerdict.Block)
         assertTrue(p.appVerdict("com.whatsapp") is SafetyVerdict.Allow)
         assertTrue(p.screenVerdict(frame("com.android.settings", "Accessibility", "Downloaded apps")) is SafetyVerdict.Block)
-        assertTrue(p.screenVerdict(frame("com.android.settings", "Wi-Fi", "Bluetooth")) is SafetyVerdict.Allow)
+        // The shared AppSafetyPolicy blocks the whole Settings app for Use.SCREEN; the local page-level rules (still used
+        // when no shared policy is passed) allow harmless pages.
+        assertTrue(p.screenVerdict(frame("com.android.settings", "Wi-Fi", "Bluetooth")) is SafetyVerdict.Block)
+        val localOnly = DefaultScreenSafetyPolicy("com.onyx.agent", shared = null)
+        assertTrue(localOnly.screenVerdict(frame("com.android.settings", "Wi-Fi", "Bluetooth")) is SafetyVerdict.Allow)
+        assertTrue(localOnly.screenVerdict(frame("com.android.settings", "Accessibility", "Downloaded apps")) is SafetyVerdict.Block)
         assertTrue(p.screenVerdict(frame("com.example.shop", "Checkout", secure = true)) is SafetyVerdict.TakeOver)
         assertTrue(p.screenVerdict(frame("com.example.shop", "Please complete the CAPTCHA")) is SafetyVerdict.TakeOver)
         // user allow-list only relaxes banking, never password managers / ONYX itself
         val relaxed = DefaultScreenSafetyPolicy("com.onyx.agent", userAllowed = { setOf("com.phonepe.app", "com.x8bit.bitwarden") })
         assertTrue(relaxed.appVerdict("com.phonepe.app") is SafetyVerdict.Allow)
         assertTrue(relaxed.appVerdict("com.x8bit.bitwarden") is SafetyVerdict.Block)
+    }
+
+    @Test fun sharedAppSafetyPolicyIsConsulted() {
+        // A package/label only the shared :core:apps blocklist knows about is blocked for the screen agent too.
+        val shared = com.offlineagent.core.apps.AppSafetyPolicy(listOf(
+            com.offlineagent.core.apps.AppSafetyPolicy.Rule(com.offlineagent.core.apps.AppSafetyPolicy.Category.PASSWORD_MANAGER,
+                com.offlineagent.core.apps.AppSafetyPolicy.Kind.PACKAGE, "com.example.vault"),
+            com.offlineagent.core.apps.AppSafetyPolicy.Rule(com.offlineagent.core.apps.AppSafetyPolicy.Category.PAYMENT,
+                com.offlineagent.core.apps.AppSafetyPolicy.Kind.LABEL, "bank"),
+            com.offlineagent.core.apps.AppSafetyPolicy.Rule(com.offlineagent.core.apps.AppSafetyPolicy.Category.STORE_PURCHASE,
+                com.offlineagent.core.apps.AppSafetyPolicy.Kind.PACKAGE, "com.example.store"),
+        ), selfPackages = setOf("com.onyx.agent"), userBlocked = { setOf("com.example.chat") })
+        val labels = mapOf("com.example.money" to "Acme Bank")
+        val pol = DefaultScreenSafetyPolicy("com.onyx.agent", shared = shared, labelOf = { labels[it] })
+        assertTrue(pol.appVerdict("com.example.vault") is SafetyVerdict.Block)     // shared package rule
+        assertTrue(pol.appVerdict("com.example.money") is SafetyVerdict.Block)     // shared LABEL rule via labelOf
+        assertTrue(pol.appVerdict("com.example.store") is SafetyVerdict.Block)     // screen-only category applies (Use.SCREEN)
+        assertTrue(pol.appVerdict("com.example.chat") is SafetyVerdict.Block)      // shared policy's user-blocked list
+        assertTrue(pol.appVerdict("com.example.notes") is SafetyVerdict.Allow)
+        assertTrue(shared.checkPackage("com.example.store").allowed)                // same rule does not block plain intents
+        // Without the shared policy these packages pass the local rules — proving the verdict came from :core:apps.
+        val local = DefaultScreenSafetyPolicy("com.onyx.agent", shared = null, labelOf = { labels[it] })
+        assertTrue(local.appVerdict("com.example.vault") is SafetyVerdict.Allow)
+        assertTrue(local.appVerdict("com.example.money") is SafetyVerdict.Allow)
+        // User allow-list relaxes a shared PAYMENT hit only, never a password manager.
+        val relaxed = DefaultScreenSafetyPolicy("com.onyx.agent", userAllowed = { setOf("com.example.money", "com.example.vault") }, shared = shared, labelOf = { labels[it] })
+        assertTrue(relaxed.appVerdict("com.example.money") is SafetyVerdict.Allow)
+        assertTrue(relaxed.appVerdict("com.example.vault") is SafetyVerdict.Block)
+        // And the real default blocklist is wired in by default.
+        val def = DefaultScreenSafetyPolicy("com.onyx.agent")
+        assertTrue(def.appVerdict("com.android.vending") is SafetyVerdict.Block)
     }
 
     @Test fun blockedAppsCannotBeOpenedOrTransferredTo() = runBlocking {
