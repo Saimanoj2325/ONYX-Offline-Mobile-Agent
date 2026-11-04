@@ -125,7 +125,12 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
         Column(modifier.fillMaxSize()) {
             TopAppBar(
                 navigationIcon = { IconButton(onClick = { scope.launch { drawer.open() } }) { Icon(Icons.Filled.Menu, "Conversations") } },
-                title = { ModelPicker(vm, engine, ui, chatModels, onDownload = { sheet = Sheet.MODELS }) },
+                title = {
+                    Column {
+                        ModelPicker(vm, engine, ui, chatModels, onDownload = { sheet = Sheet.MODELS })
+                        if (ui.temporary) Text("Temporary chat · memory off", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+                    }
+                },
                 actions = {
                     IconButton(onClick = { vm.newChat() }) { Icon(Icons.Filled.Create, "New chat") }
                     var menu by remember { mutableStateOf(false) }
@@ -133,6 +138,7 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
                     DropdownMenu(menu, { menu = false }) {
                         val settings by vm.settings.collectAsStateWithLifecycle()
                         DropdownMenuItem(text = { Text("Thinking (Qwen3, slower)") }, trailingIcon = { Switch(settings.thinking, { vm.setThinking(it) }) }, onClick = { vm.setThinking(!settings.thinking) })
+                        DropdownMenuItem(text = { Text("Temporary chat (no memory)") }, trailingIcon = { Switch(ui.temporary, { vm.toggleTemporary() }) }, onClick = { vm.toggleTemporary() })
                         DropdownMenuItem(text = { Text("Use my documents") }, trailingIcon = { Switch(settings.useDocuments, { vm.setUseDocuments(it) }) }, onClick = { vm.setUseDocuments(!settings.useDocuments) })
                         DropdownMenuItem(text = { Text("Export chat as PDF") }, enabled = messages.isNotEmpty(), onClick = { menu = false; vm.exportChatPdf() })
                         DropdownMenuItem(text = { Text("Rename chat") }, enabled = chat != null, onClick = { menu = false; renameTarget = chat?.let { ConversationRef(it.id, it.title, it.updatedAt) } })
@@ -345,6 +351,12 @@ private fun MessageItem(m: MessageEntity, vm: ChatViewModel, host: OpenUiHost, b
                     DropdownMenuItem(text = { Text("Copy") }, onClick = { menu = false; onCopy(m.text) })
                     DropdownMenuItem(text = { Text("Edit & resend") }, enabled = !busy, onClick = { menu = false; vm.startEdit(m) })
                 }
+            }
+            // Phase 6: "Memory updated" chip under the user message that changed saved memories.
+            val chips by vm.memoryChips.collectAsStateWithLifecycle()
+            chips[m.id]?.let { c ->
+                Text("✓ $c", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 2.dp, end = 6.dp))
             }
         }
         return

@@ -99,6 +99,9 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     val onboardingDismissed = MutableStateFlow(false)
     val queue = InferenceQueue(sharedLlm)
 
+    /** Phase 6 M2: long memory (saved memories, chat history, contacts, routines). */
+    val longMemory by lazy { OnyxMemory(app, this) }
+
     /** Phase 6: on-phone benchmark (Agents → Models). */
     val benchmark by lazy { Benchmark(app) }
 
@@ -195,9 +198,15 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     suspend fun refreshDevice() = withContext(Dispatchers.IO) { runCatching { _plan.value = RuntimeSelector.plan(monitor.snapshot()) } }
     suspend fun refreshModelState() { _hasChatModel.value = runCatching { app.models.active(ModelRole.CHAT) != null }.getOrDefault(false) }
 
-    private fun deps(): AgentDeps = AgentDeps(
+    /** Phase 6: memory store for temporary chats — reads nothing, writes nothing. */
+    private val noMemory = object : MemoryStore {
+        override val enabled = false
+        override suspend fun recall(query: String, limit: Int) = emptyList<MemoryHit>()
+    }
+
+    private fun deps(temporary: Boolean = false): AgentDeps = AgentDeps(
         queue = if (_hasChatModel.value) queue else null,
-        tools = gateway, memory = memory, context = context,
+        tools = gateway, memory = if (temporary) noMemory else memory, context = context,
         approvals = { r -> askUser(r) },
         network = { monitor.online.value },
         outbox = { runId, tool, args, risk ->
@@ -205,9 +214,11 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
         },
         audit = { runId, actor, action, detail, risk -> audit(runId, actor, action, detail, risk) },
         store = taskStore,
+        routines = if (prefs.values.value.memoryEnabled && !temporary) longMemory.routines else null,
+        hooks = if (temporary) com.offlineagent.core.agents.AgentHooks.NONE else longMemory.hooks,
     )
 
-    private fun orchestrator() = Orchestrator(deps(), OrchestratorConfig(llmVerification = prefs.values.value.llmVerification))
+    private fun orchestrator(temporary: Boolean = false) = Orchestrator(deps(temporary), OrchestratorConfig(llmVerification = prefs.values.value.llmVerification))
 
     /** Starts a multi-agent task. Returns null (with a reason) when the model is busy with another job. */
     fun run(request: String): String? = start(request).error
@@ -225,7 +236,7 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
      * Phase 5b: starts a task from Home or from Chat. [conversation] = earlier chat turns (follow-ups), [onFinished]
      * is ALWAYS called once — also when the run is stopped — with the final checkpoint.
      */
-    fun start(request: String, conversation: String = "", onFinished: (suspend (TaskCheckpoint) -> Unit)? = null): StartResult {
+    fun start(request: String, conversation: String = "", onFinished: (suspend (TaskCheckpoint) -> Unit)? = null, temporary: Boolean = false): StartResult {
         if (isRunning) return StartResult(null, "ONYX is already working on a task.")
         if (app.agents.isRunning) return StartResult(null, "The chat agent is running; wait for it to finish.")
         val runId = "task-" + UUID.randomUUID().toString().take(8)
@@ -236,7 +247,7 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
         TaskResumeWorker.schedule(app, WATCHDOG_MIN) // resumes it if the process dies mid-run
         job = app.appScope.launch {
             refreshModelState()
-            val cp = try { orchestrator().run(request, board) }
+            val cp = try { orchestrator(temporary).run(request, board) }
             catch (e: kotlinx.coroutines.CancellationException) {
                 withContext(kotlinx.coroutines.NonCancellable) { onFinished?.invoke(board.checkpoint()) }
                 throw e
@@ -317,22 +328,26 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     // ---------------------------------------------------------------- memory (user-controlled)
     val memory = object : MemoryStore {
         override val enabled: Boolean get() = prefs.values.value.memoryEnabled
-        private fun words(s: String) = s.lowercase().split(Regex("[^\\p{L}\\p{N}]+")).filter { it.length > 2 }.toSet()
+        // Phase 6: saved memories (BM25) + snippets from ALL past chats + documents, best first.
         override suspend fun recall(query: String, limit: Int): List<MemoryHit> = withContext(Dispatchers.IO) {
             if (!enabled) return@withContext emptyList()
-            val q = words(query)
-            val mine = dao.memories().map { m -> m to (words(m.text) intersect q).size + if (m.pinned) 1 else 0 }
-                .filter { it.second > 0 }.sortedByDescending { it.second }.take(limit)
-                .map { (m, s) -> MemoryHit("memory", m.category, m.text, s.toDouble()) }
+            val s = longMemory.settings()
+            val mine = if (s.savedMemories) runCatching { longMemory.book.relevant(query, limit) }.getOrDefault(emptyList())
+                .map { m -> MemoryHit("memory", m.kind.name.lowercase() + if (m.inferred) " (inferred)" else "", m.text, 2.0) } else emptyList()
+            val chats = if (s.referenceChatHistory) runCatching { longMemory.history.search(query, 2) }.getOrDefault(emptyList())
+                .map { h -> MemoryHit("chat", h.chatTitle, h.text, 1.0) } else emptyList()
             val docs = if (app.cachedSettings.useDocuments) runCatching { app.retriever.search(query, 3) }.getOrDefault(emptyList())
                 .map { MemoryHit("document", it.candidate.documentTitle, it.candidate.text, it.score.toDouble()) } else emptyList()
-            (mine + docs).take(limit)
+            (mine + chats + docs).take(limit)
+        }
+        override suspend fun profile(query: String, budgetTokens: Int): String = withContext(Dispatchers.IO) {
+            if (!enabled || !longMemory.settings().savedMemories) return@withContext ""
+            val mem = runCatching { longMemory.book.relevant(query, 4) }.getOrDefault(emptyList())
+            com.offlineagent.core.agents.memory.MemoryContext.build(mem, emptyList(), budgetTokens).text
         }
         override suspend fun remember(text: String, source: String) {
-            // Only explicit "remember …" requests become memories automatically; everything else stays in task history.
-            val m = Regex("^(?:please\\s+)?remember(?:\\s+that)?\\s+(.{3,400})", RegexOption.IGNORE_CASE).find(text.removePrefix("Asked: ").trim()) ?: return
-            val now = System.currentTimeMillis()
-            dao.upsertMemory(AgentMemoryEntity(text = m.groupValues[1].trim(), category = "fact", source = source, createdAt = now, updatedAt = now))
+            // Phase 6: the request of a finished task goes through the same extraction / remember / forget path as chat.
+            runCatching { longMemory.onUserMessage(null, null, text.removePrefix("Asked: ").trim()) }
         }
     }
 

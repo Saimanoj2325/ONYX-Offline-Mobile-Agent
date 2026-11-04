@@ -119,6 +119,8 @@ data class ChatUi(
     val thinkOverride: Boolean? = null,
     /** Phase 5b: multi-agent mode for Chat-mode messages (AUTO = task-like requests go to the ONYX agents). */
     val agents: AgentsMode = AgentsMode.AUTO,
+    /** Phase 6: temporary chat — neither reads nor writes memory (saved memories, chat history, summaries index). */
+    val temporary: Boolean = false,
 )
 
 /** Phase 5b: the composer's "Agents" switch. */
@@ -184,11 +186,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun openChat(id: Long?) {
         if (genJob?.isActive == true) return notice("Wait for the current answer to finish (or press Stop).")
         chatIdFlow.value = id
-        _ui.update { it.copy(chatId = id, canvasOpen = false, streaming = null, pendingImages = emptyList()) }
-        viewModelScope.launch { g.settings.update { it.copy(lastChatId = id ?: 0) } }
+        _ui.update { it.copy(chatId = id, canvasOpen = false, streaming = null, pendingImages = emptyList(), temporary = if (id == null) false else it.temporary) }
+        viewModelScope.launch {
+            g.settings.update { it.copy(lastChatId = id ?: 0) }
+            if (id != null) { val t = runCatching { g.onyx.longMemory.isTemporary(id) }.getOrDefault(false); _ui.update { it.copy(temporary = t) } }
+        }
     }
 
     fun newChat() = openChat(null)
+
+    /** Phase 6: "Temporary chat" — for a new chat before the first message, or switch the open chat. */
+    fun toggleTemporary() = viewModelScope.launch {
+        val on = !_ui.value.temporary
+        _ui.update { it.copy(temporary = on) }
+        _ui.value.chatId?.let { runCatching { g.onyx.longMemory.setTemporary(it, on) } }
+        notice(if (on) "Temporary chat: nothing is read from or saved to memory." else "Memory is on for this chat.")
+    }
+
+    /** Phase 6: "Memory updated" chips (user message id → text). */
+    val memoryChips get() = g.onyx.longMemory.chips
 
     fun deleteChat(id: Long) = viewModelScope.launch {
         chats.deleteChat(id)
@@ -201,6 +217,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _ui.value.chatId?.let { return it }
         val now = System.currentTimeMillis()
         val id = chats.insertChat(ChatEntity(title = firstText.lines().first().take(48).ifBlank { "New chat" }, createdAt = now, updatedAt = now))
+        if (_ui.value.temporary) runCatching { g.onyx.longMemory.setTemporary(id, true) }
         chatIdFlow.value = id
         _ui.update { it.copy(chatId = id) }
         g.settings.update { it.copy(lastChatId = id) }
@@ -320,9 +337,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
           try {
             val chatId = ensureChat(text.ifBlank { "Photo" })
             val now = System.currentTimeMillis()
-            chats.insertMessage(MessageEntity(chatId = chatId, role = "user", text = text,
+            val userMsgId = chats.insertMessage(MessageEntity(chatId = chatId, role = "user", text = text,
                 attachmentsJson = if (images.isEmpty()) null else JsonArray(images.map { JsonPrimitive(it.absolutePath) }).toString(), createdAt = now))
             chats.touch(chatId, now)
+            // Phase 6: saved memories (auto-extract / remember / forget) + the "Memory updated" chip.
+            val upd = if (text.isNotBlank()) runCatching { g.onyx.longMemory.onUserMessage(chatId, userMsgId, text) }.getOrNull() else null
+            if (upd != null && upd.explicit && images.isEmpty()) {
+                // A pure "remember …" / "forget …" message is answered directly (no model call).
+                val reply = when {
+                    upd.forgotten.isNotEmpty() -> "Done — I forgot ${upd.forgotten.size} memor${if (upd.forgotten.size == 1) "y" else "ies"}: " + upd.forgotten.joinToString("; ") { it.text }
+                    upd.saved.isNotEmpty() -> "Got it — I'll remember: ${upd.saved.first().text}. You can see or delete it in Memory."
+                    _ui.value.temporary -> "This is a temporary chat, so nothing is saved to memory."
+                    else -> "I couldn't find a memory matching that."
+                }
+                chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = reply, createdAt = System.currentTimeMillis()))
+                return@launch
+            }
 
             // Skills: explicit /skill-id, or the suggestion chip
             val explicit = if (forceSkill != null) SkillMatcher.Match(forceSkill, text, true) else if (text.startsWith("/")) SkillMatcher.match(text, g.skills.parsed()) else null
@@ -396,7 +426,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val conversation = turns(chatId).takeLast(6).joinToString("\n") { t -> (if (t.role == Role.USER) "User: " else "ONYX: ") + t.text.take(500) }
         val msgId = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = KIND_ONYX, createdAt = System.currentTimeMillis()))
         val done = kotlinx.coroutines.CompletableDeferred<com.offlineagent.core.agents.TaskCheckpoint>()
-        val res = g.onyx.start(text, conversation) { cp -> done.complete(cp) }
+        val temporary = runCatching { g.onyx.longMemory.isTemporary(chatId) }.getOrDefault(false)
+        val res = g.onyx.start(text, conversation, { cp -> done.complete(cp) }, temporary = temporary)
         val runId = res.runId ?: run {
             chats.message(msgId)?.let { chats.updateMessage(it.copy(error = res.error ?: "Could not start the agents.")) }
             return
@@ -404,6 +435,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         chats.message(msgId)?.let { chats.updateMessage(it.copy(runId = runId)) }
         val cp = try { done.await() } catch (e: CancellationException) { g.onyx.cancel(); throw e }
         finishOnyxMessage(msgId, cp)
+        if (!temporary && !cp.answer.isNullOrBlank()) g.appScope.launch {
+            runCatching { g.onyx.longMemory.onExchange(chatId, chats.chat(chatId)?.title ?: "Chat", text, cp.answer.orEmpty()) }
+        }
     }
 
     private suspend fun finishOnyxMessage(msgId: Long, cp: com.offlineagent.core.agents.TaskCheckpoint) {
@@ -550,7 +584,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             com.offlineagent.core.runtime.context.ConversationSummary(m.text, m.runId?.removePrefix("upTo:")?.toLongOrNull() ?: 0)
         }
 
-    private fun contextManager(s: AppSettings): com.offlineagent.core.runtime.context.ContextManager {
+    private fun contextManager(s: AppSettings, temporary: Boolean = false): com.offlineagent.core.runtime.context.ContextManager {
         val llm = com.offlineagent.core.runtime.agent.InferenceAgentLlm(g.inference)
         return com.offlineagent.core.runtime.context.ContextManager(
             counter = { t -> g.inference.countTokens(t) ?: com.offlineagent.core.runtime.context.TokenCounter.estimate(t) },
@@ -559,7 +593,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val (sys, user) = com.offlineagent.core.runtime.context.ContextManager.summaryPrompt(prev, turns, words)
                 llm.complete(sys, user, null, words * 2)
             } else null,
-            memory = if (s.longTermMemory) g.chatMemory else null,
+            memory = if (s.longTermMemory && !temporary) g.chatMemory else null,
             // Phase 4b: memory pages are re-read on every turn; keep them small (time to first token).
             config = com.offlineagent.core.runtime.context.ContextConfig(memoryPages = 2, memoryMaxTokens = 320),
         )
@@ -575,11 +609,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val plan = g.engineController.planWithoutModel(s)
         val maxOut = if (thinking) g.engineController.maxOutput(s, plan, ctx).coerceAtLeast(1536) else g.engineController.maxOutput(s, plan, ctx)
         val imgs = withContext(Dispatchers.Default) { images.map { toImageData(it) } }
-        val built = contextManager(s).build(system, turns(chatId), latestSummary(chatId), text.ifBlank { "Describe this image." }, ctx, maxOut,
-            extraContext = if (rag.isNotEmpty()) RagPrompt.context(rag) else "")
+        // Phase 6: saved memories + snippets from other chats (token budget), nothing in a temporary chat.
+        val temporary = runCatching { g.onyx.longMemory.isTemporary(chatId) }.getOrDefault(false)
+        val memBlock = if (temporary) "" else runCatching { g.onyx.longMemory.contextFor(text, chatId, budgetTokens = if (ctx <= 4096) 200 else 320).text }.getOrDefault("")
+        val extra = listOf(memBlock, if (rag.isNotEmpty()) RagPrompt.context(rag) else "").filter { it.isNotBlank() }.joinToString("\n\n")
+        val built = contextManager(s, temporary).build(system, turns(chatId), latestSummary(chatId), text.ifBlank { "Describe this image." }, ctx, maxOut,
+            extraContext = extra)
         if (built.summaryChanged) built.summary?.let { sum ->
             chats.insertMessage(MessageEntity(chatId = chatId, role = "system", text = sum.text, kind = KIND_SUMMARY, runId = "upTo:${sum.upToId}", createdAt = System.currentTimeMillis()))
-            if (s.longTermMemory) viewModelScope.launch { runCatching { g.chatMemory.add("summary of \"${chats.chat(chatId)?.title}\"", sum.text, emptySet()) } }
+            if (s.longTermMemory && !temporary) viewModelScope.launch { runCatching { g.chatMemory.add("summary of \"${chats.chat(chatId)?.title}\"", sum.text, emptySet()) } }
+            // (c) the rolling summary also feeds "reference chat history" for other chats
+            if (!temporary) g.appScope.launch { runCatching { g.onyx.longMemory.history.addSummary(chatId, chats.chat(chatId)?.title ?: "Chat", sum.text,
+                com.offlineagent.core.agents.memory.MemoryScope.NORMAL) } }
         }
         _ui.update { it.copy(contextUsed = built.promptTokens, contextSize = ctx) }
         val msgs = built.messages.toMutableList()
@@ -608,12 +649,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         ))
         chats.touch(chatId, System.currentTimeMillis())
         st?.let { stt -> _ui.update { it.copy(contextUsed = (stt.contextUsed.takeIf { c -> c > 0 } ?: (it.contextUsed + stt.generatedTokens))) } }
-        if (s.longTermMemory && v.answer.isNotBlank()) {
+        if (!temporary && v.answer.isNotBlank()) {
             val all = chats.messages(chatId)
             val ans = all.lastOrNull { it.role == "assistant" }
             val q = all.lastOrNull { it.role == "user" }
-            if (ans != null && q != null) viewModelScope.launch {
-                runCatching { g.chatMemory.add("chat \"${chats.chat(chatId)?.title}\"", "User: ${q.text.take(600)}\nAssistant: ${ans.text.take(900)}", setOf(q.id, ans.id)) }
+            if (ans != null && q != null) {
+                if (s.longTermMemory) viewModelScope.launch {
+                    runCatching { g.chatMemory.add("chat \"${chats.chat(chatId)?.title}\"", "User: ${q.text.take(600)}\nAssistant: ${ans.text.take(900)}", setOf(q.id, ans.id)) }
+                }
+                // Phase 6: index for cross-chat retrieval, then (idle, BACKGROUND priority) look for facts the rules missed.
+                g.appScope.launch {
+                    runCatching { g.onyx.longMemory.onExchange(chatId, chats.chat(chatId)?.title ?: "Chat", q.text, ans.text) }
+                    runCatching { g.onyx.longMemory.modelExtract(chatId, q.id, q.text) }
+                }
             }
         }
     }

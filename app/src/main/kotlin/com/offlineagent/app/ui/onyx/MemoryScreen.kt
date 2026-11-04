@@ -51,6 +51,13 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
     var editing by remember { mutableStateOf<AgentMemoryEntity?>(null) }
     var adding by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
+    // Phase 6
+    val settings by app.settings.settings.collectAsState(initial = com.offlineagent.core.data.AppSettings())
+    val contacts by remember { onyx.db.phase6().observeContacts() }.collectAsState(initial = emptyList())
+    val routines by remember { onyx.db.phase6().observeRoutines() }.collectAsState(initial = emptyList())
+    val historyCount by remember { onyx.db.phase6().observeHistoryCount() }.collectAsState(initial = 0)
+    var renaming by remember { mutableStateOf<com.offlineagent.core.data.RoutineEntity?>(null) }
+    var confirmWipe by remember { mutableStateOf(false) }
 
     Box(modifier.fillMaxSize()) {
         LazyColumn(contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 96.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -70,7 +77,22 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
                         }
                         Switch(prefs.memoryEnabled, { v -> onyx.prefs.update { it.copy(memoryEnabled = v) } })
                     }
-                    Text("Say \"remember that …\" to add one, or tap +.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Say \"remember that …\" or \"forget …\" in any chat, or tap +. Temporary chats never read or write memory.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Saved memories", style = MaterialTheme.typography.bodyMedium)
+                            Text("Learn lasting facts and preferences from chats (marked inferred until you confirm)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(settings.savedMemories, { v -> scope.launch { app.settings.update { it.copy(savedMemories = v) } } })
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Reference chat history", style = MaterialTheme.typography.bodyMedium)
+                            Text("Use relevant bits of all past chats ($historyCount saved snippets) in new chats and tasks", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(settings.referenceChatHistory, { v -> scope.launch { app.settings.update { it.copy(referenceChatHistory = v) } } })
+                    }
+                    if (historyCount > 0) TextButton(onClick = { scope.launch { onyx.longMemory.history.wipe() } }) { Text("Clear chat-history index") }
                 }
             }
             if (memories.isEmpty()) item { Text("No memories yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(8.dp)) }
@@ -79,8 +101,10 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
                     Row(Modifier.padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(m.text, style = MaterialTheme.typography.bodyMedium)
-                            Text("${m.category} · ${m.source.substringBefore(':')}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${m.kind.lowercase()} · ${m.source.substringBefore(':')}" + if (m.inferred) " · inferred (${(m.confidence * 100).toInt()}%)" else "",
+                                style = MaterialTheme.typography.labelSmall, color = if (m.inferred) NetworkAmber else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
+                        if (m.inferred) TextButton(onClick = { scope.launch { onyx.longMemory.book.confirm(m.id) } }) { Text("Confirm") }
                         IconButton(onClick = { scope.launch { onyx.dao.upsertMemory(m.copy(pinned = !m.pinned, updatedAt = System.currentTimeMillis())) } }) {
                             Icon(Icons.Default.Star, "Pin", tint = if (m.pinned) NetworkAmber else MaterialTheme.colorScheme.outline)
                         }
@@ -90,6 +114,45 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
                 }
             }
             if (memories.isNotEmpty()) item { TextButton(onClick = { confirmClear = true }) { Text("Delete all memories", color = MaterialTheme.colorScheme.error) } }
+            // Phase 6: frequent contacts (learned only from approved calls / messages)
+            item {
+                SectionCard {
+                    Text("Frequent contacts", style = MaterialTheme.typography.titleSmall)
+                    if (contacts.isEmpty()) Text("None yet — learned from calls and messages you approve.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    contacts.take(12).forEach { c ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(c.name, style = MaterialTheme.typography.bodyMedium)
+                                Text("${c.uses}× · ${c.channels.replace(',', ' ')}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            IconButton(onClick = { scope.launch { onyx.db.phase6().deleteContact(c.key) } }) { Icon(Icons.Default.Delete, "Forget contact") }
+                        }
+                    }
+                }
+            }
+            // Phase 6: routines the Planner reuses (no planning call)
+            item {
+                SectionCard {
+                    Text("Routines", style = MaterialTheme.typography.titleSmall)
+                    Text("A multi-step task that worked twice becomes a routine: next time the agents skip planning.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    routines.forEach { r ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(r.name, style = MaterialTheme.typography.bodyMedium)
+                                Text((if (r.successes >= com.offlineagent.core.agents.memory.RoutineBook.ACTIVE_AFTER) "active" else "learning (${r.successes}/2)") +
+                                    " · used ${r.uses}× · " + com.offlineagent.core.agents.memory.Routine.stepsFromJson(r.stepsJson).joinToString(" → ") { it.tool },
+                                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Switch(r.enabled, { v -> scope.launch { onyx.longMemory.routines.setEnabled(r.id, v) } })
+                            IconButton(onClick = { renaming = r }) { Icon(Icons.Default.Edit, "Rename") }
+                            IconButton(onClick = { scope.launch { onyx.longMemory.routines.delete(r.id) } }) { Icon(Icons.Default.Delete, "Delete routine") }
+                        }
+                    }
+                }
+            }
+            item {
+                TextButton(onClick = { confirmWipe = true }) { Text("Wipe ALL memory (memories, chat history index, summaries, contacts, routines)", color = MaterialTheme.colorScheme.error) }
+            }
         }
         ExtendedFloatingActionButton(onClick = { adding = true }, icon = { Icon(Icons.Default.Add, null) }, text = { Text("Add") },
             modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp))
@@ -103,7 +166,7 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
             confirmButton = {
                 TextButton(enabled = text.isNotBlank(), onClick = {
                     val now = System.currentTimeMillis(); val e = editing
-                    scope.launch { onyx.dao.upsertMemory(e?.copy(text = text.trim(), updatedAt = now) ?: AgentMemoryEntity(text = text.trim(), source = "user", createdAt = now, updatedAt = now)) }
+                    scope.launch { onyx.dao.upsertMemory(e?.copy(text = text.trim(), updatedAt = now, inferred = false, confirmed = true, confidence = 1.0) ?: AgentMemoryEntity(text = text.trim(), source = "user", createdAt = now, updatedAt = now)) }
                     adding = false; editing = null
                 }) { Text("Save") }
             },
@@ -112,4 +175,15 @@ fun MemoryScreen(app: OfflineAgentApp, share: (IntentRequest) -> Unit, modifier:
     if (confirmClear) AlertDialog(onDismissRequest = { confirmClear = false }, title = { Text("Delete all memories?") }, text = { Text("This cannot be undone.") },
         confirmButton = { TextButton(onClick = { scope.launch { onyx.dao.deleteAllMemories() }; confirmClear = false }) { Text("Delete", color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } })
+    renaming?.let { r ->
+        var name by remember(r.id) { mutableStateOf(r.name) }
+        AlertDialog(onDismissRequest = { renaming = null }, title = { Text("Rename routine") },
+            text = { OutlinedTextField(name, { name = it }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { scope.launch { onyx.longMemory.routines.rename(r.id, name) }; renaming = null }) { Text("Save") } },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } })
+    }
+    if (confirmWipe) AlertDialog(onDismissRequest = { confirmWipe = false }, title = { Text("Wipe all memory?") },
+        text = { Text("Deletes saved memories, the chat-history index, rolling summaries, frequent contacts and routines. Chats themselves stay. This cannot be undone.") },
+        confirmButton = { TextButton(onClick = { scope.launch { onyx.longMemory.wipeAll() }; confirmWipe = false }) { Text("Wipe", color = MaterialTheme.colorScheme.error) } },
+        dismissButton = { TextButton(onClick = { confirmWipe = false }) { Text("Cancel") } })
 }
