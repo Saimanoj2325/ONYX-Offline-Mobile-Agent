@@ -310,6 +310,12 @@ class VerificationAgent(private val deps: AgentDeps, private val llmCheck: Boole
         val out = outcome.output
         if (out.isBlank()) issues += "empty result"
         if (outcome.data?.isErrorResult() == true) issues += "tool reported an error"
+        // Phase 6: tools that check an expected outcome (screen_act expect, screen_assert, screen_wait, screen_extract) report
+        // {"subgoal":{"passed":false,"issue":…}} — a failed subgoal is a verification issue, so the node is retried
+        // (screen tools re-check instead of repeating the action) and, if it still fails, its dependants are skipped.
+        ((outcome.data?.get("subgoal")) as? JsonObject)?.let { sg ->
+            if ((sg["passed"] as? JsonPrimitive)?.booleanOrNull == false) issues += "subgoal not met: " + ((sg["issue"] as? JsonPrimitive)?.contentOrNull ?: "expected outcome not seen")
+        }
         if (out.contains("<think>")) issues += "contains raw thinking"
         val lines = out.lines().filter { it.isNotBlank() }
         if (lines.size >= 4 && lines.groupingBy { it.trim() }.eachCount().values.any { it >= 4 }) issues += "repetitive output"

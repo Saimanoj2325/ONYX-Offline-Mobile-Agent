@@ -40,6 +40,7 @@ include(":core:agents")  // Multi-agent orchestrator, task DAG, blackboard, infe
 
 // Phase 6 modules
 include(":core:apps")    // AppBridge: app catalogue, intent tools, notification bridge, AppSafetyPolicy, scoped approvals (pure Kotlin)
+include(":core:screen")  // Screen tools v2: snapshot refs, diff, find/wait/assert/extract, cross-app transfer, safety (pure Kotlin)
 
 // Optional developer tool: runs the real JNI bridge + real GGUF on an ARM64 Linux host JVM.
 // Enabled only with -PhostHarness (see tools/host-harness/README.md). Not part of the APK.
