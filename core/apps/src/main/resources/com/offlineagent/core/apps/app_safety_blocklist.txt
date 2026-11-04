@@ -1,0 +1,183 @@
+# ONYX AppSafetyPolicy blocklist — shared by AppBridge (intents, share, notifications) and the screen tools.
+# Load it with AppSafetyPolicy.default() (classpath resource) — never copy it.
+#
+# Format: one rule per line:   <category> <kind> <value>
+#   category : payment | password_manager | authenticator | self | system_admin | store_purchase
+#   kind     : package      exact package name
+#              prefix       package-name prefix (e.g. "com.kotak")
+#              word         a whole segment of the package name ("bank" matches com.foo.bank.app / com.foo_bank)
+#              label        a whole word of the app's label ("Authenticator")
+#              scheme       URI scheme (lower case, without "://")
+#              host         URI host (and its subdomains)
+#              action       Android intent action (screen/intent use)
+# Lines starting with # are comments. Matching is case-insensitive.
+# Categories marked "screen-only" in AppSafetyPolicy (store_purchase) do not block plain intents (opening the Play Store
+# page of an app is fine; operating its purchase screen is not).
+
+# ---------------------------------------------------------------- payment: UPI, banking, wallets, brokerage
+payment package com.google.android.apps.nbu.paisa.user
+payment package com.phonepe.app
+payment package net.one97.paytm
+payment package in.org.npci.upiapp
+payment package com.sbi.lotusintouch
+payment package com.sbi.SBIFreedomPlus
+payment package com.sbi.upi
+payment package com.csam.icici.bank.imobile
+payment package com.snapwork.hdfc
+payment package com.hdfcbank.payzapp
+payment package com.axis.mobile
+payment package com.msf.kbank.mobile
+payment package com.mobikwik_new
+payment package com.freecharge.android
+payment package com.amazon.mShop.android.shopping.upi
+payment package com.paypal.android.p2pmobile
+payment package com.google.android.apps.walletnfcrel
+payment package com.samsung.android.spay
+payment package com.whatsapp.payments
+payment package com.dreamplug.androidapp
+payment package com.bharatpe.app
+payment package com.myairtelapp
+payment package com.idfcfirstbank.optimus
+payment package com.kotak811mobilebankingapp.instantsavingsupiscanandpayrecharge
+payment package com.zerodha.kite3
+payment package com.nextbillion.groww
+payment package com.upstox.pro
+payment package com.angelbroking.angelwealth
+payment package com.mobikwik
+payment package com.navi.android
+payment package money.super.payments
+payment package com.jio.myjio.jiopay
+payment prefix com.kotak
+payment prefix com.icicibank
+payment prefix com.yesbank
+payment prefix com.pnb
+payment prefix com.bankofbaroda
+payment prefix com.canarabank
+payment prefix com.unionbank
+payment word bank
+payment word banking
+payment word netbanking
+payment word upi
+payment word bhim
+payment word wallet
+payment word paytm
+payment word phonepe
+payment word payzapp
+payment word trading
+payment word demat
+payment word mpay
+payment label bank
+payment label banking
+payment label upi
+payment label bhim
+payment label wallet
+payment label pay
+payment label paytm
+payment label phonepe
+payment label paypal
+payment label demat
+# UPI and pay-app URI schemes (upi://pay?pa=… etc.) — never built, never opened.
+payment scheme upi
+payment scheme upipay
+payment scheme paytmmp
+payment scheme paytm
+payment scheme phonepe
+payment scheme tez
+payment scheme gpay
+payment scheme bhim
+payment scheme credpay
+payment scheme mobikwik
+payment scheme freecharge
+payment scheme amazonpay
+payment scheme paypal
+payment host pay.google.com
+payment host gpay.app.goo.gl
+payment host paytm.me
+payment host p.paytm.me
+payment host phon.pe
+payment host phonepe.com
+payment host razorpay.me
+payment host rzp.io
+payment host paypal.me
+payment host upi.link
+payment host bhimupi.org.in
+
+# ---------------------------------------------------------------- password managers
+password_manager package com.x8bit.bitwarden
+authenticator package com.azure.authenticator
+password_manager package com.agilebits.onepassword
+password_manager package com.lastpass.lpandroid
+password_manager package com.dashlane
+password_manager package keepass2android.keepass2android
+password_manager package com.kunzisoft.keepass.free
+password_manager package com.kunzisoft.keepass.libre
+password_manager package org.keepassdx
+password_manager package com.enpass.app
+password_manager package com.nordpass.android.app.password.manager
+password_manager package com.google.android.apps.passwordmanager
+password_manager package proton.android.pass
+password_manager word keepass
+password_manager word bitwarden
+password_manager word lastpass
+password_manager word onepassword
+password_manager word passwordmanager
+password_manager label password
+password_manager label passwords
+password_manager label keepass
+
+# ---------------------------------------------------------------- authenticators / OTP
+authenticator package com.google.android.apps.authenticator2
+authenticator package com.authy.authy
+authenticator package org.fedorahosted.freeotp
+authenticator package com.beemdevelopment.aegis
+authenticator package com.yubico.yubioath
+authenticator package com.duosecurity.duomobile
+authenticator package com.okta.android.auth
+authenticator word authenticator
+authenticator word otp
+authenticator word totp
+authenticator label authenticator
+authenticator label otp
+authenticator scheme otpauth
+authenticator scheme otpauth-migration
+
+# ---------------------------------------------------------------- ONYX itself (an agent must never drive or re-enter itself)
+self package com.offlineagent.app
+self prefix com.offlineagent.app.
+
+# ---------------------------------------------------------------- settings / admin / installers (never grant itself permissions)
+system_admin package com.android.settings
+system_admin package com.google.android.settings
+system_admin package com.android.permissioncontroller
+system_admin package com.google.android.permissioncontroller
+system_admin package com.android.packageinstaller
+system_admin package com.google.android.packageinstaller
+system_admin package com.android.managedprovisioning
+system_admin package com.google.android.apps.work.clouddpc
+system_admin package com.oplus.securitypermission
+system_admin package com.coloros.securitypermission
+system_admin package com.miui.securitycenter
+system_admin package com.samsung.android.lool
+system_admin package com.android.vpndialogs
+system_admin package com.android.certinstaller
+system_admin action android.settings.ACCESSIBILITY_SETTINGS
+system_admin action android.settings.ACCESSIBILITY_DETAILS_SETTINGS
+system_admin action android.app.action.ADD_DEVICE_ADMIN
+system_admin action android.app.action.PROVISION_MANAGED_PROFILE
+system_admin action android.app.action.SET_NEW_PASSWORD
+system_admin action android.settings.MANAGE_UNKNOWN_APP_SOURCES
+system_admin action android.settings.APPLICATION_DEVELOPMENT_SETTINGS
+system_admin action android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS
+system_admin action android.settings.NOTIFICATION_LISTENER_DETAIL_SETTINGS
+system_admin action android.settings.action.MANAGE_OVERLAY_PERMISSION
+system_admin action android.settings.MANAGE_DEFAULT_APPS_SETTINGS
+system_admin action android.settings.SECURITY_SETTINGS
+system_admin action android.settings.APPLICATION_DETAILS_SETTINGS
+system_admin action android.intent.action.INSTALL_PACKAGE
+system_admin action android.intent.action.UNINSTALL_PACKAGE
+system_admin action android.intent.action.DELETE
+system_admin action android.app.role.action.REQUEST_ROLE
+system_admin scheme package
+
+# ---------------------------------------------------------------- store purchase screens (screen-only: intents to the store page are fine)
+store_purchase package com.android.vending

@@ -6,4 +6,5 @@
     <string name="a11y_description">Lets Offline Agent read what is on the screen and tap or type for you when YOU ask it to do a task (for example \"fill this internship form\"). Everything stays on this phone: nothing is sent anywhere, there is no internet permission. Each step is shown in a floating panel with Pause and Stop, and the assistant asks before anything that submits, pays, sends or deletes. Banking and payment apps are blocked. CAPTCHAs are never solved, passwords are never typed, and one-time codes are only typed if you give them. You can switch this off at any time here or in the app (Settings → Phone actions).</string>
     <string name="autofill_label">Offline Agent profile autofill</string>
     <string name="notif_label">Offline Agent notification summaries</string>
+    <string name="quick_ask_label">Ask ONYX</string>
 </resources>

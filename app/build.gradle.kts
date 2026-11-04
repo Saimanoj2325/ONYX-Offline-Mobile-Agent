@@ -79,6 +79,7 @@ dependencies {
     implementation(project(":core:openui"))
     implementation(project(":core:models"))
     implementation(project(":core:agents"))
+    implementation(project(":core:apps"))
     "connectedImplementation"(project(":core:mcp-http"))
     implementation(libs.pdfbox.android)
 

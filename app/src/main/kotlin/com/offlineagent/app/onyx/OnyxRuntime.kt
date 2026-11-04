@@ -64,7 +64,9 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /** A confirmation the user must answer on the bottom sheet. */
-data class OnyxApproval(val request: ApprovalRequest, val canAlwaysAllow: Boolean, val answer: CompletableDeferred<Boolean>)
+data class OnyxApproval(val request: ApprovalRequest, val canAlwaysAllow: Boolean, val answer: CompletableDeferred<Boolean>,
+    /** Phase 6: "Allow <App> for this task" (AppBridge scoped approval); the "always" answer grants this scope instead. */
+    val scopeLabel: String? = null)
 
 /**
  * Phase 5 wiring: the multi-agent [Orchestrator] on the app's ONE loaded model, its Android ports, the Phase 5 Room
@@ -80,7 +82,10 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     private val outboxStore by lazy { RoomOutboxStore(dao) }
 
     /** Phase 5 device tools (joined into the shared tool registry in OfflineAgentApp). */
-    val extraTools: List<Tool> by lazy { Phase5Tools(app) { i -> app.launcher.launch(i, "settings") }.all() + NetworkTools.create() }
+    val extraTools: List<Tool> by lazy { Phase5Tools(app) { i -> app.launcher.launch(i, "settings") }.all() + NetworkTools.create() + appBridge.tools }
+
+    /** Phase 6 AppBridge (app catalogue, intents, notification bridge, scoped approvals) — see onyx/apps/AppBridgeTools.kt. */
+    val appBridge by lazy { com.offlineagent.app.onyx.apps.AppBridgeTools(app) }
 
     // ---------------------------------------------------------------- one model, one queue
     private val sharedLlm = object : AgentLlm {
@@ -275,6 +280,7 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     }
 
     private suspend fun finished(cp: TaskCheckpoint) {
+        appBridge.endRun(cp.runId)
         if (taskStore.interrupted().isEmpty()) WorkManager.getInstance(app).cancelUniqueWork(TaskResumeWorker.NAME)
         if (cp.status == TaskStatus.COMPLETED && prefs.values.value.voiceReplies) cp.answer?.let { speakRequests.tryEmit(it) }
     }
@@ -288,7 +294,9 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
         val spec = gateway.spec(r.tool)
         val always = spec != null && r.risk < Risk.HIGH && spec.permission.canAlwaysAllow
         if (always && r.tool in app.cachedSettings.alwaysAllowedTools) return true
-        val a = OnyxApproval(r, always, CompletableDeferred())
+        if (appBridge.preApproved(r)) { audit(r.runId, "Executor", "scoped approval used: ${r.tool}", r.title.take(200), r.risk); return true }
+        val scope = appBridge.scopeLabel(r)
+        val a = OnyxApproval(r, always || scope != null, CompletableDeferred(), scope)
         _pending.value = a
         Notifications.post(app, Notifications.CH_AGENT, 5050, "ONYX needs your OK", "${r.title} — ${r.risk.label} risk", "onyx")
         // A background (WorkManager) resume cannot wait forever: no answer in 9 minutes = declined.
@@ -299,7 +307,8 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
 
     fun answer(allow: Boolean, always: Boolean) {
         val p = _pending.value ?: return
-        if (allow && always && p.canAlwaysAllow) app.appScope.launch { app.settings.update { it.copy(alwaysAllowedTools = it.alwaysAllowedTools + p.request.tool) } }
+        if (allow && always && p.scopeLabel != null) appBridge.grant(p.request)
+        else if (allow && always && p.canAlwaysAllow) app.appScope.launch { app.settings.update { it.copy(alwaysAllowedTools = it.alwaysAllowedTools + p.request.tool) } }
         p.answer.complete(allow)
         _pending.value = null
     }
@@ -318,7 +327,7 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
         override fun spec(name: String): ToolSpec? = app.agents.registry(null)[name]?.spec
         override fun requiresNetwork(name: String) = name in networkTools()
         override fun usesModel(name: String) = name in modelTools
-        override fun risk(name: String, args: JsonObject): Risk = spec(name)?.let { s -> riskOf(s).let { if (requiresNetwork(name) && it < Risk.MEDIUM) Risk.MEDIUM else it } } ?: Risk.HIGH
+        override fun risk(name: String, args: JsonObject): Risk = appBridge.risk(name, args) ?: spec(name)?.let { s -> riskOf(s).let { if (requiresNetwork(name) && it < Risk.MEDIUM) Risk.MEDIUM else it } } ?: Risk.HIGH
         override suspend fun execute(name: String, args: JsonObject): ToolResult {
             val t = app.agents.registry(null)[name] ?: return ToolResult.Error("tool $name is not available", retryable = false)
             return withTimeoutOrNull(t.spec.timeoutMs) { t.execute(args, ToolContext("onyx", null)) } ?: ToolResult.Error("$name timed out")
