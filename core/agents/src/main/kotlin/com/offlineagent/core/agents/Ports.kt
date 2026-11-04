@@ -26,7 +26,7 @@ fun riskOf(spec: ToolSpec): Risk {
         Permission.SENSITIVE_READ, Permission.DEVICE_CONTROL -> Risk.MEDIUM
         Permission.EXTERNAL_INTENT, Permission.SCREEN_ACTION -> Risk.HIGH
     }
-    val irreversible = Regex("delete|remove|send|pay|purchase|transfer|wipe|uninstall").containsMatchIn(spec.name)
+    val irreversible = Regex("delete|remove|send|reply|pay|purchase|transfer|wipe|uninstall").containsMatchIn(spec.name)
     return if (irreversible && base >= Risk.LOW) Risk.CRITICAL else base
 }
 

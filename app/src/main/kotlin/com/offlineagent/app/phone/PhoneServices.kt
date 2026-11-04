@@ -244,10 +244,12 @@ class SafFilesPort(private val ctx: Context) : FilesPort {
 // ---------------------------------------------------------------- notifications (opt-in listener, memory only)
 
 class NotificationCaptureService : NotificationListenerService() {
-    override fun onListenerConnected() { connected = true }
+    override fun onListenerConnected() { connected = true; runCatching { com.offlineagent.app.onyx.apps.AppBridgeNotifications.seed(this, activeNotifications) } }
     override fun onListenerDisconnected() { connected = false }
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) { sbn?.let { com.offlineagent.app.onyx.apps.AppBridgeNotifications.removed(it) } } // Phase 6
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         val n = sbn ?: return
+        com.offlineagent.app.onyx.apps.AppBridgeNotifications.posted(this, n) // Phase 6 AppBridge (actions/replies, memory only)
         if (n.packageName == packageName || n.isOngoing) return
         val ex = n.notification.extras
         val title = ex.getCharSequence("android.title")?.toString() ?: ""

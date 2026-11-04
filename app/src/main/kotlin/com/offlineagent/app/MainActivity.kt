@@ -186,7 +186,9 @@ private fun AppRoot(
     var showSettings by rememberSaveable { mutableStateOf(false) }
     val open by openRequests.collectAsStateWithLifecycle()
     LaunchedEffect(open) {
-        when (open) { "onyx" -> tab = Tab.HOME; "onyx-tasks" -> tab = Tab.TASKS }
+        when (open) { "onyx" -> tab = Tab.HOME; "onyx-tasks" -> tab = Tab.TASKS
+            com.offlineagent.app.onyx.apps.AppBridgeInbox.OPEN -> com.offlineagent.app.onyx.apps.AppBridgeInbox.take()?.let { r -> // Phase 6 share-in / Ask ONYX
+                tab = Tab.CHAT; vm.newChat(); r.imagePaths.forEach { p -> vm.attachImage(android.net.Uri.fromFile(java.io.File(p))).join() }; vm.send(r.prompt) } }
         openRequests.value = null
     }
     androidx.activity.compose.BackHandler(enabled = !showSettings && tab != Tab.HOME) { tab = Tab.HOME }

@@ -63,7 +63,7 @@ fun ApprovalSheet(a: OnyxApproval, onAnswer: (allow: Boolean, always: Boolean) -
             if (r.needsNetwork) Text("If you're offline it will be queued and run automatically when you're back online.", style = MaterialTheme.typography.bodySmall)
             Button(onClick = { onAnswer(true, false) }, modifier = Modifier.fillMaxWidth(),
                 colors = if (r.risk >= Risk.HIGH) ButtonDefaults.buttonColors(containerColor = rc) else ButtonDefaults.buttonColors()) { Text("Allow once") }
-            if (a.canAlwaysAllow) OutlinedButton(onClick = { onAnswer(true, true) }, modifier = Modifier.fillMaxWidth()) { Text("Always allow ${r.tool}") }
+            if (a.canAlwaysAllow) OutlinedButton(onClick = { onAnswer(true, true) }, modifier = Modifier.fillMaxWidth()) { Text(a.scopeLabel ?: "Always allow ${r.tool}") }
             TextButton(onClick = { onAnswer(false, false) }, modifier = Modifier.fillMaxWidth()) { Text("Deny") }
         }
     }

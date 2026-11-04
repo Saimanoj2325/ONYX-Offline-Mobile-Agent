@@ -396,7 +396,7 @@ private fun InlineApproval(a: ApprovalRequest, canAlways: Boolean, onAnswer: (Bo
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { onAnswer(true, false) }, colors = if (a.risk >= Risk.HIGH) ButtonDefaults.buttonColors(containerColor = rc) else ButtonDefaults.buttonColors()) { Text("Allow once") }
                 OutlinedButton(onClick = { onAnswer(false, false) }) { Text("Deny") }
-                if (canAlways) TextButton(onClick = { onAnswer(true, true) }) { Text("Always") }
+                if (canAlways) TextButton(onClick = { onAnswer(true, true) }) { Text(if (com.offlineagent.app.onyx.apps.AppBridgeTools.scopeLabelOf(a) != null) "For this task" else "Always") }
             }
         }
     }
