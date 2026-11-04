@@ -10,6 +10,8 @@ Version: `0.6.0-phase6` (versionCode 6).
 
 ---
 
+AppBridge (app intents, notifications, quick ask): see [PHASE6-APPS.md](PHASE6-APPS.md).
+
 ## M1 — device-adaptive model runtime
 
 ### 1. Tiers (`:core:agents` `RuntimeSelector`)

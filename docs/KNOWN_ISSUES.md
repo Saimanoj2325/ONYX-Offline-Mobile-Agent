@@ -129,3 +129,9 @@
   (inferred memories are marked until confirmed).
 - Chat-history retrieval is keyword (BM25), not semantic: paraphrases with no shared words are not found.
 - Deleting a thread forgets its summary and snippets; the chat's next summary (if it keeps growing) is re-indexed.
+
+## Phase 6 AppBridge — see docs/PHASE6-APPS.md
+- The legacy Phase 1–4 chat path has no scoped approvals ("Allow <App> for this task" exists only on the Onyx/agents path).
+- The app catalogue is in memory only (rebuilt on start / package changes, not persisted).
+- `clipboard_get` works only while ONYX is in the foreground (Android 10+).
+- `notif_reply` (inline RemoteInput reply) is untested on a device; the AppBridge Android side is compiled, not phone-tested.
