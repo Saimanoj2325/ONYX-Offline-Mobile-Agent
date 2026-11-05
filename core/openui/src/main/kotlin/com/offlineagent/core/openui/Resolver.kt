@@ -56,8 +56,14 @@ sealed interface OuAction {
 
 data class OuError(val code: String, val message: String, val statement: String? = null, val warning: Boolean = false)
 
-data class Resolved(val root: UiNode?, val errors: List<OuError>, val proseLines: List<String> = emptyList()) {
+data class Resolved(val root: UiNode?, val errors: List<OuError>, val proseLines: List<String> = emptyList(), val placeholders: Int = 0) {
     val ok: Boolean get() = root != null
+
+    /**
+     * 0.6.2.2: the model wrote template filler ("Chat 1: [text]") and almost nothing real is left once it is hidden
+     * (at most a title). The app shows a friendly message instead of an empty / placeholder canvas.
+     */
+    val onlyPlaceholders: Boolean get() = placeholders > 0 && (root?.walk()?.count { n -> n.props.values.any { it is String && it.isNotBlank() && n.type != "Stack" } } ?: 0) <= 1
 }
 
 /**
@@ -68,7 +74,9 @@ data class Resolved(val root: UiNode?, val errors: List<OuError>, val proseLines
  */
 class OpenUiResolver(private val lib: OpenUiLibrary = OpenUiLibrary.DEFAULT) {
 
-    fun resolve(program: Program, streaming: Boolean = false): Resolved {
+    fun resolve(program0: Program, streaming: Boolean = false): Resolved {
+        // 0.6.2.2: a looping model repeats statements and writes `root = Stack([root, …])`; see [deduped].
+        val program = program0.deduped()
         val errors = mutableListOf<OuError>()
         val stmts = program.byName
         val invalidByName = program.invalid.mapNotNull { l -> l.assignedName?.let { it to l } }.toMap()
@@ -79,7 +87,7 @@ class OpenUiResolver(private val lib: OpenUiLibrary = OpenUiLibrary.DEFAULT) {
         // Statements nobody references (and that are not the entry) are dropped, as in OpenUI.
         val prose = program.invalid.filter { it.assignedName == null && it.raw.isNotBlank() }.map { it.raw.trim() }
         if (!streaming) for (l in program.invalid) if (l.assignedName != null) errors += OuError("parse-failed", l.reason, l.assignedName)
-        return Resolved(root, errors, prose)
+        return Resolved(root, errors, prose, ctx.placeholders)
     }
 
     private fun entryStatement(p: Program, errors: MutableList<OuError>): Statement? {
@@ -112,6 +120,14 @@ class OpenUiResolver(private val lib: OpenUiLibrary = OpenUiLibrary.DEFAULT) {
     ) {
         fun err(code: String, msg: String, at: String?) { if (!streaming) errors += OuError(code, msg, at) }
 
+        /** Placeholder strings hidden so far ("[text]", "TBD", …). */
+        var placeholders = 0
+        fun text(s: String): String? {
+            val c = Placeholders.clean(s)
+            if (c != s) placeholders++
+            return c
+        }
+
         /** Follows references. Returns null for unresolved refs (pending while streaming). */
         fun deref(v: OuValue, path: Set<String>): Pair<OuValue, Set<String>>? {
             var cur = v
@@ -137,7 +153,7 @@ class OpenUiResolver(private val lib: OpenUiLibrary = OpenUiLibrary.DEFAULT) {
             val (d, p) = deref(v, path) ?: return null
             return when (d) {
                 is OuValue.Call -> call(d, at, p)
-                is OuValue.Str -> if (d.v.isBlank()) null else UiNode("TextContent", mapOf("text" to d.v, "size" to "default"), at ?: "")
+                is OuValue.Str -> text(d.v)?.takeIf { it.isNotBlank() }?.let { UiNode("TextContent", mapOf("text" to it, "size" to "default"), at ?: "") }
                 is OuValue.Num -> UiNode("TextContent", mapOf("text" to UiNode.fmt(d.v), "size" to "default"), at ?: "")
                 is OuValue.Arr -> {
                     val kids = d.items.mapNotNull { component(it, null, p) }
@@ -184,7 +200,7 @@ class OpenUiResolver(private val lib: OpenUiLibrary = OpenUiLibrary.DEFAULT) {
             val (d, p) = deref(v, path) ?: return null
             return when (t) {
                 PType.Str -> when (d) {
-                    is OuValue.Str -> d.v; is OuValue.Num -> UiNode.fmt(d.v); is OuValue.Bool -> d.v.toString()
+                    is OuValue.Str -> text(d.v); is OuValue.Num -> UiNode.fmt(d.v); is OuValue.Bool -> d.v.toString()
                     else -> { err("type-mismatch", "$prop: expected string", at); null }
                 }
                 PType.Num -> when (d) {
@@ -207,7 +223,7 @@ class OpenUiResolver(private val lib: OpenUiLibrary = OpenUiLibrary.DEFAULT) {
                 }
                 PType.Action -> action(d, p)
                 PType.Cell -> when (d) {
-                    is OuValue.Str -> d.v; is OuValue.Num -> d.v; is OuValue.Bool -> d.v
+                    is OuValue.Str -> text(d.v) ?: ""; is OuValue.Num -> d.v; is OuValue.Bool -> d.v
                     is OuValue.Null -> ""
                     else -> plain(d, p)?.toString()
                 }

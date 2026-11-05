@@ -370,6 +370,9 @@ class ChatHistoryIndex(private val repo: HistoryRepo, private val clock: () -> L
     suspend fun threads(): List<HistoryChunk> =
         repo.all().filter { it.summary }.groupBy { it.chatId }.map { (_, v) -> v.maxBy { it.createdAt } }.sortedByDescending { it.createdAt }
 
+    /** 0.6.2.2: every indexed chunk (summaries + exchanges) — for questions about earlier chats ([PreviousChats]). */
+    suspend fun allChunks(): List<HistoryChunk> = repo.all()
+
     /** Deletes a thread from memory: its summary and every indexed exchange of that chat (the chat itself stays). */
     suspend fun deleteThread(chatId: Long) = deleteChat(chatId)
 

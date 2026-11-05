@@ -72,3 +72,12 @@ tasks.register<JavaExec>("runPhase6") {
     jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
     args(nativeDir)
 }
+
+// 0.6.2.2: Canvas prompt sizes (real tokenizer) and cold/warm prefill, before vs after. Env: MODEL, THREADS, CTX.
+tasks.register<JavaExec>("runPhase622") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.offlineagent.tools.Phase622HarnessKt")
+    val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
+    jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
+    args(nativeDir)
+}

@@ -130,6 +130,15 @@ class OnyxMemory(private val app: OfflineAgentApp, private val runtime: OnyxRunt
         MemoryContext.build(mem, hist, budgetTokens)
     }
 
+    /**
+     * 0.6.2.2: context for a question ABOUT earlier chats ("summarise our previous chats"): the Threads summaries and
+     * newest exchanges of recent chats, newest first. Temporary chat / Use memory / Reference chat history are honoured
+     * (the block then says why there is nothing, so the model does not invent chats).
+     */
+    suspend fun previousChats(query: String, chatId: Long?, budgetTokens: Int): com.offlineagent.core.agents.memory.PreviousChats.Block = withContext(Dispatchers.IO) {
+        com.offlineagent.core.agents.memory.PreviousChats.contextFor(query, history, chatId, scope(chatId), settings(), budgetTokens)
+    }
+
     // ---------------------------------------------------------------- rolling summary (c)
     /**
      * Folds turns that fall out of [windowTokens] into the chat's running summary (model at BACKGROUND priority,

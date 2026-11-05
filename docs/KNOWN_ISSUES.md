@@ -215,3 +215,32 @@
   because every route sees the history; the resolver is only used for export.
 - **Limits**: the screen agent's step prompts get only a short session tail inside the goal; very long answers are cut
   to fit the session budget on 2K–4K context models (the PDF export always uses the full stored answer).
+
+## 0.6.2.2 — Canvas looped on a plain question, first token 241 s (fixed)
+- **Bug** (Sai, phone, Qwen3 1.7B, Canvas mode): "can you give me 2-3 lines of summary of our previous chats?" went to
+  the canvas designer, which streamed `root = TextContent(…) / prevChats = ["Chat 1: [text]", …] / root = Stack([root,
+  prevChats])` over and over (the canvas flickered: "last definition wins" made `root` a cycle), never showed real
+  content, and the first token came after 241 s.
+- **Causes**: (1) Canvas mode sent every message to the designer; (2) nothing stopped a repeating stream (1 600-token cap,
+  no repetition penalty); (3) BM25 history retrieval shares no words with "our previous chats", so the model had no real
+  content and wrote template filler; (4) slow first token: the canvas session block ran the rolling summariser INLINE
+  (up to 6 extra model calls, each a prefill + up to 300 generated tokens) before the canvas request started, and the
+  canvas system prompt was the full generated library (~2 000 tokens) — a different prefix from chat, so it was
+  prefilled again (cold) on the first canvas turn and after anything else used the KV cache.
+- **Fix**: `CanvasRouting` answers questions / chat requests in chat ("Answered in chat" note) and keeps tables, charts,
+  plans, forms and edits of the current canvas in Canvas. `LoopGuard` stops repeated statements / n-gram loops (canvas
+  and chat); canvas output capped at 768 tokens (grammar ≤ 24 statements) with repeat penalty 1.1. `Program.deduped()`
+  drops repeated statements and resolves `x = f(x)` against the previous definition (last valid tree, no flicker);
+  placeholder filler ("[text]", "TBD", "Lorem ipsum") is not rendered, and a canvas left with only placeholders shows a
+  friendly message. `PreviousChats` puts the Threads summaries + newest exchanges of recent chats (onyx-agents.db) into
+  the context for "previous chats / what did we talk about yesterday" questions, in chat and canvas, honouring
+  temporary chats and the memory switches. Canvas prompt: static ~400-token sheet first (cached prefix), dynamic part
+  after it within a device-aware budget (`PromptBudget`: measured prompt speed via `PrefillMeter`, else per RAM tier,
+  ~20 s target; history trimmed first, then memory); no inline summariser. Message footer now shows prompt tokens
+  (cached part), prefill time and "prep" time before generation.
+- **Limits**: routing is keyword-based (a chatty "plan" question can still go to Canvas; switch to Chat). Plain chat
+  still runs the rolling summariser inline when the window fills (shown as "Summarising older messages…"). Model-load
+  time after an idle unload still counts towards the first token. Not re-measured on a phone.
+- **Host numbers** (`Phase622Harness`, Qwen3 1.7B Q8_0, 2-vCPU sandbox, NOT a phone; cold = nothing cached):
+  before: canvas prompt 2 371 tokens (system 1 994), 34.5 s cold / 7.0 s with the system prefix warm; after: the same
+  question answered in chat 504 tokens, 5.4 s cold / 2.1 s warm; a real canvas request 663 tokens, 8.3 s cold / 3.7 s warm.

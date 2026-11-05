@@ -112,6 +112,30 @@ object OpenUiPrompt {
         |Form answers come back as "${FormSubmission.HEADER} …".
     """.trimMargin()
 
+    /**
+     * 0.6.2.2: Canvas-mode system prompt for phones. The full generated library ([generate] in PROGRAM mode) is about
+     * 2 000 tokens; with a 1.7B model on a phone CPU that alone was most of a minute of prefill whenever its KV cache
+     * was not warm. This sheet (~400 tokens) lists the components a canvas really uses (every name and argument order
+     * matches [OpenUiLibrary.DEFAULT]; checked by a unit test) and the rules a small model breaks: no placeholders, no
+     * re-assigning names, no repeating lines. It is static text, so it is the cached prefix of every canvas request.
+     */
+    fun canvasSheet(): String = CANVAS_SHEET
+
+    internal val CANVAS_SHEET = """
+        |You write openui-lang: a compact UI language. Output ONLY code, one statement per line: `name = Expression`.
+        |The first line is `root = Stack([...])`. Arguments are positional. Every name is assigned ONCE and used by a later reference.
+        |Components: TextContent(text, size?) size "small" | "default" | "large" | "large-heavy" · Callout(variant, title, description?) variant "info" | "success" | "warning" | "error" · Table(columns, rows) with Col(label, type?) · BarChart(labels, series) / LineChart(labels, series) with Series(category, values) · PieChart(slices) with Slice(category, value) · Steps(items) with StepsItem(title, details?) · ListBlock(items) with ListItem(title, subtitle?) · Form(name, fields, buttons?) with FormControl(label, Input(name, placeholder?)) and Buttons([Button(label, "submit:<form name>")]) · Stack(children)
+        |Example:
+        |root = Stack([title, tbl])
+        |title = TextContent("Top Languages", "large-heavy")
+        |tbl = Table([Col("Language", "string"), Col("Users (M)", "number")], [["Python", 15.7], ["Java", 12.1]])
+        |Rules:
+        |- Use real, specific content from the request and the context. Never write placeholders like "[text]", "Item 1", "TBD" or "...".
+        |- If you do not have the facts, write one Callout("info", ...) that says so.
+        |- At most about 12 components. Never repeat a line. Stop after the last component.
+        |- To change the current UI, write the complete updated program (same names for unchanged parts).
+    """.trimMargin()
+
     /** Canvas update: the current program is shown to the model, which writes the full updated program. */
     fun updateUser(request: String, currentSource: String): String =
         "Current UI (openui-lang):\n$currentSource\n\nChange request: $request\n\nWrite the complete updated program."
