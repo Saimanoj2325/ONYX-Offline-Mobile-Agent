@@ -426,8 +426,10 @@ class MacroTest {
         rec.add(RecordedEvent.Clicked(name, "com.example.form", 20))
         "Sai".forEachIndexed { i, _ -> rec.add(RecordedEvent.TextChanged(name, "com.example.form", "Sai".take(i + 1), 30L + i)) }
         rec.add(RecordedEvent.TextChanged(node(editable = true, password = true), "com.example.form", "pw", 40))  // never recorded
-        rec.add(RecordedEvent.Scrolled("com.example.form", "down", 50)); rec.add(RecordedEvent.Scrolled("com.example.form", "down", 51))
-        rec.add(RecordedEvent.Clicked(node("Submit", clickable = true), "com.example.form", 60))
+        // 6.2: scrolls right after a tap / new window are the app's own (ignored), so the user's scroll comes later here.
+        rec.add(RecordedEvent.Scrolled("com.example.form", "down", 50))                                        // app's own: ignored
+        rec.add(RecordedEvent.Scrolled("com.example.form", "down", 5_000)); rec.add(RecordedEvent.Scrolled("com.example.form", "down", 5_001))
+        rec.add(RecordedEvent.Clicked(node("Submit", clickable = true), "com.example.form", 6_000))
         val m = rec.build("m1", "Fill form", "demo", variables = mapOf("name" to "Sai"))
         assertEquals(listOf(MacroStepKind.OPEN_APP, MacroStepKind.TAP, MacroStepKind.TYPE, MacroStepKind.SCROLL, MacroStepKind.TAP), m.steps.map { it.kind })
         assertEquals("{{name}}", m.steps[2].value)
@@ -445,11 +447,12 @@ class MacroTest {
             com.offlineagent.core.runtime.phone.MacroStep(MacroStepKind.TYPE, MacroRecorder.selector(node(editable = true, hint = "Name", id = "app:id/name"), "com.example.form"), "{{name}}"),
             com.offlineagent.core.runtime.phone.MacroStep(MacroStepKind.TAP, MacroRecorder.selector(node("Submit", clickable = true), "com.example.form"), irreversible = true),
         ), params = listOf("name"))
-        val s = screen("com.example.form", node(editable = true, hint = "Name", id = "app:id/name"), node("Submit", clickable = true))
+        var typed = ""
         val performed = mutableListOf<ScreenAction>()
+        // 6.2: replay checks each step's effect, so the fake screen shows what was typed (as a real field does).
         val driver = object : ScreenDriver {
-            override suspend fun snapshot() = s
-            override suspend fun perform(a: ScreenAction, s: ScreenSnapshot): Boolean { performed += a; return true }
+            override suspend fun snapshot() = screen("com.example.form", node(editable = true, hint = "Name", id = "app:id/name").copy(text = typed), node("Submit", clickable = true))
+            override suspend fun perform(a: ScreenAction, s: ScreenSnapshot): Boolean { performed += a; if (a is ScreenAction.Type) typed = a.text; return true }
         }
         val approvals = mutableListOf<String>()
         val host = object : AutomationHost {

@@ -42,7 +42,7 @@ data class ScreenNode(
 /** An interactive or informative element the agent can refer to by [id]. */
 data class ScreenElement(val id: Int, val node: ScreenNode, val nearbyLabel: String)
 
-data class ScreenSnapshot(val packageName: String, val root: ScreenNode, val appLabel: String = packageName, val activity: String = "") {
+data class ScreenSnapshot(val packageName: String, val root: ScreenNode, val appLabel: String = packageName, val activity: String = "", val windowTitle: String = "") {
     /** Elements in reading order: interactive nodes plus text-only nodes (as context). ids start at 1. */
     val elements: List<ScreenElement> by lazy {
         val out = ArrayList<ScreenElement>()
@@ -101,7 +101,12 @@ data class ScreenSnapshot(val packageName: String, val root: ScreenNode, val app
 sealed interface ScreenAction {
     data class Tap(val element: Int) : ScreenAction
     data class Type(val element: Int, val text: String, val submit: Boolean = false) : ScreenAction
-    data class Scroll(val direction: String) : ScreenAction
+    /** [element] = the scroll container (0 = the first scrollable on screen). */
+    data class Scroll(val direction: String, val element: Int = 0) : ScreenAction
+    /** Phase 6.2: long-press a node (macros record it from TYPE_VIEW_LONG_CLICKED). */
+    data class LongPress(val element: Int) : ScreenAction
+    /** Phase 6.2: the keyboard's Enter / Search / Go key on a field (ACTION_IME_ENTER, API 30+). */
+    data class Enter(val element: Int) : ScreenAction
     data object Back : ScreenAction
     data object Home : ScreenAction
     data class OpenApp(val app: String) : ScreenAction
@@ -113,6 +118,8 @@ sealed interface ScreenAction {
         is Tap -> "Tap " + target(s, element)
         is Type -> "Type \"${if (looksSecret(text)) "••••" else text.take(60)}\" into " + target(s, element) + if (submit) " and press Enter" else ""
         is Scroll -> "Scroll $direction"
+        is LongPress -> "Long-press " + target(s, element)
+        is Enter -> "Press Enter in " + target(s, element)
         Back -> "Press Back"
         Home -> "Go to the home screen"
         is OpenApp -> "Open $app"

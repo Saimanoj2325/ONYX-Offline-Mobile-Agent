@@ -264,3 +264,88 @@ run on a phone yet.
 4. Try "open WhatsApp and type hi to Mom" (it should stop before Send) and "open Settings > Display and turn on dark mode".
 5. The old launcher macro is fixed on first load. If it still starts wrong, record it again from the home screen.
 
+
+## 6.2 — accurate macro record/replay, robust screen agent, overlay approvals, debug reports (0.6.2-phase6, versionCode 8)
+
+Sai's report from the OnePlus Nord CE 3: "Macro recording should be accurate. It should work in every app and replicate
+everything exactly — if I selected a chat in WhatsApp, next time it should open the same chat. The screen agent is not
+working perfectly." Also: approvals forced him to switch back to ONYX every time.
+
+### Macros: record rich targets, replay by matching
+- **Recording** (`MacroRecorder`, `TargetCapture`, `OfflineAccessibilityService`): every step stores package, activity,
+  window title, view id, text, content description, hint, class, ancestor chain (id / class / index), the **list-row
+  label** (the chat name "Mom", found from the row's name/title view), the list's id, position as a fraction of the
+  screen, and a **before/after screen fingerprint** (view ids + 32-bit hashes of visible texts — never the words, so
+  message previews are not saved). Typed text keeps the final value per field (also after tapping back into it);
+  password fields (isPassword or a password input type) and one-time-code fields are never recorded. Also recorded:
+  long-press, Back (key event during recording, or "returned to an earlier screen"), Home, Enter (when the keyboard
+  sends it; otherwise tick "Press Enter after typing" in the editor), user scrolls (the app's own scrolls right after a
+  tap / new screen are ignored) and the real pauses between steps.
+- **Replay** (`MacroPlayer`, `TargetMatcher`): strategies in order — resource id + text → list-item label → exact
+  text/description → fuzzy text → ancestor path → relative position (last resort; never for list rows or irreversible
+  steps). Before each step it waits for the expected screen (fingerprint similarity) and the target, up to 2x the
+  recorded pause (8–15 s). A list row that is off screen is found by scrolling down, then up (8 / 16 scrolls). After each
+  step it checks the effect (recorded "after" screen, window change, or typed text); if nothing happened it retries once
+  with the next strategy, then stops with "expected … but saw …". Irreversible steps are never retried.
+- **Entities**: a chosen chat is stored by its label, so replay opens "Mom" even when the order changed or she is far
+  down the list. WhatsApp macros can start with the chat link (`https://wa.me/<number>`, set in the editor); if the link
+  does not open the expected screen, every recorded step runs instead.
+- **Values**: typed texts and chosen list items are suggested as `{{message}}` / `{{chat}}`; Run and Test run ask for them.
+- **Safety unchanged**: scheduled runs stop before Send/Pay/Submit/Enter and notify; irreversible steps ask every time;
+  AppSafetyPolicy blocklist and AutomationPolicy still apply.
+- **Editor**: each step in plain words ("Tap chat 'Mom' in WhatsApp", "Type 'hi' into 'Message'"), Up / Down / Delete,
+  edit typed text or chat name, suggested values, schedule, and **Test run** (outlines each matched element on the
+  overlay before acting).
+- **Debug report**: a failed run's overlay card has **Copy debug report**; Settings → Automation → Debug reports has the
+  last macro and screen-agent reports. Steps, strategies with candidate counts, scrolls, package / activity, timing;
+  other names masked ("Mo**"), no message text except what the macro itself types.
+- Old (≤0.6.1) macros still load and replay by text; the editor suggests recording them again.
+
+### Screen agent (`:core:screen`)
+- **Stable refs** (RefStabilizer idea): a ref stays valid on a re-read when the element is clearly the same (same role +
+  label + id, unique, barely moved, not a reused list row). Send/Pay/Delete-type targets always need a fresh snapshot.
+- **Code-checked effects**: every action result carries `effect` = none / changed / new_app.
+- **Loop guards** (`TaskGuards`): no-effect streak (warn at 2, stop at 4), same action on the same screen 3x, returning to
+  a screen 4x, A↔B cycles. Warnings go to the next model prompt; stops end the task with the reason.
+- **Hand-off detector** (`HandoffDetector`): password, one-time code, UPI PIN / payment, CAPTCHA, secure window — English,
+  Hindi and Telugu keywords. "Payment methods" in a shop does not trigger it. UPI PIN screens are also a TakeOver in the
+  safety policy.
+- **Scroll-to-find** for named targets in `screen_act` and in `screen_task`.
+- **Compact screen** (`CompactScreen`) for the 1.7B model: list rows merged ("row 'Mom' · 'hi'"), nested duplicates and
+  unlabelled images dropped, ≤ 2000 chars.
+- **Fast steps** (`FastSteps`): clauses like "open chat Mom and type 'hi' into Message" run without a model call when the
+  target is on screen exactly once; commits (send/pay…) never are; the model takes over at the first clause it can't do.
+- **Debug report** for `screen_task` runs (fast vs model steps, effects, guards, hand-offs, timing).
+
+### Approvals on top of the current app
+- `PromptRouter` (`:core:agents`): ONYX in front → the existing ApprovalSheet; another app in front → a card drawn over it
+  with the accessibility overlay (no SYSTEM_ALERT_WINDOW needed); without the service → "display over other apps"
+  overlay if granted; else a heads-up notification with Allow / Deny actions.
+- The card shows the action in plain words, the app and the risk, with **Allow once / Allow for this task** (only where
+  a scope exists) **/ Deny / Stop**. It is draggable. Irreversible steps never offer "for this task" and ask every time.
+- On a secure or password screen the card never covers it: approvals go to the notification, and a hand-off becomes a
+  small "Your turn · Resume · Stop" pill docked on the other side of the field.
+- Used by the screen agent (scope approvals, per-step confirmations, hand-offs), macros (approvals, questions) and
+  AppBridge (scoped approvals via the ONYX gate). "Allow once" no longer grants the app scope.
+
+### Tests (JVM, fake phone)
+- `:core:screen` `MacroReplayTest` (10): rich targets + one TYPE per field + fingerprints without message text, replay
+  after the list is reordered, off-screen chat found by scrolling (both directions), changed layout matched by id,
+  password / PIN / OTP skipped, final typed value after re-tapping, failure messages (not found, no effect) and report
+  masking, parameter substitution, Send asks / scheduled runs stop / test-run highlights, deep-link start + fallback.
+- `:core:screen` `ScreenReliabilityTest` (8): hand-off detector in 3 languages, screen_task "Your turn", stable refs vs
+  Send, scroll-to-find in screen_act, fast steps with zero model calls, compact rows, guards, Allow once vs for task.
+- `:core:agents` `PromptRoutingTest` (6): in-app vs overlay, fallbacks, never covering sensitive screens, irreversible
+  steps, Stop/Deny/Resume and the yes/no gate mapping.
+- Existing macro tests updated for realistic timings and a fake field that shows typed text.
+
+### On the phone (OnePlus Nord CE 3), after installing 0.6.2
+1. Android may switch the accessibility service off after the update (the config now asks for long-press and key
+   events): turn "Offline Agent screen automation" back on if the banner says so.
+2. Record again any macro made before 0.6.2 (old ones still run, but by text only).
+3. Record: open WhatsApp from the home screen → tap the chat "Mom" → type "hi" → Stop & save. In the editor tap the
+   suggested `'Mom' → {{chat}}` if you want to pick the chat each run. Use **Test run**: each element is outlined first.
+4. Move another chat to the top (send yourself a message), run again: it must open Mom. Pin 15+ chats so Mom is off
+   screen: it must scroll to her.
+5. Start a screen-agent task, leave ONYX: the approval card should appear over WhatsApp. Try Allow for this task.
+6. If anything fails: tap **Copy debug report** on the card (or Settings → Automation → Debug reports) and paste it in chat.

@@ -132,19 +132,50 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
     /** Kill switch: stops whatever is running right now. */
     fun stopAll() { running?.stop(); job?.cancel(); OfflineAccessibilityService.instance?.overlay()?.hide() }
 
-    private fun host(s: OfflineAccessibilityService, header: String, agent: () -> ScreenAgent?): AutomationHost {
+    private fun host(s: OfflineAccessibilityService, header: String, agent: () -> ScreenAgent?, report: () -> String? = { null }): AutomationHost {
         val ov = s.overlay()
         ov.onPauseToggle = {
             agent()?.let { a -> if (a.state.value == com.offlineagent.core.runtime.phone.AutomationState.PAUSED) a.resume() else a.pause() }
         }
         ov.onStop = { agent()?.stop(); job?.cancel() }
+        val source = if (header.startsWith("Macro")) "Macro" else "Screen agent"
+        fun appLabel(): String = OfflineAccessibilityService.lastForegroundPackage?.let { launcher.label(it) }.orEmpty()
         return object : AutomationHost {
             override fun preview(step: Int, text: String) = ov.showStep("$header · step $step", text, agent()?.state?.value == com.offlineagent.core.runtime.phone.AutomationState.PAUSED)
-            override suspend fun approve(step: Int, action: String, reason: String) = ov.approve(header, action, reason)
-            override suspend fun ask(question: String) = ov.ask(header, question)
-            override fun finished(summary: String) = ov.showDone(summary)
+            // Phase 6.2: approvals and questions appear on top of the current app (not by bringing ONYX to the front).
+            override suspend fun approve(step: Int, action: String, reason: String): Boolean {
+                ov.hide()
+                val irreversible = Regex("(?i)send|submit|pay|delete|enter").containsMatchIn(reason)
+                val r = PromptCenter.ask(app, com.offlineagent.core.agents.UserPrompt(PromptCenter.newId("macro"), com.offlineagent.core.agents.PromptKind.APPROVE, source,
+                    "Step $step: $action", appLabel(), if (irreversible) com.offlineagent.core.agents.Risk.CRITICAL else com.offlineagent.core.agents.Risk.HIGH, reason,
+                    allowTaskScope = false, irreversible = irreversible))
+                if (r.stop) { agent()?.stop(); job?.cancel() }
+                return r.allowed
+            }
+            override suspend fun ask(question: String): String? {
+                ov.hide()
+                val r = PromptCenter.ask(app, com.offlineagent.core.agents.UserPrompt(PromptCenter.newId("ask"), com.offlineagent.core.agents.PromptKind.ASK, source, question, appLabel()))
+                if (r.stop) { agent()?.stop(); job?.cancel() }
+                return if (r.allowed) r.text else null
+            }
+            override fun finished(summary: String) = ov.showDone(summary, report())
+            override suspend fun highlight(step: Int, bounds: com.offlineagent.core.runtime.phone.Bounds, text: String) {
+                ov.showStep("$header · test run · step $step", text, false)
+                HighlightOverlay.show(s, bounds, 900)
+            }
         }
     }
+
+    /** Phase 6.2 "Copy debug report": the last macro run (null until one ran). */
+    val lastMacroReport = MutableStateFlow<String?>(null)
+    val lastMacroFailed = MutableStateFlow(false)
+
+    /** Opens a deep link in [pkg] (e.g. https://wa.me/<number> in WhatsApp). */
+    private fun openLink(uri: String, pkg: String): Boolean = runCatching {
+        val i = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (pkg.isNotBlank()) i.setPackage(pkg)
+        app.startActivity(i); true
+    }.getOrDefault(false)
 
     override suspend fun describeScreen(): String {
         checkEnabled()
@@ -171,7 +202,7 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
             val llm = InferenceAgentLlm(this.app.inference,
                 onPartial = { t -> val now = System.currentTimeMillis(); if (now - lastPartial > 150) { lastPartial = now; this.app.automationPartial.value = t } },
                 onPrompt = { d, n -> this.app.automationPartial.value = com.offlineagent.core.runtime.chat.StreamingTurn.readingStatus(d, n) })
-            val agent = ScreenAgent(llm, s, host(s, "Offline Agent") { agentRef }, this.app.automationPolicy(), this.app.automationLog,
+            val agent = ScreenAgent(llm, s, host(s, "Offline Agent", { agentRef }), this.app.automationPolicy(), this.app.automationLog,
                 ScreenAgentLimits(maxSteps = 25))
             agentRef = agent; running = agent
             return agent.run(goal, if (profileNotes.isNotBlank()) "Your saved profile (use only if the task needs it): $profileNotes" else "")
@@ -205,7 +236,7 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
         val matches = AutofillMapper(llm).map(ff, profile, "${snap.appLabel}: " + snap.elements.take(8).joinToString(" ") { it.node.label }.take(200))
         var filled = 0
         var agentRef: ScreenAgent? = null
-        val h = host(s, "Filling form") { agentRef }
+        val h = host(s, "Filling form", { agentRef })
         for ((i, m) in matches.withIndex()) {
             val v = m.value(profile) ?: continue
             if (ff[i].currentValue.isNotBlank()) continue // never overwrite what's there
@@ -229,17 +260,27 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
         return play(m, params.filterKeys { !it.startsWith("_") }.values.toList(), unattended = false)
     }
 
-    suspend fun play(m: Macro, positional: List<String>, unattended: Boolean): String {
+    suspend fun play(m: Macro, positional: List<String>, unattended: Boolean, testRun: Boolean = false, useDeepLink: Boolean = true): String {
         val s = service()
         val values = m.params.mapIndexed { i, p -> p to (positional.getOrNull(i) ?: "") }.toMap()
         val taskId = "macro-" + m.id
-        LongTasks.start(app, LongTask(taskId, "Running macro", m.name))
+        LongTasks.start(app, LongTask(taskId, if (testRun) "Test-running macro" else "Running macro", m.name))
+        job = currentCoroutineContext().job
         try {
             val policy = app.automationPolicy()
-            return MacroPlayer(s, host(s, "Macro: ${m.name}") { null }, policy, app.automationLog,
-                isHome = launcher::isHome, openProblem = { pkg -> launcher.openProblem(pkg, policy::isBlockedApp) }, appLabel = launcher::label).play(m, values, unattended)
+            var player: MacroPlayer? = null
+            val failedReport: () -> String? = { player?.lastReport?.takeIf { !it.ok }?.render(com.offlineagent.app.BuildConfig.VERSION_NAME) }
+            player = MacroPlayer(s, host(s, "Macro: ${m.name}", { null }, failedReport), policy, app.automationLog,
+                isHome = launcher::isHome, openProblem = { pkg -> launcher.openProblem(pkg, policy::isBlockedApp) }, appLabel = launcher::label,
+                openLink = { uri, pkg -> openLink(uri, pkg) })
+            val out = player.play(m, values, unattended, testRun = testRun, useDeepLink = useDeepLink)
+            player.lastReport?.let { r -> lastMacroReport.value = r.render(com.offlineagent.app.BuildConfig.VERSION_NAME); lastMacroFailed.value = !r.ok }
+            return out
         } finally { LongTasks.finish(app, taskId) }
     }
+
+    /** Phase 6.2: the last screen_task run's debug report (screen agent). */
+    fun screenTaskReport(): String? = runCatching { app.onyx.screen.toolkit.session.lastTaskReport?.render(com.offlineagent.app.BuildConfig.VERSION_NAME) }.getOrNull()
 
     // ------------------------------------------------------------ teach by demonstration
 
@@ -247,11 +288,12 @@ class AutomationController(private val app: OfflineAgentApp) : ScreenPort {
         val s = service()
         val rec = MacroRecorder(app.packageName, app.automationPolicy(), isHome = launcher::isHome, appForLabel = launcher::appForLabel)
         s.recorder = rec
+        s.setKeyFiltering(true) // Back / Enter keys become steps (only while recording)
         _recording.value = true
         s.overlay().showRecording(onSave = {
-            s.recorder = null; _recording.value = false; s.overlay().hide()
+            s.recorder = null; s.setKeyFiltering(false); _recording.value = false; s.overlay().hide()
             onSaved(rec.build("m" + System.currentTimeMillis().toString(36), "New macro", "Recorded on " + java.time.LocalDate.now()))
-        }, onCancel = { s.recorder = null; _recording.value = false; s.overlay().hide(); onSaved(null) })
+        }, onCancel = { s.recorder = null; s.setKeyFiltering(false); _recording.value = false; s.overlay().hide(); onSaved(null) })
         // Leave our app so the user can demonstrate in the target app.
         s.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME)
     }

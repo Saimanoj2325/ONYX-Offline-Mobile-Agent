@@ -101,11 +101,16 @@ class ScreenTools(private val app: OfflineAgentApp, private val onyx: OnyxRuntim
         }
     }
 
+    val port: AndroidScreenPort by lazy { AndroidScreenPort(app) }
+
+    /** Phase 6.2: whether the last probe of [pkg] found a secure (FLAG_SECURE) window. */
+    fun lastSecure(pkg: String): Boolean = port.cachedSecure(pkg)
+
     val toolkit: ScreenToolkit by lazy {
-        val port = AndroidScreenPort(app)
+        val port = this.port
         ScreenToolkit(
             port = port,
-            host = OverlayScreenHost { stop() },
+            host = OverlayScreenHost(app) { stop() },
             // One shared blocklist: AppBridge's AppSafetyPolicy (:core:apps) is consulted with Use.SCREEN, then the screen rules.
             policy = DefaultScreenSafetyPolicy(app.packageName, { app.cachedSettings.automationAllowedApps }, { app.cachedSettings.automationBlockedApps },
                 shared = onyx.appBridge.policy, labelOf = { pkg -> port.appLabel(pkg).takeIf { it != pkg } }),
@@ -171,19 +176,42 @@ class ScreenPrefs(ctx: Context) {
     fun setEnabled(v: Boolean) { _enabled.value = v; sp.edit().putBoolean("enabled", v).apply() }
 }
 
-/** Overlay side: previews, per-step Allow/Deny, "take over" hand-off (Allow = continue after the user did it). */
-class OverlayScreenHost(private val onStop: () -> Unit) : ScreenHost {
+/**
+ * Overlay side: previews, per-step Allow/Deny, "take over" hand-off. Phase 6.2: questions are drawn as a card ON TOP
+ * of the current app ([PromptCenter]: accessibility overlay → system overlay → heads-up notification); a hand-off
+ * says "Your turn" with Resume, and never covers a password / secure screen (it docks as a small pill instead).
+ */
+class OverlayScreenHost(private val ctx: android.content.Context, private val onStop: () -> Unit) : ScreenHost {
     private fun ov() = OfflineAccessibilityService.instance?.overlay()?.also { o -> o.onStop = onStop; o.onPauseToggle = {} }
+    private fun appLabel(): String {
+        val pkg = OfflineAccessibilityService.lastForegroundPackage ?: return ""
+        return runCatching { ctx.packageManager.getApplicationLabel(ctx.packageManager.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
+    }
     override fun preview(text: String) { ov()?.showStep("ONYX · screen", text, false) }
-    override suspend fun confirm(action: String, reason: String): Boolean = ov()?.approve("ONYX", action, reason) ?: false
-    override suspend fun takeOver(reason: String): Boolean =
-        ov()?.approve("ONYX — your turn", "Please do this part yourself: $reason", "tap Allow when you are done to let ONYX continue, or Stop") ?: false
+    override suspend fun confirm(action: String, reason: String): Boolean {
+        ov()?.hide()
+        val irreversible = reason.startsWith("this may send")
+        val r = com.offlineagent.app.automation.PromptCenter.ask(ctx, com.offlineagent.core.agents.UserPrompt(
+            com.offlineagent.app.automation.PromptCenter.newId("screen"), com.offlineagent.core.agents.PromptKind.APPROVE, "Screen agent", action, appLabel(),
+            if (irreversible) com.offlineagent.core.agents.Risk.CRITICAL else com.offlineagent.core.agents.Risk.HIGH, reason, allowTaskScope = false, irreversible = irreversible))
+        if (r.stop) onStop()
+        return r.allowed
+    }
+    override suspend fun takeOver(reason: String): Boolean {
+        ov()?.hide()
+        val r = com.offlineagent.app.automation.PromptCenter.ask(ctx, com.offlineagent.core.agents.UserPrompt(
+            com.offlineagent.app.automation.PromptCenter.newId("handoff"), com.offlineagent.core.agents.PromptKind.HANDOFF, "Screen agent",
+            "Please do this part yourself: $reason", appLabel(), com.offlineagent.core.agents.Risk.MEDIUM, "Tap Resume when you are done, or Stop."))
+        if (r.stop) onStop()
+        return r.allowed
+    }
 }
 
 /** AccessibilityService-backed port: node actions by path, launch intents, clipboard, share sheet, secure-window probe. */
 class AndroidScreenPort(private val app: OfflineAgentApp) : ScreenPort {
     private fun svc(): OfflineAccessibilityService? = OfflineAccessibilityService.instance
     @Volatile private var secureCache: Triple<String, Long, Boolean>? = null
+    fun cachedSecure(pkg: String): Boolean = secureCache?.let { (p, _, v) -> p == pkg && v } ?: false
 
     override suspend fun capture(): ScreenFrame? {
         val s = svc() ?: return null

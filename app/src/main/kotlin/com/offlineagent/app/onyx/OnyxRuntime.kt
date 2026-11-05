@@ -66,7 +66,10 @@ import java.util.concurrent.TimeUnit
 /** A confirmation the user must answer on the bottom sheet. */
 data class OnyxApproval(val request: ApprovalRequest, val canAlwaysAllow: Boolean, val answer: CompletableDeferred<Boolean>,
     /** Phase 6: "Allow <App> for this task" (AppBridge scoped approval); the "always" answer grants this scope instead. */
-    val scopeLabel: String? = null)
+    val scopeLabel: String? = null) {
+    /** Phase 6.2: the user picked "always / for this task" on the sheet. */
+    @Volatile var always: Boolean = false
+}
 
 /**
  * Phase 5 wiring: the multi-agent [Orchestrator] on the app's ONE loaded model, its Android ports, the Phase 5 Room
@@ -215,7 +218,7 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     private fun deps(temporary: Boolean = false): AgentDeps = AgentDeps(
         queue = if (_hasChatModel.value) queue else null,
         tools = gateway, memory = if (temporary) noMemory else memory, context = context,
-        approvals = screen.wrap(com.offlineagent.core.agents.ApprovalGate { r -> askUser(r) }), // screen scopes in front of AppBridge scopes + the sheet
+        approvals = screen.wrap(userGate), // screen scopes in front of AppBridge scopes + the sheet / overlay card
         network = { monitor.online.value },
         outbox = { runId, tool, args, risk ->
             OutboxProcessor(outboxStore, gateway, { monitor.online.value }).enqueue(runId, tool, args, risk).also { OutboxWorker.schedule(app) }
@@ -293,25 +296,73 @@ class OnyxRuntime(private val app: OfflineAgentApp) {
     fun cancel() { job?.cancel(); _pending.value?.answer?.complete(false); _pending.value = null; app.inference.cancel() }
     fun dismissCurrent() { if (!isRunning) _current.value = null }
 
-    private suspend fun askUser(r: ApprovalRequest): Boolean {
+    private suspend fun askUser(r: ApprovalRequest): Boolean = decideUser(r).allowed
+
+    /** The gate the orchestrator uses: yes/no for most tools, the full answer (once / for this task) for scope requests. */
+    private val userGate = object : com.offlineagent.core.agents.ApprovalGate {
+        override suspend fun approve(request: ApprovalRequest): Boolean = decideUser(request).allowed
+        override suspend fun decide(request: ApprovalRequest): com.offlineagent.core.agents.PromptReply = decideUser(request)
+    }
+
+    private fun sourceOf(tool: String) = when {
+        tool.startsWith("screen_") -> "Screen agent"
+        tool == "run_macro" -> "Macro"
+        tool.startsWith("app_") || tool.startsWith("notification") || tool.startsWith("share") -> "AppBridge"
+        else -> "ONYX"
+    }
+
+    private fun appOf(r: ApprovalRequest): String {
+        val named = (r.args["app"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+            ?: (r.args["package"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+            ?: OfflineAccessibilityService.lastForegroundPackage?.takeIf { it != app.packageName }
+        return named?.let { n -> runCatching { app.packageManager.getApplicationLabel(app.packageManager.getApplicationInfo(n, 0)).toString() }.getOrDefault(n) }.orEmpty()
+    }
+
+    /**
+     * Phase 6.2: approvals are shown where the user is. ONYX in front → the ApprovalSheet (unchanged); another app in
+     * front → an overlay card on top of it (accessibility overlay, else "display over other apps", else a heads-up
+     * notification with Allow / Deny). Irreversible steps never offer "Allow for this task".
+     */
+    private suspend fun decideUser(r: ApprovalRequest): com.offlineagent.core.agents.PromptReply {
+        val ONCE = com.offlineagent.core.agents.PromptReply(com.offlineagent.core.agents.PromptAnswer.ALLOW_ONCE)
         val spec = gateway.spec(r.tool)
         val always = spec != null && r.risk < Risk.HIGH && spec.permission.canAlwaysAllow
-        if (always && r.tool in app.cachedSettings.alwaysAllowedTools) return true
-        if (appBridge.preApproved(r)) { audit(r.runId, "Executor", "scoped approval used: ${r.tool}", r.title.take(200), r.risk); return true }
+        if (always && r.tool in app.cachedSettings.alwaysAllowedTools) return ONCE
+        if (appBridge.preApproved(r)) { audit(r.runId, "Executor", "scoped approval used: ${r.tool}", r.title.take(200), r.risk); return ONCE }
         val scope = appBridge.scopeLabel(r)
-        val a = OnyxApproval(r, always || scope != null, CompletableDeferred(), scope)
+        val irreversible = r.risk >= Risk.CRITICAL
+        val prompt = com.offlineagent.core.agents.UserPrompt(
+            id = com.offlineagent.app.automation.PromptCenter.newId("onyx"), kind = com.offlineagent.core.agents.PromptKind.APPROVE,
+            source = sourceOf(r.tool), action = r.title, appLabel = appOf(r), risk = r.risk, reason = r.description.take(300),
+            allowTaskScope = !irreversible && (r.offerTaskScope || always || scope != null), irreversible = irreversible,
+        )
+        val sheet = com.offlineagent.core.agents.PromptPresenter { q -> sheet(r, always, scope, q.allowTaskScope) }
+        // A background (WorkManager) resume cannot wait forever: no answer in 9 minutes = declined.
+        val reply = withTimeoutOrNull(9 * 60_000L) { com.offlineagent.app.automation.PromptCenter.ask(app, prompt, sheet) }
+            ?: com.offlineagent.core.agents.PromptReply(com.offlineagent.core.agents.PromptAnswer.TIMEOUT)
+        if (reply.forTask && !irreversible) {
+            if (scope != null) appBridge.grant(r)
+            else if (always) app.appScope.launch { app.settings.update { it.copy(alwaysAllowedTools = it.alwaysAllowedTools + r.tool) } }
+        }
+        if (reply.stop) { audit(r.runId, "User", "stopped from the approval card", r.title.take(200), r.risk); screen.stop() }
+        audit(r.runId, "User", "approval ${reply.answer.name.lowercase()} via ${com.offlineagent.app.automation.PromptCenter.state(app).let { if (it.onyxInForeground) "sheet" else "overlay" }}", r.title.take(200), r.risk)
+        return reply
+    }
+
+    /** The in-app ApprovalSheet (ONYX is in front). */
+    private suspend fun sheet(r: ApprovalRequest, always: Boolean, scope: String?, offerTask: Boolean): com.offlineagent.core.agents.PromptReply {
+        val a = OnyxApproval(r, offerTask && (always || scope != null || r.offerTaskScope), CompletableDeferred(), scope ?: if (r.offerTaskScope) "this task" else null)
         _pending.value = a
         Notifications.post(app, Notifications.CH_AGENT, 5050, "ONYX needs your OK", "${r.title} — ${r.risk.label} risk", "onyx")
-        // A background (WorkManager) resume cannot wait forever: no answer in 9 minutes = declined.
-        val ok = withTimeoutOrNull(9 * 60_000L) { a.answer.await() } ?: false
-        _pending.value = null
-        return ok
+        return try {
+            val ok = a.answer.await()
+            com.offlineagent.core.agents.PromptReply(when { !ok -> com.offlineagent.core.agents.PromptAnswer.DENY; a.always -> com.offlineagent.core.agents.PromptAnswer.ALLOW_TASK; else -> com.offlineagent.core.agents.PromptAnswer.ALLOW_ONCE })
+        } finally { if (_pending.value === a) _pending.value = null }
     }
 
     fun answer(allow: Boolean, always: Boolean) {
         val p = _pending.value ?: return
-        if (allow && always && p.scopeLabel != null) appBridge.grant(p.request)
-        else if (allow && always && p.canAlwaysAllow) app.appScope.launch { app.settings.update { it.copy(alwaysAllowedTools = it.alwaysAllowedTools + p.request.tool) } }
+        p.always = allow && always
         p.answer.complete(allow)
         _pending.value = null
     }

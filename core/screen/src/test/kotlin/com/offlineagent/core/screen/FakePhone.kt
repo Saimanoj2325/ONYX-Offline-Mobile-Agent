@@ -22,7 +22,10 @@ fun withPaths(n: ScreenNode, path: List<Int> = emptyList()): ScreenNode = n.copy
 
 abstract class FakeApp(val pkg: String, val label: String) {
     var secure = false
+    open val activity: String get() = "$pkg.MainActivity"
     abstract fun tree(): ScreenNode
+    /** System Back inside the app (false = nothing to go back to). */
+    open fun back(): Boolean = false
     /** Returns false when the op is not supported on that node. */
     abstract fun perform(n: ScreenNode, op: NodeOp, text: String): Boolean
 }
@@ -108,7 +111,7 @@ class FakePhone(vararg apps: FakeApp) : ScreenPort {
         if (!serviceOn) return null
         onCapture(++captures)
         val a = app()
-        return ScreenFrame(ScreenSnapshot(a.pkg, withPaths(a.tree()), a.label, "${a.pkg}.MainActivity"), a.secure)
+        return ScreenFrame(ScreenSnapshot(a.pkg, withPaths(a.tree()), a.label, a.activity), a.secure)
     }
 
     private fun find(root: ScreenNode, path: List<Int>): ScreenNode? {
@@ -123,7 +126,7 @@ class FakePhone(vararg apps: FakeApp) : ScreenPort {
         performed += "${app().label}:$op:${node.label.ifBlank { node.hint }}"
         return app().perform(live, op, text)
     }
-    override suspend fun global(op: GlobalOp): Boolean { performed += "global:$op"; return true }
+    override suspend fun global(op: GlobalOp): Boolean { performed += "global:$op"; if (op == GlobalOp.BACK) app().back(); return true }
     override suspend fun resolveApp(app: String): String? = apps.values.firstOrNull { it.pkg == app || it.label.equals(app, true) }?.pkg
         ?: when (app.lowercase()) { "phonepe" -> "com.phonepe.app"; "bitwarden" -> "com.x8bit.bitwarden"; else -> null }
     override suspend fun launch(pkg: String): Boolean { if (pkg !in apps) return false; foreground = pkg; performed += "launch:$pkg"; return true }
@@ -171,4 +174,79 @@ class Rig(vararg apps: FakeApp, val llm: ScreenLlm? = null, var enabled: Boolean
     val kit = ScreenToolkit(phone, host, policy, { a, d, _: Risk -> audit += "$a | $d" }, { killed }, cards, { llm },
         { ScreenConfig(enabled = enabled, settleMs = 0, waitPollMs = 1, defaultWaitMs = 10) })
     val s get() = kit.session
+}
+
+/**
+ * Phase 6.2: a WhatsApp-like app. Chat list (RecyclerView showing [visible] rows from [offset]; rows have the real
+ * WhatsApp ids), a chat screen with entry + Send. [reorder], [layoutV2] (wrapper + changed hint/order, same ids),
+ * [frozen] (taps do nothing) let tests change the world between recording and replay.
+ */
+class FakeWhatsApp(var chats: MutableList<String> = mutableListOf("Ravi", "Office group", "Mom", "Dad", "Priya", "Teja", "Anil")) : FakeApp("com.whatsapp", "WhatsApp") {
+    var screen = "list"
+    var openChat = ""
+    var input = ""
+    var offset = 0
+    var visible = 5
+    var layoutV2 = false
+    var frozen = false
+    val sent = mutableListOf<Pair<String, String>>()
+    override val activity: String get() = if (screen == "list") "com.whatsapp.HomeActivity" else "com.whatsapp.Conversation"
+    private fun id(x: String) = "com.whatsapp:id/$x"
+
+    private fun row(name: String, preview: String) = node("android.widget.LinearLayout", id = id("contact_row_container"), click = true, kids = arrayOf(
+        node("android.widget.TextView", text = name, id = id("conversations_row_contact_name")),
+        node("android.widget.TextView", text = preview, id = id("single_msg_tv")),
+        node("android.widget.TextView", text = "10:4${name.length % 10}", id = id("conversations_row_date"))))
+
+    override fun tree(): ScreenNode = if (screen == "list") node("android.widget.FrameLayout", kids = arrayOf(
+        group(id("toolbar"), text("WhatsApp"), button("", id = id("menuitem_search"), desc = "Search")),
+        node("androidx.recyclerview.widget.RecyclerView", id = id("conversations_list"), scroll = true,
+            kids = chats.drop(offset).take(visible).map { row(it, "secret message to $it") }.toTypedArray())))
+    else {
+        val entry = node("android.widget.EditText", text = input, hint = if (layoutV2) "Type a message" else "Message", id = id("entry"), click = true, edit = true, focused = true)
+        val send = node(if (layoutV2) "android.widget.Button" else "android.widget.ImageButton", desc = "Send", id = id("send"), click = true)
+        node("android.widget.FrameLayout", kids = arrayOf(
+            group(id("conversation_toolbar"), node("android.widget.TextView", text = openChat, id = id("conversation_contact_name")), button("", desc = "Video call", id = id("video_call"))),
+            node("androidx.recyclerview.widget.RecyclerView", id = id("conversation_messages"), scroll = true, kids = sent.filter { it.first == openChat }.map { text(it.second) }.toTypedArray()),
+            if (layoutV2) group("", group(id("footer_v2"), send, group("", entry))) else group(id("footer"), entry, send)))
+    }
+
+    override fun perform(n: ScreenNode, op: NodeOp, text: String): Boolean {
+        if (frozen) return op == NodeOp.CLICK
+        return when {
+            screen == "list" && op == NodeOp.CLICK && n.viewId == id("contact_row_container") -> { openChat = n.children.first().text; screen = "chat"; input = ""; true }
+            screen == "list" && op == NodeOp.CLICK && n.viewId == id("conversations_row_contact_name") -> { openChat = n.text; screen = "chat"; input = ""; true }
+            screen == "list" && op == NodeOp.SCROLL_FORWARD -> if (offset + visible < chats.size) { offset = minOf(offset + visible - 1, chats.size - visible); true } else false
+            screen == "list" && op == NodeOp.SCROLL_BACKWARD -> if (offset > 0) { offset = maxOf(0, offset - (visible - 1)); true } else false
+            op == NodeOp.SET_TEXT && n.editable -> { input = text; true }
+            op == NodeOp.CLICK && n.viewId == id("send") -> { if (input.isNotBlank()) { sent += openChat to input; input = "" }; true }
+            op == NodeOp.CLICK || op == NodeOp.FOCUS -> true
+            else -> false
+        }
+    }
+
+    override fun back(): Boolean = if (screen == "chat") { screen = "list"; true } else false
+
+    /** What a wa.me link does: opens that chat directly. */
+    fun openByLink(name: String) { openChat = name; screen = "chat"; input = "" }
+}
+
+/** Phase 6.2: the fake phone as a macro [com.offlineagent.core.runtime.phone.ScreenDriver] (ScreenAction → node ops). */
+class FakeDriver(val phone: FakePhone) : com.offlineagent.core.runtime.phone.ScreenDriver {
+    override suspend fun snapshot(): ScreenSnapshot? = phone.capture()?.snapshot
+    override suspend fun perform(a: com.offlineagent.core.runtime.phone.ScreenAction, s: ScreenSnapshot): Boolean {
+        fun el(id: Int) = s.element(id)?.node
+        return when (a) {
+            is com.offlineagent.core.runtime.phone.ScreenAction.Tap -> el(a.element)?.let { phone.perform(it, NodeOp.CLICK) } ?: false
+            is com.offlineagent.core.runtime.phone.ScreenAction.LongPress -> el(a.element)?.let { phone.perform(it, NodeOp.LONG_CLICK) } ?: false
+            is com.offlineagent.core.runtime.phone.ScreenAction.Type -> el(a.element)?.let { phone.perform(it, NodeOp.SET_TEXT, a.text) } ?: false
+            is com.offlineagent.core.runtime.phone.ScreenAction.Enter -> el(a.element)?.let { phone.perform(it, NodeOp.IME_ENTER) } ?: false
+            is com.offlineagent.core.runtime.phone.ScreenAction.Scroll -> (el(a.element)?.takeIf { it.scrollable } ?: s.elements.firstOrNull { it.node.scrollable }?.node)
+                ?.let { phone.perform(it, if (a.direction == "up") NodeOp.SCROLL_BACKWARD else NodeOp.SCROLL_FORWARD) } ?: false
+            com.offlineagent.core.runtime.phone.ScreenAction.Back -> phone.global(GlobalOp.BACK)
+            com.offlineagent.core.runtime.phone.ScreenAction.Home -> phone.global(GlobalOp.HOME)
+            is com.offlineagent.core.runtime.phone.ScreenAction.OpenApp -> phone.launch(a.app)
+            else -> true
+        }
+    }
 }

@@ -174,3 +174,24 @@
   new `<queries>` entry). An icon whose label matches no launchable app is dropped from the recording.
 - Still not run on a phone: the OnePlus Nord CE 3 checks are in docs/PHASE6.md §6.1.
 
+
+## Phase 6.2 (0.6.2) — macros, screen agent, overlay approvals — see docs/PHASE6.md §6.2
+- **Not run on a phone yet.** Everything is JVM-tested on the fake phone; the Android recorder, overlay card, highlight,
+  notification fallback and key-event recording have only been compiled.
+- **Apps with poor accessibility trees** cannot be replayed exactly: games, custom-drawn / canvas UIs, many Flutter and
+  some React Native / Unity apps expose few or no nodes. Replay then has only the relative-position fallback, which is
+  never used for list rows or irreversible steps, so such steps stop with a clear reason instead of tapping blindly.
+- **Secure screens** (FLAG_SECURE, banking, password managers) are never automated; they are handed to you.
+- **Enter on the on-screen keyboard** is invisible to accessibility on most keyboards: tick "Press Enter after typing" on
+  that step in the editor. Back is recorded from key events while recording; on phones whose gesture navigation does not
+  send a key event, Back is inferred when you return to an earlier screen without a tap.
+- **Fingerprint drift**: if an app redesigns a screen completely (new view ids), a step may wait up to ~15 s and stop with
+  "expected … but saw …". Record it again.
+- **Typed text in some apps is not readable**: when a field never reports its text, replay notes it and continues.
+- **WhatsApp chat link** needs the contact's number typed in the editor once (no contacts lookup yet), and only works for
+  a fixed chat (not a `{{chat}}` value).
+- **Accessibility re-enable**: the service config now requests long-press and key-event filtering; OxygenOS may turn the
+  service off after updating. Key-event filtering is switched on only while recording.
+- **Overlay over secure screens**: approvals then go to a heads-up notification. If notifications are blocked for ONYX and
+  the service is off, the request falls back to ONYX's own sheet (open ONYX to answer).
+- The legacy chat agent (explicit `/skill` runs) still uses its in-chat approval card.

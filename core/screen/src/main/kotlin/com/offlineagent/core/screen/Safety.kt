@@ -107,7 +107,9 @@ class DefaultScreenSafetyPolicy(
         if (pkg == "com.android.vending" && PLAY_PURCHASE.any { it in text })
             return SafetyVerdict.Block("this is a Play Store purchase screen")
         if (frame.secure) return SafetyVerdict.TakeOver("this screen is protected (secure window) — please do this part yourself")
-        if (CAPTCHA.any { it in text }) return SafetyVerdict.TakeOver("this screen shows a CAPTCHA / human check — please solve it yourself")
+        if (CAPTCHA.any { it in text } || HandoffDetector.CAPTCHA.any { it in text }) return SafetyVerdict.TakeOver("this screen shows a CAPTCHA / human check — please solve it yourself")
+        // Phase 6.2: UPI PIN / payment confirmation screens (English, Hindi, Telugu) are always the user's turn.
+        HandoffDetector.check(ScreenView("probe", frame))?.takeIf { it.kind == HandoffKind.PAYMENT }?.let { return SafetyVerdict.TakeOver(it.reason) }
         return SafetyVerdict.Allow
     }
 

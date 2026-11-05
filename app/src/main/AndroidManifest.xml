@@ -13,6 +13,8 @@
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <!-- Reminders + foreground-service notifications (runtime on Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Phase 6.2: fallback approval card over other apps when the accessibility service is off (user grants it in Settings). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- Long agent runs / report & PDF generation keep running in a foreground service with a Cancel button -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -193,6 +195,7 @@
 
         <!-- Phase 5 exact reminders -->
         <receiver android:name=".onyx.ReminderAlarmReceiver" android:exported="false" />
+        <receiver android:name=".automation.PromptActionReceiver" android:exported="false" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

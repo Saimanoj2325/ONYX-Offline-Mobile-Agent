@@ -70,6 +70,11 @@ class AutomationPolicy(
                     else -> Verdict.Allow
                 }
             }
+            is ScreenAction.LongPress -> {
+                val n = s.element(a.element)?.node ?: return Verdict.Stop("element [${a.element}] is not on screen")
+                if (!n.enabled) Verdict.Stop("that control is disabled") else if (isIrreversibleTarget(n)) Verdict.NeedsApproval("long-pressing \"${n.label.take(40)}\" may change or delete something") else Verdict.Allow
+            }
+            is ScreenAction.Enter -> Verdict.NeedsApproval("pressing Enter may send or submit what was typed")
             is ScreenAction.OpenApp -> Verdict.Allow
             else -> Verdict.Allow
         }
@@ -113,6 +118,8 @@ interface AutomationHost {
     /** Ask the user a question (e.g. an OTP or a missing detail); null = user declined. */
     suspend fun ask(question: String): String?
     fun finished(summary: String)
+    /** Phase 6.2 macro "Test run": outline the matched element on the overlay before acting (no-op by default). */
+    suspend fun highlight(step: Int, bounds: Bounds, text: String) {}
 }
 
 data class AutomationLogEntry(val time: Long, val step: Int, val app: String, val action: String, val outcome: String)

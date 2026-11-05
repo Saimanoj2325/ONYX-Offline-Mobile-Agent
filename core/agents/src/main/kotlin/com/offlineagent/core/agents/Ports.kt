@@ -92,10 +92,20 @@ data class ApprovalRequest(
     val risk: Risk,
     val sideEffects: String,
     val needsNetwork: Boolean,
+    /** Phase 6.2: "Allow for this task" may be offered (scope approvals). Irreversible steps never set it. */
+    val offerTaskScope: Boolean = false,
 )
 
-/** Suspends until the user answers the confirmation sheet. */
-fun interface ApprovalGate { suspend fun approve(request: ApprovalRequest): Boolean }
+/** Suspends until the user answers the confirmation sheet (or the overlay card on top of the current app). */
+fun interface ApprovalGate {
+    suspend fun approve(request: ApprovalRequest): Boolean
+    /**
+     * Phase 6.2: the full answer — Allow once / Allow for this task / Deny / Stop. Gates that only know yes/no keep
+     * the old meaning: a yes to a scope request grants the scope.
+     */
+    suspend fun decide(request: ApprovalRequest): PromptReply =
+        if (approve(request)) PromptReply(if (request.offerTaskScope) PromptAnswer.ALLOW_TASK else PromptAnswer.ALLOW_ONCE) else PromptReply(PromptAnswer.DENY)
+}
 
 fun interface NetworkStatus { fun isOnline(): Boolean }
 

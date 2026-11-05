@@ -442,11 +442,17 @@ private fun AutomationPage(app: OfflineAgentApp, notify: (String) -> Unit) {
     val macros by app.automation.macros.macros.collectAsStateWithLifecycle()
     val log by app.automationLog.recent.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<Macro?>(null) }
+    var askValues by remember { mutableStateOf<Pair<Macro, Boolean>?>(null) }
+    val lastReport by app.automation.lastMacroReport.collectAsStateWithLifecycle()
+    val lastFailed by app.automation.lastMacroFailed.collectAsStateWithLifecycle()
     val fmt = remember { DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM) }
+    fun runMacro(m: Macro, values: List<String>, test: Boolean) {
+        scope.launch { notify(runCatching { app.automation.play(m, values, unattended = false, testRun = test) }.getOrElse { it.message ?: "failed" }) }
+    }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         item {
-            Text("Teach by demonstration: tap Record, do the task in any app, then Stop & save. The macro becomes a skill you can run by name, with optional {{values}} and a schedule. Scheduled runs never press submit/pay/send — they stop and notify you.",
+            Text("Teach by demonstration: tap Record, do the task in any app, then Stop & save. Replay finds each control again by its id, text and list name (a chat is found by name even if the list order changes), scrolls to find it, and checks each step worked. The macro becomes a skill you can run by name, with optional {{values}} and a schedule. Scheduled runs never press submit/pay/send — they stop and notify you. Passwords are never recorded.",
                 style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 8.dp)) {
                 Button(onClick = {
@@ -462,15 +468,28 @@ private fun AutomationPage(app: OfflineAgentApp, notify: (String) -> Unit) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp)) {
                     Text(m.name, style = MaterialTheme.typography.titleSmall)
-                    Text("${m.steps.size} steps in ${m.startPackage}" + (if (m.params.isNotEmpty()) " · values: ${m.params.joinToString()}" else "") +
+                    Text("${m.steps.size} steps in ${app.automation.launcher.label(m.startPackage)}" + (if (m.params.isNotEmpty()) " · values: ${m.params.joinToString()}" else "") +
                         (if (m.schedule.kind != "none") " · ${m.schedule.kind} %02d:%02d".format(m.schedule.hour, m.schedule.minute) else "") +
-                        (if (m.hasIrreversibleSteps) " · has steps that need approval" else ""), style = MaterialTheme.typography.bodySmall)
+                        (if (m.hasIrreversibleSteps) " · has steps that need approval" else "") + (if (m.version < 2) " · old format (record again for exact replay)" else ""),
+                        style = MaterialTheme.typography.bodySmall)
                     Row {
-                        TextButton(onClick = { scope.launch { notify(runCatching { app.automation.play(m, emptyList(), unattended = false) }.getOrElse { it.message ?: "failed" }) } }, enabled = m.params.isEmpty()) { Text("Run") }
+                        TextButton(onClick = { if (m.params.isEmpty()) runMacro(m, emptyList(), false) else askValues = m to false }) { Text("Run") }
+                        TextButton(onClick = { if (m.params.isEmpty()) runMacro(m, emptyList(), true) else askValues = m to true }) { Text("Test run") }
                         TextButton(onClick = { editing = m }) { Text("Edit") }
                         TextButton(onClick = { scope.launch { app.automation.deleteMacro(m) } }) { Text("Delete") }
                     }
                 }
+            }
+        }
+        item {
+            Section("Debug reports")
+            Text("After a failed run, copy its report and paste it into chat. Reports list steps, matching strategies and timing — never message contents beyond what the macro itself typed.",
+                style = MaterialTheme.typography.bodySmall)
+            Row {
+                TextButton(onClick = { lastReport?.let { copyText(ctx, "ONYX macro debug report", it); notify("Macro report copied") } }, enabled = lastReport != null) {
+                    Text(if (lastFailed) "Copy failed macro report" else "Copy last macro report") }
+                TextButton(onClick = { app.automation.screenTaskReport()?.let { copyText(ctx, "ONYX screen agent debug report", it); notify("Screen agent report copied") } ?: notify("No screen agent run yet") }) {
+                    Text("Copy screen agent report") }
             }
         }
         item {
@@ -483,64 +502,10 @@ private fun AutomationPage(app: OfflineAgentApp, notify: (String) -> Unit) {
         }
     }
 
-    editing?.let { m -> MacroEditor(m, onDismiss = { editing = null }, onSave = { updated -> scope.launch { app.automation.saveMacro(updated); editing = null; notify("Macro saved as skill /macro-${updated.id.take(12)}") } }) }
-}
-
-@Composable
-private fun MacroEditor(m: Macro, onDismiss: () -> Unit, onSave: (Macro) -> Unit) {
-    var name by remember { mutableStateOf(m.name) }
-    var desc by remember { mutableStateOf(m.description) }
-    var schedule by remember { mutableStateOf(m.schedule) }
-    // Typed values can become parameters: tick a step to turn its text into {{valueN}}.
-    var paramSteps by remember { mutableStateOf(m.steps.indices.filter { m.steps[it].value.startsWith("{{") }.toSet()) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Macro") },
-        text = {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                item {
-                    OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(desc, { desc = it }, label = { Text("What it does") }, modifier = Modifier.fillMaxWidth())
-                    Text("Steps (tick typed values that should be asked each time):", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
-                }
-                items(m.steps.indices.toList()) { i ->
-                    val st = m.steps[i]
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (st.kind == com.offlineagent.core.runtime.phone.MacroStepKind.TYPE) Checkbox(i in paramSteps, { c -> paramSteps = if (c) paramSteps + i else paramSteps - i })
-                        Text("${i + 1}. ${st.kind.name.lowercase()} " + (st.selector?.let { it.text.ifBlank { it.contentDescription.ifBlank { it.hint.ifBlank { it.viewId.substringAfterLast('/') } } } } ?: "") +
-                            (if (st.value.isNotBlank()) " “${st.value.take(30)}”" else "") + if (st.irreversible) " ⚠" else "", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                item {
-                    Text("Schedule", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("none", "daily", "weekly").forEach { k -> FilterChip(selected = schedule.kind == k, onClick = { schedule = schedule.copy(kind = k) }, label = { Text(k) }) }
-                    }
-                    if (schedule.kind != "none") Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("at %02d:%02d".format(schedule.hour, schedule.minute), Modifier.weight(1f))
-                        TextButton(onClick = { schedule = schedule.copy(hour = (schedule.hour + 1) % 24) }) { Text("+1h") }
-                        TextButton(onClick = { schedule = schedule.copy(minute = (schedule.minute + 15) % 60) }) { Text("+15m") }
-                    }
-                    if (schedule.kind != "none") Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(schedule.whenCharging, { schedule = schedule.copy(whenCharging = it) }); Text("Only while charging", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                val params = ArrayList<String>()
-                val steps = m.steps.mapIndexed { i, st ->
-                    if (i in paramSteps && st.kind == com.offlineagent.core.runtime.phone.MacroStepKind.TYPE) {
-                        val p = if (st.value.startsWith("{{")) st.value.removePrefix("{{").removeSuffix("}}") else "value${params.size + 1}"
-                        params += p; st.copy(value = "{{$p}}")
-                    } else st
-                }
-                onSave(m.copy(name = name.trim().ifBlank { "Macro" }, description = desc, steps = steps, params = params, schedule = schedule))
-            }) { Text("Save") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
+    editing?.let { m -> MacroEditor(m, app.automation.launcher::label, onDismiss = { editing = null },
+        onSave = { updated -> scope.launch { app.automation.saveMacro(updated); editing = null; notify("Macro saved as skill /macro-${updated.id.take(12)}") } },
+        onTestRun = { updated -> if (updated.params.isEmpty()) runMacro(updated, emptyList(), true) else askValues = updated to true }) }
+    askValues?.let { (m, test) -> MacroValuesDialog(m, if (test) "Test run: ${m.name}" else "Run: ${m.name}", onDismiss = { askValues = null }) { vals -> askValues = null; runMacro(m, vals, test) } }
 }
 
 // ---------------------------------------------------------------- MCP

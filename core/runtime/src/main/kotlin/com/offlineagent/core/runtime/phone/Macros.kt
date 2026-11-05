@@ -3,7 +3,15 @@ package com.offlineagent.core.runtime.phone
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-/** How a recorded step finds its target again on replay (most specific first). */
+/** One ancestor of a recorded target (root side first): its view id, class and index in its parent. */
+@Serializable
+data class AncestorRef(val viewId: String = "", val className: String = "", val index: Int = -1)
+
+/**
+ * How a recorded step finds its target again on replay. Phase 6.2 records a rich target: id, texts, hint, class,
+ * ancestor chain, the list row's label ("Mom" for a WhatsApp chat row), the list's id, and the position as a
+ * fraction of the screen (last resort only). All new fields default, so 6.0/6.1 macros still load.
+ */
 @Serializable
 data class NodeSelector(
     val packageName: String = "",
@@ -12,10 +20,25 @@ data class NodeSelector(
     val contentDescription: String = "",
     val className: String = "",
     val hint: String = "",
-)
+    val activity: String = "",
+    val windowTitle: String = "",
+    val ancestors: List<AncestorRef> = emptyList(),
+    /** Label of the list row the target sits in (the entity: a chat, contact, song…); may be a {{placeholder}}. */
+    val listItemLabel: String = "",
+    val listId: String = "",
+    val inList: Boolean = false,
+    val relX: Float = -1f,
+    val relY: Float = -1f,
+    val relW: Float = 0f,
+    val relH: Float = 0f,
+    val editable: Boolean = false,
+) {
+    /** What a person would call the target. */
+    val displayName: String get() = listItemLabel.ifBlank { text.ifBlank { contentDescription.ifBlank { hint.ifBlank { viewId.substringAfterLast('/').replace('_', ' ') } } } }
+}
 
 @Serializable
-enum class MacroStepKind { OPEN_APP, TAP, TYPE, SCROLL, BACK, HOME, WAIT }
+enum class MacroStepKind { OPEN_APP, TAP, TYPE, SCROLL, BACK, HOME, WAIT, LONG_PRESS, IME_ENTER }
 
 @Serializable
 data class MacroStep(
@@ -23,9 +46,15 @@ data class MacroStep(
     val selector: NodeSelector? = null,
     /** TYPE: literal text or "{{name}}" placeholder; OPEN_APP: package; SCROLL: "down"/"up". */
     val value: String = "",
+    /** Real pause the user took before this step while recording (replay waits for the screen, up to ~2x this). */
     val waitMillis: Long = 0,
     /** Marked during recording/replay when the target looks irreversible: replay asks before it. */
     val irreversible: Boolean = false,
+    /** Phase 6.2: the screen right before / after the step (ids + text hashes, never words). */
+    val before: ScreenFingerprint? = null,
+    val after: ScreenFingerprint? = null,
+    /** TYPE: press the keyboard's Enter/Search key afterwards (asks first, like any submit). */
+    val submit: Boolean = false,
 )
 
 @Serializable
@@ -40,6 +69,24 @@ data class MacroSchedule(
     val whenCharging: Boolean = false,
 )
 
+/**
+ * Optional faster start (e.g. a WhatsApp chat link). Replay tries it first and, when the expected screen appears,
+ * skips the first [skipSteps] steps; when the link does not work it replays every step. Never required.
+ */
+@Serializable
+data class DeepLinkStart(
+    val kind: String = "",
+    val uri: String = "",
+    val packageName: String = "",
+    val skipSteps: Int = 0,
+    val label: String = "",
+    val enabled: Boolean = false,
+)
+
+/** A suggested {{value}}: a typed text (field "value") or a chosen list item (field "label") at [step] (0-based). */
+@Serializable
+data class ParamSuggestion(val name: String, val step: Int, val field: String, val example: String)
+
 @Serializable
 data class Macro(
     val id: String,
@@ -50,10 +97,40 @@ data class Macro(
     val params: List<String> = emptyList(),
     val schedule: MacroSchedule = MacroSchedule(),
     val createdAt: Long = 0,
+    /** 1 = recorded before 6.2 (text-only targets), 2 = rich targets + fingerprints. */
+    val version: Int = 1,
+    val deepLink: DeepLinkStart? = null,
+    val suggestions: List<ParamSuggestion> = emptyList(),
 ) {
-    val hasIrreversibleSteps: Boolean get() = steps.any { it.irreversible }
+    val hasIrreversibleSteps: Boolean get() = steps.any { it.irreversible || it.kind == MacroStepKind.IME_ENTER || it.submit }
 
     fun toJson(): String = MacroCodec.json.encodeToString(serializer(), this)
+
+    /** Turns a suggestion into a real parameter ({{name}} in the step's text or list label). */
+    fun applySuggestion(p: ParamSuggestion): Macro {
+        val st = steps.getOrNull(p.step) ?: return this
+        val ph = "{{${p.name}}}"
+        val changed = when (p.field) {
+            "value" -> st.copy(value = ph)
+            "label" -> st.selector?.let { sel ->
+                val textWasLabel = MacroText.norm(sel.text) == MacroText.norm(sel.listItemLabel) && sel.text.isNotBlank()
+                st.copy(selector = sel.copy(listItemLabel = ph, text = if (textWasLabel) ph else sel.text))
+            } ?: st
+            else -> st
+        }
+        return copy(steps = steps.toMutableList().also { it[p.step] = changed }, params = if (p.name in params) params else params + p.name,
+            suggestions = suggestions.filterNot { it == p })
+    }
+
+    /** Every {{name}} still used by a step (params no step uses are dropped by the editor). */
+    fun usedParams(): List<String> {
+        val rx = Regex("\\{\\{\\s*([A-Za-z0-9_ -]+?)\\s*}}")
+        val out = LinkedHashSet<String>()
+        for (st in steps) {
+            listOf(st.value, st.selector?.listItemLabel.orEmpty(), st.selector?.text.orEmpty()).forEach { v -> rx.findAll(v).forEach { out += it.groupValues[1] } }
+        }
+        return out.toList()
+    }
 
     /** A skill that runs this macro, so it shows up in Skills and can be triggered by /id or by phrases. */
     fun toSkillMarkdown(): String = """
@@ -75,19 +152,43 @@ object MacroCodec {
     fun decode(s: String): Macro = json.decodeFromString(Macro.serializer(), s)
 }
 
-/** Raw events from the accessibility service while recording. */
+/**
+ * Raw events from the accessibility service while recording. [screen] is the whole window at that moment (paths
+ * assigned) and [path] the event source's child-index path in it; both are optional (shallow events still work).
+ */
 sealed interface RecordedEvent {
-    data class WindowChanged(val packageName: String, val time: Long) : RecordedEvent
-    data class Clicked(val node: ScreenNode, val packageName: String, val time: Long) : RecordedEvent
-    data class TextChanged(val node: ScreenNode, val packageName: String, val text: String, val time: Long) : RecordedEvent
-    data class Scrolled(val packageName: String, val direction: String, val time: Long) : RecordedEvent
-    data class GlobalBack(val time: Long) : RecordedEvent
+    val time: Long
+    data class WindowChanged(val packageName: String, override val time: Long, val activity: String = "", val screen: ScreenSnapshot? = null) : RecordedEvent
+    data class Clicked(val node: ScreenNode, val packageName: String, override val time: Long, val screen: ScreenSnapshot? = null, val path: List<Int>? = null) : RecordedEvent
+    data class LongClicked(val node: ScreenNode, val packageName: String, override val time: Long, val screen: ScreenSnapshot? = null, val path: List<Int>? = null) : RecordedEvent
+    data class TextChanged(val node: ScreenNode, val packageName: String, val text: String, override val time: Long, val screen: ScreenSnapshot? = null, val path: List<Int>? = null) : RecordedEvent
+    data class Scrolled(val packageName: String, val direction: String, override val time: Long, val listId: String = "") : RecordedEvent
+    data class GlobalBack(override val time: Long) : RecordedEvent
+    /** The keyboard's Enter / Search key (only seen when the keyboard sends key events). */
+    data class ImeEnter(val packageName: String, override val time: Long) : RecordedEvent
+    /** A settled screen (throttled window-content updates): gives each step its before/after fingerprint. */
+    data class ScreenSeen(val screen: ScreenSnapshot, override val time: Long) : RecordedEvent
+}
+
+/** Password detection that also looks at the input type (some apps don't set isPassword). */
+object SecretFields {
+    private const val CLASS_MASK = 0x0000000f
+    private const val VAR_MASK = 0x00000ff0
+    fun isPassword(n: ScreenNode): Boolean {
+        if (n.password) return true
+        val cls = n.inputType and CLASS_MASK
+        val v = n.inputType and VAR_MASK
+        return (cls == 1 && (v == 0x80 || v == 0x90 || v == 0xe0)) || (cls == 2 && v == 0x10) ||
+            Regex("(?i)(password|passcode|\\bpin\\b|cvv)").containsMatchIn(n.hint + " " + n.viewId.substringAfterLast('/'))
+    }
 }
 
 /**
- * Turns a demonstration into replayable steps: an OPEN_APP for the first app, one TAP per click, ONE TYPE per field
- * (the final text, not every keystroke), scrolls merged, and the user's own app (the recorder overlay) ignored.
- * Typed values that the user marks as variables become {{placeholders}}. Password fields are never recorded.
+ * Turns a demonstration into replayable steps: an OPEN_APP for the first app, one TAP / LONG_PRESS per click with a
+ * rich target, ONE TYPE per field (its final value, even when the user tapped away and came back), scrolls merged
+ * (and programmatic scrolls right after a tap/window change ignored), Back (key event or "returned to an earlier
+ * screen"), Home, and the user's own pauses as waits. ONYX's own windows are ignored. Password and one-time-code
+ * fields are never recorded. Typed texts and chosen list items become suggested {{values}}.
  */
 class MacroRecorder(
     private val ownPackage: String,
@@ -105,19 +206,38 @@ class MacroRecorder(
     private var startPackage = ""
     private var lastTime = 0L
     private var lastPackage = ""
+    private var lastActionTime = 0L
+    private var lastWindowTime = 0L
+    private var lastBackTime = -10_000L
+    private var lastScreen: ScreenSnapshot? = null
+    private var lastScreenTime = 0L
 
     val recorded: List<MacroStep> get() = steps.toList()
 
+    private fun pkgOf(e: RecordedEvent) = when (e) {
+        is RecordedEvent.WindowChanged -> e.packageName; is RecordedEvent.Clicked -> e.packageName; is RecordedEvent.LongClicked -> e.packageName
+        is RecordedEvent.TextChanged -> e.packageName; is RecordedEvent.Scrolled -> e.packageName; is RecordedEvent.GlobalBack -> lastPackage
+        is RecordedEvent.ImeEnter -> e.packageName; is RecordedEvent.ScreenSeen -> e.screen.packageName
+    }
+
+    private fun fp(pkg: String): ScreenFingerprint? = lastScreen?.takeIf { it.packageName == pkg }?.let { ScreenFingerprint.of(it) }
+
+    /** Adds a step; the previous step's "after" is the screen this one starts on. */
+    private fun push(st: MacroStep) {
+        val before = st.before
+        if (before != null) steps.lastOrNull()?.let { prev -> if (prev.after == null) steps[steps.size - 1] = prev.copy(after = before) }
+        steps += st
+    }
+
     fun add(e: RecordedEvent) {
-        val pkg = when (e) {
-            is RecordedEvent.WindowChanged -> e.packageName; is RecordedEvent.Clicked -> e.packageName
-            is RecordedEvent.TextChanged -> e.packageName; is RecordedEvent.Scrolled -> e.packageName; is RecordedEvent.GlobalBack -> lastPackage
-        }
+        val pkg = pkgOf(e)
         if (MacroApps.isSystemChrome(pkg, ownPackage)) return
-        val time = when (e) {
-            is RecordedEvent.WindowChanged -> e.time; is RecordedEvent.Clicked -> e.time; is RecordedEvent.TextChanged -> e.time
-            is RecordedEvent.Scrolled -> e.time; is RecordedEvent.GlobalBack -> e.time
+        val time = e.time
+        if (e is RecordedEvent.ScreenSeen) {
+            if (!isHome(pkg)) { lastScreen = e.screen; lastScreenTime = time }
+            return
         }
+        if (e is RecordedEvent.WindowChanged && e.screen != null && !isHome(pkg)) { lastScreen = e.screen; lastScreenTime = time }
         if (pkg.isNotEmpty() && isHome(pkg)) { onHome(e, time); return }
         if (startPackage.isEmpty() && pkg.isNotEmpty()) {
             startPackage = pkg
@@ -128,24 +248,68 @@ class MacroRecorder(
         }
         val gap = if (lastTime == 0L) 0L else (time - lastTime).coerceIn(0, 10_000)
         when (e) {
-            is RecordedEvent.Clicked -> steps += MacroStep(MacroStepKind.TAP, selector(e.node, pkg), waitMillis = gap.coerceAtMost(3000), irreversible = policy.isIrreversibleTarget(e.node))
-            is RecordedEvent.TextChanged -> {
-                if (e.node.password) return
-                val sel = selector(e.node, pkg)
+            is RecordedEvent.Clicked -> {
+                val sel = TargetCapture.selector(e.node, pkg, e.screen, e.path)
+                push(MacroStep(MacroStepKind.TAP, sel, waitMillis = gap, irreversible = policy.isIrreversibleTarget(e.node), before = fp(pkg)))
+                lastActionTime = time
+            }
+            is RecordedEvent.LongClicked -> {
+                val sel = TargetCapture.selector(e.node, pkg, e.screen, e.path)
+                // A long-press also fires a click on some views: replace a TAP on the same target recorded just now.
                 val last = steps.lastOrNull()
-                if (last != null && last.kind == MacroStepKind.TYPE && last.selector == sel) steps[steps.size - 1] = last.copy(value = e.text)
-                else steps += MacroStep(MacroStepKind.TYPE, sel, e.text, waitMillis = gap.coerceAtMost(3000))
+                if (last != null && last.kind == MacroStepKind.TAP && sameTarget(last.selector, sel) && time - lastActionTime < 800) steps.removeAt(steps.size - 1)
+                push(MacroStep(MacroStepKind.LONG_PRESS, sel, waitMillis = gap, irreversible = policy.isIrreversibleTarget(e.node), before = fp(pkg)))
+                lastActionTime = time
+            }
+            is RecordedEvent.TextChanged -> {
+                if (SecretFields.isPassword(e.node) || policy.isOtpField(e.node)) return
+                val sel = TargetCapture.selector(e.node, pkg, e.screen, e.path).copy(editable = true)
+                // Final value per field: update the earlier TYPE of this field when only taps on that same field came between.
+                for (i in steps.indices.reversed()) {
+                    val st = steps[i]
+                    if (st.kind == MacroStepKind.TYPE && sameField(st.selector, sel)) { steps[i] = st.copy(value = e.text); lastTime = time; return }
+                    if (!(st.kind == MacroStepKind.TAP && sameField(st.selector, sel))) break
+                }
+                push(MacroStep(MacroStepKind.TYPE, sel, e.text, waitMillis = gap, before = fp(pkg)))
+                lastActionTime = time
             }
             is RecordedEvent.Scrolled -> {
+                // Apps scroll by themselves right after a tap or a new screen (a chat jumps to its last message): not the user.
+                if (time - lastActionTime < 700 || time - lastWindowTime < 1000) { lastTime = time; return }
                 val last = steps.lastOrNull()
-                if (!(last != null && last.kind == MacroStepKind.SCROLL && last.value == e.direction)) steps += MacroStep(MacroStepKind.SCROLL, value = e.direction)
+                if (!(last != null && last.kind == MacroStepKind.SCROLL && last.value == e.direction)) push(MacroStep(MacroStepKind.SCROLL, NodeSelector(pkg, viewId = e.listId, listId = e.listId), e.direction, waitMillis = gap, before = fp(pkg)))
             }
-            is RecordedEvent.GlobalBack -> steps += MacroStep(MacroStepKind.BACK)
-            is RecordedEvent.WindowChanged -> Unit
+            is RecordedEvent.GlobalBack -> { push(MacroStep(MacroStepKind.BACK, waitMillis = gap, before = fp(pkg))); lastBackTime = time; lastActionTime = time }
+            is RecordedEvent.ImeEnter -> {
+                val last = steps.lastOrNull()
+                if (last != null && last.kind == MacroStepKind.TYPE) steps[steps.size - 1] = last.copy(submit = true)
+                else push(MacroStep(MacroStepKind.IME_ENTER, waitMillis = gap, before = fp(pkg)))
+                lastActionTime = time
+            }
+            is RecordedEvent.WindowChanged -> {
+                // Back without a key event (gesture nav on some phones): we came back to a screen seen earlier, with no tap.
+                val now = e.screen?.let { ScreenFingerprint.of(it) }
+                if (now != null && pkg == lastPackage && time - lastActionTime > 1000 && time - lastBackTime > 1000 && steps.size > 1) {
+                    val earlier = steps.dropLast(1).any { it.before?.packageName == pkg && (it.before?.similarity(now) ?: 0.0) >= 0.85 }
+                    val differsFromLast = (steps.last().before?.similarity(now) ?: 0.0) < 0.85
+                    if (earlier && differsFromLast) { push(MacroStep(MacroStepKind.BACK, waitMillis = gap, before = null)); lastBackTime = time }
+                }
+                lastWindowTime = time
+            }
+            is RecordedEvent.ScreenSeen -> Unit
         }
         lastTime = time
         if (pkg.isNotEmpty()) lastPackage = pkg
     }
+
+    private fun sameField(a: NodeSelector?, b: NodeSelector): Boolean {
+        a ?: return false
+        if (a.packageName != b.packageName) return false
+        if (a.viewId.isNotBlank() || b.viewId.isNotBlank()) return a.viewId == b.viewId && a.hint == b.hint
+        return a.className == b.className && a.hint == b.hint && a.ancestors == b.ancestors
+    }
+
+    private fun sameTarget(a: NodeSelector?, b: NodeSelector) = a != null && a.viewId == b.viewId && a.text == b.text && a.listItemLabel == b.listItemLabel && a.contentDescription == b.contentDescription
 
     /** Launcher events: icon tap → OPEN_APP(app); coming back to the home screen mid-demo → HOME; the rest is dropped. */
     private fun onHome(e: RecordedEvent, time: Long) {
@@ -158,6 +322,7 @@ class MacroRecorder(
                     if (!(steps.lastOrNull()?.kind == MacroStepKind.OPEN_APP && steps.last().value == target)) steps += MacroStep(MacroStepKind.OPEN_APP, value = target)
                     lastPackage = target // the app's own window event that follows is not a second switch
                     lastTime = time
+                    lastActionTime = time
                 }
             }
             is RecordedEvent.WindowChanged -> {
@@ -170,20 +335,124 @@ class MacroRecorder(
         }
     }
 
-    /** Replace literal typed values with placeholders: values -> parameter names. */
+    /**
+     * Builds the macro. [variables] (name → literal value) turns matching typed texts and list labels into
+     * {{placeholders}} right away; everything else typed or chosen is offered as a suggestion in the editor.
+     */
     fun build(id: String, name: String, description: String, variables: Map<String, String> = emptyMap(), now: Long = System.currentTimeMillis()): Macro {
+        // The final screen is the last step's "after".
+        val finalSteps0 = steps.toMutableList()
+        if (finalSteps0.isNotEmpty() && finalSteps0.last().after == null && lastScreen != null && lastScreenTime >= lastActionTime)
+            finalSteps0[finalSteps0.size - 1] = finalSteps0.last().copy(after = ScreenFingerprint.of(lastScreen))
         val params = ArrayList<String>()
-        val finalSteps = steps.map { s ->
-            if (s.kind == MacroStepKind.TYPE) {
-                val v = variables.entries.firstOrNull { it.value == s.value }
-                if (v != null) { if (v.key !in params) params += v.key; s.copy(value = "{{${v.key}}}") } else s
-            } else s
-        }
-        return Macro(id, name, description, startPackage, finalSteps.dropLastWhile { it.kind == MacroStepKind.HOME }, params, createdAt = now)
+        val finalSteps = finalSteps0.map { s ->
+            val sel = s.selector
+            when {
+                s.kind == MacroStepKind.TYPE -> {
+                    val v = variables.entries.firstOrNull { it.value == s.value }
+                    if (v != null) { if (v.key !in params) params += v.key; s.copy(value = "{{${v.key}}}") } else s
+                }
+                sel != null && sel.listItemLabel.isNotBlank() -> {
+                    val v = variables.entries.firstOrNull { it.value.equals(sel.listItemLabel, true) }
+                    if (v != null) { if (v.key !in params) params += v.key; s.copy(selector = sel.copy(listItemLabel = "{{${v.key}}}", text = if (sel.text.equals(sel.listItemLabel, true)) "{{${v.key}}}" else sel.text)) } else s
+                }
+                else -> s
+            }
+        }.dropLastWhile { it.kind == MacroStepKind.HOME }
+        val m = Macro(id, name, description, startPackage, finalSteps, params, createdAt = now, version = 2)
+        return m.copy(suggestions = MacroParams.suggest(m), deepLink = DeepLinks.suggest(m))
     }
 
     companion object {
         fun selector(n: ScreenNode, pkg: String) = NodeSelector(pkg, n.viewId, n.text.take(80).takeIf { !n.editable } ?: "", n.contentDescription.take(80), n.className, n.hint.take(80))
+    }
+}
+
+/** Phase 6.2: which typed texts / chosen list items could be {{values}}. */
+object MacroParams {
+    private val CHAT_APPS = setOf("com.whatsapp", "com.whatsapp.w4b", "org.telegram.messenger", "com.google.android.apps.messaging", "com.instagram.android",
+        "com.facebook.orca", "org.thoughtcrime.securesms", "com.samsung.android.messaging", "com.android.mms")
+    private val CHAT_LIST = Regex("(?i)(conversation|chat|contact|thread|inbox)")
+
+    fun isChatList(sel: NodeSelector) = sel.packageName in CHAT_APPS || CHAT_LIST.containsMatchIn(sel.listId)
+
+    fun suggest(m: Macro): List<ParamSuggestion> {
+        val used = HashSet(m.params)
+        val out = ArrayList<ParamSuggestion>()
+        fun name(base: String): String { var n = base; var i = 2; while (n in used) n = base + i++; used += n; return n }
+        m.steps.forEachIndexed { i, st ->
+            val sel = st.selector
+            if (st.kind == MacroStepKind.TYPE && st.value.isNotBlank() && !st.value.contains("{{")) {
+                val hint = (sel?.hint.orEmpty() + " " + sel?.viewId.orEmpty()).lowercase()
+                val base = when { "search" in hint -> "search"; "message" in hint || "entry" in hint || "compose" in hint -> "message"; "name" in hint -> "name"; else -> "text" }
+                out += ParamSuggestion(name(base), i, "value", st.value.take(60))
+            }
+            if ((st.kind == MacroStepKind.TAP || st.kind == MacroStepKind.LONG_PRESS) && sel != null && sel.listItemLabel.isNotBlank() && !sel.listItemLabel.contains("{{"))
+                out += ParamSuggestion(name(if (isChatList(sel)) "chat" else "item"), i, "label", sel.listItemLabel.take(60))
+        }
+        return out
+    }
+}
+
+/** Phase 6.2: optional deep-link starts (only where the app has a reliable one). */
+object DeepLinks {
+    val WHATSAPP = setOf("com.whatsapp", "com.whatsapp.w4b")
+
+    /** A WhatsApp macro that opens a chat from the chat list can start with the chat link instead (needs a number). */
+    fun suggest(m: Macro): DeepLinkStart? {
+        val pkg = m.steps.firstOrNull()?.takeIf { it.kind == MacroStepKind.OPEN_APP }?.value ?: return null
+        if (pkg !in WHATSAPP) return null
+        val tapIdx = m.steps.indexOfFirst { (it.kind == MacroStepKind.TAP) && it.selector?.listItemLabel?.isNotBlank() == true }
+        if (tapIdx <= 0) return null
+        if (m.steps.subList(1, tapIdx).any { it.kind != MacroStepKind.TAP && it.kind != MacroStepKind.SCROLL && it.kind != MacroStepKind.WAIT }) return null
+        return DeepLinkStart("whatsapp_chat", "", pkg, tapIdx + 1, m.steps[tapIdx].selector!!.listItemLabel, enabled = false)
+    }
+
+    /** "+91 98480 22338" → "https://wa.me/919848022338" (null when it isn't a plausible international number). */
+    fun whatsappUri(phone: String, defaultCountry: String = "91"): String? {
+        var d = phone.filter { it.isDigit() || it == '+' }
+        if (d.isBlank()) return null
+        d = when {
+            d.startsWith("+") -> d.drop(1)
+            d.startsWith("00") -> d.drop(2)
+            d.length == 10 -> defaultCountry + d
+            d.length == 11 && d.startsWith("0") -> defaultCountry + d.drop(1)
+            else -> d
+        }.filter { it.isDigit() }
+        return if (d.length in 8..15) "https://wa.me/$d" else null
+    }
+}
+
+/** Phase 6.2: steps in plain words for the editor and the overlay. */
+object MacroDescribe {
+    fun step(st: MacroStep, appLabel: (String) -> String = { it }): String {
+        val sel = st.selector
+        val app = sel?.packageName?.takeIf { it.isNotBlank() }?.let(appLabel)
+        val inApp = if (app != null) " in $app" else ""
+        fun q(s: String) = "'" + s.replace("\n", " ").take(40) + "'"
+        return when (st.kind) {
+            MacroStepKind.OPEN_APP -> "Open ${appLabel(st.value)}"
+            MacroStepKind.TAP, MacroStepKind.LONG_PRESS -> {
+                val verb = if (st.kind == MacroStepKind.TAP) "Tap" else "Long-press"
+                val what = when {
+                    sel == null -> "something"
+                    sel.listItemLabel.isNotBlank() -> (if (MacroParams.isChatList(sel)) "chat " else "item ") + q(sel.listItemLabel)
+                    sel.text.isNotBlank() -> q(sel.text)
+                    sel.contentDescription.isNotBlank() -> q(sel.contentDescription) + " button"
+                    sel.editable && sel.hint.isNotBlank() -> "the " + q(sel.hint) + " field"
+                    sel.viewId.isNotBlank() -> q(sel.viewId.substringAfterLast('/').replace('_', ' '))
+                    else -> "a ${sel.className.substringAfterLast('.').ifBlank { "control" }}"
+                }
+                "$verb $what$inApp" + if (st.irreversible) " (asks first)" else ""
+            }
+            MacroStepKind.TYPE -> "Type ${q(st.value)}" + (sel?.let { s -> s.hint.ifBlank { s.contentDescription }.takeIf { it.isNotBlank() }?.let { " into " + q(it) } } ?: "") +
+                (if (st.submit) " and press Enter (asks first)" else "")
+            MacroStepKind.SCROLL -> "Scroll ${st.value.ifBlank { "down" }}$inApp"
+            MacroStepKind.BACK -> "Press Back"
+            MacroStepKind.HOME -> "Go to the home screen"
+            MacroStepKind.WAIT -> "Wait ${(st.waitMillis + 500) / 1000} s"
+            MacroStepKind.IME_ENTER -> "Press Enter on the keyboard (asks first)"
+        }
     }
 }
 
@@ -227,104 +496,3 @@ object MacroApps {
     }
 }
 
-/** Finds a recorded step's target in a live snapshot. */
-object MacroMatcher {
-    fun find(sel: NodeSelector, s: ScreenSnapshot): ScreenElement? {
-        val cands = s.elements
-        fun score(n: ScreenNode): Int {
-            var sc = 0
-            if (sel.viewId.isNotBlank() && n.viewId == sel.viewId) sc += 5
-            if (sel.text.isNotBlank() && n.text.equals(sel.text, true)) sc += 4
-            if (sel.contentDescription.isNotBlank() && n.contentDescription.equals(sel.contentDescription, true)) sc += 4
-            if (sel.hint.isNotBlank() && n.hint.equals(sel.hint, true)) sc += 3
-            if (sel.className.isNotBlank() && n.className == sel.className) sc += 1
-            if (sel.text.isNotBlank() && sc < 4 && n.label.contains(sel.text, true)) sc += 2
-            return sc
-        }
-        val best = cands.maxByOrNull { score(it.node) } ?: return null
-        val sc = score(best.node)
-        // Need more than a class-name match.
-        return if (sc >= 3) best else null
-    }
-
-    fun fill(value: String, params: Map<String, String>): String =
-        Regex("\\{\\{([A-Za-z0-9_ -]+)}}").replace(value) { m -> params[m.groupValues[1].trim()] ?: m.value }
-}
-
-/** Replays a macro through the same [ScreenDriver] + [AutomationHost] + [AutomationPolicy] as the screen agent. */
-class MacroPlayer(
-    private val driver: ScreenDriver,
-    private val host: AutomationHost,
-    private val policy: AutomationPolicy,
-    private val log: AutomationLog,
-    private val findTimeoutMillis: Long = 6000,
-    private val clock: () -> Long = System::currentTimeMillis,
-    private val sleep: suspend (Long) -> Unit = { kotlinx.coroutines.delay(it) },
-    /** Phase 6.1: the launcher (an OPEN_APP of it replays as Home). */
-    private val isHome: (String) -> Boolean = { false },
-    /** Why [pkg] cannot be opened (not installed, no launch screen, hidden by package visibility, blocked), or null. */
-    private val openProblem: (String) -> String? = { null },
-    private val appLabel: (String) -> String = { it },
-) {
-    suspend fun play(m: Macro, params: Map<String, String>, unattended: Boolean = false): String {
-        val missing = m.params.filter { params[it].isNullOrBlank() }
-        if (missing.isNotEmpty()) return "Missing values for: ${missing.joinToString()}".also { host.finished(it) }
-        m.steps.forEachIndexed { i, st ->
-            val step = i + 1
-            if (st.waitMillis > 0) sleep(st.waitMillis.coerceAtMost(3000))
-            val action: ScreenAction
-            var snap: ScreenSnapshot? = null
-            when (st.kind) {
-                MacroStepKind.OPEN_APP -> {
-                    if (st.value.isBlank()) return fail("step $step has no app to open", step)
-                    action = if (isHome(st.value)) ScreenAction.Home else {
-                        openProblem(st.value)?.let { why -> return fail("can't open ${appLabel(st.value)} (${st.value}): $why", step) }
-                        ScreenAction.OpenApp(st.value)
-                    }
-                }
-                MacroStepKind.BACK -> action = ScreenAction.Back
-                MacroStepKind.HOME -> action = ScreenAction.Home
-                MacroStepKind.WAIT -> action = ScreenAction.Wait(st.waitMillis)
-                MacroStepKind.SCROLL -> action = ScreenAction.Scroll(st.value.ifBlank { "down" })
-                MacroStepKind.TAP, MacroStepKind.TYPE -> {
-                    val sel = st.selector ?: return fail("step $step has no target", step)
-                    var el: ScreenElement? = null
-                    val deadline = clock() + findTimeoutMillis
-                    while (el == null && clock() < deadline) {
-                        snap = driver.snapshot()
-                        el = snap?.let { MacroMatcher.find(sel, it) }
-                        if (el == null) sleep(400)
-                    }
-                    if (el == null || snap == null) return fail("could not find \"${sel.text.ifBlank { sel.contentDescription.ifBlank { sel.viewId } }}\" on screen (step $step)", step)
-                    action = if (st.kind == MacroStepKind.TAP) ScreenAction.Tap(el.id) else ScreenAction.Type(el.id, MacroMatcher.fill(st.value, params))
-                }
-            }
-            val s = snap ?: driver.snapshot()
-            if (s != null) {
-                when (val v = policy.check(action, s, params.values.toSet())) {
-                    is AutomationPolicy.Verdict.Stop -> return fail(v.reason, step)
-                    is AutomationPolicy.Verdict.NeedsApproval -> {
-                        if (unattended) return fail("step \"${action.describe(s)}\" needs your approval — open the app to finish", step)
-                        if (!host.approve(step, action.describe(s), v.reason)) return fail("you declined \"${action.describe(s)}\"", step)
-                    }
-                    AutomationPolicy.Verdict.Allow -> host.preview(step, action.describe(s))
-                }
-                if (st.irreversible && action !is ScreenAction.Tap) { /* marked steps are taps; nothing else */ }
-                val ok = driver.perform(action, s)
-                log.add(AutomationLogEntry(clock(), step, s.packageName, action.describe(s), if (ok) "ok (macro ${m.name})" else "failed (macro ${m.name})"))
-                if (!ok) return fail(when (action) {
-                    is ScreenAction.OpenApp -> "could not open ${appLabel(action.app)} (${action.app}) — Android has no launch screen for it, or it is hidden from ONYX"
-                    is ScreenAction.Tap -> "tapping \"${action.describe(s).removePrefix("Tap ").take(40)}\" did nothing (the control is gone or not tappable)"
-                    is ScreenAction.Type -> "could not type into that field"
-                    ScreenAction.Home -> "could not go to the home screen"
-                    ScreenAction.Back -> "could not press Back"
-                    else -> "${action.describe(s)} failed"
-                }, step)
-            } else return fail("cannot read the screen", step)
-            sleep(500)
-        }
-        return "Macro \"${m.name}\" finished (${m.steps.size} steps).".also { host.finished(it) }
-    }
-
-    private fun fail(why: String, step: Int) = "Macro stopped at step $step: $why.".also { host.finished(it) }
-}

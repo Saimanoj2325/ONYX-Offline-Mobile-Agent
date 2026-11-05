@@ -41,7 +41,13 @@ class ScreenApprovals(
 
     private fun key(tool: String, args: JsonObject) = tool + "|" + args.toString()
 
-    fun wrap(inner: ApprovalGate): ApprovalGate = ApprovalGate { r -> decide(r, inner) }
+    fun wrap(inner: ApprovalGate): ApprovalGate = object : ApprovalGate {
+        override suspend fun approve(request: ApprovalRequest): Boolean = decide(request, inner)
+        // Non-screen tools keep the inner gate's full answer (AppBridge scopes: Allow once / for this task).
+        override suspend fun decide(request: ApprovalRequest): com.offlineagent.core.agents.PromptReply =
+            if (request.tool !in ScreenToolkit.NAMES) inner.decide(request)
+            else com.offlineagent.core.agents.PromptReply(if (decide(request, inner)) com.offlineagent.core.agents.PromptAnswer.ALLOW_ONCE else com.offlineagent.core.agents.PromptAnswer.DENY)
+    }
 
     suspend fun decide(r: ApprovalRequest, inner: ApprovalGate): Boolean {
         if (r.tool !in ScreenToolkit.NAMES) return inner.approve(r)
@@ -54,7 +60,8 @@ class ScreenApprovals(
         }
         if (r.risk >= Risk.CRITICAL) {
             val ok = inner.approve(r.copy(title = "Confirm this step in $label: ${r.title}",
-                description = "This step may send, submit, pay, share or delete something. ONYX asks for every such step — it is never covered by an app approval.\n" + r.description))
+                description = "This step may send, submit, pay, share or delete something. ONYX asks for every such step — it is never covered by an app approval.\n" + r.description,
+                offerTaskScope = false))
             if (ok) synchronized(lock) {
                 criticalTokens[key(r.tool, r.args)] = clock()
                 criticalTokens.entries.removeIf { clock() - it.value > tokenTtlMs }
@@ -73,11 +80,18 @@ class ScreenApprovals(
             return true
         }
         val what = if (need == Level.OPERATE) "operate" else "read"
-        val ok = inner.approve(r.copy(
+        // Phase 6.2: "Allow once" covers just this step; "Allow for this task" grants the app scope.
+        val reply = inner.decide(r.copy(
             title = "Let ONYX $what $label for this task",
             description = "Covers up to $max screen steps in $label until this task ends (${r.title}). " +
                 "Sending, paying, submitting or deleting still asks every time. Stop any time from the overlay.",
+            offerTaskScope = true,
         ))
+        val ok = reply.allowed
+        if (ok && !reply.forTask) {
+            audit?.record("approved once ${r.tool}", "app=$pkg (no scope)", r.risk)
+            return true
+        }
         if (ok) synchronized(lock) {
             val m = scopes.getOrPut(r.runId) { HashMap() }
             val old = m[pkg]

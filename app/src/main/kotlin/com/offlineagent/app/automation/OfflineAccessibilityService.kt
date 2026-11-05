@@ -62,19 +62,108 @@ class OfflineAccessibilityService : AccessibilityService(), ScreenDriver {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         // Phase 5: the Context agent's "foreground app" (only while the user has this service enabled).
-        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) event.packageName?.toString()?.takeIf { it.isNotBlank() }?.let { lastForegroundPackage = it }
+        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            event.packageName?.toString()?.takeIf { it.isNotBlank() }?.let { p ->
+                lastForegroundPackage = p
+                // Activity class names only (not dialogs / toasts / widgets).
+                event.className?.toString()?.takeIf { it.contains('.') && !it.startsWith("android.widget.") && !it.startsWith("android.view.") }?.let { lastActivity = p to it }
+            }
+        }
         val rec = recorder ?: return
         val e = event ?: return
         val pkg = e.packageName?.toString() ?: ""
+        if (pkg == packageName) return // ONYX's own overlay / app is never part of a macro
         val t = System.currentTimeMillis()
-        when (e.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> rec.add(RecordedEvent.WindowChanged(pkg, t))
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> e.source?.let { rec.add(RecordedEvent.Clicked(convert(it, 0, emptyList(), shallow = true), pkg, t)) }
-            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> e.source?.let { src ->
-                if (!src.isPassword) rec.add(RecordedEvent.TextChanged(convert(src, 0, emptyList(), shallow = true), pkg, src.text?.toString() ?: "", t))
+        runCatching {
+            when (e.eventType) {
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> rec.add(RecordedEvent.WindowChanged(pkg, t, activityFor(pkg), liveSnapshot()))
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> if (t - lastSeen > 350) { lastSeen = t; liveSnapshot()?.let { rec.add(RecordedEvent.ScreenSeen(it, t)) } }
+                AccessibilityEvent.TYPE_VIEW_CLICKED -> e.source?.let { src -> val (snap, path) = locate(src); rec.add(RecordedEvent.Clicked(convert(src, 0, path ?: emptyList(), shallow = true), pkg, t, snap, path)) }
+                AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> e.source?.let { src -> val (snap, path) = locate(src); rec.add(RecordedEvent.LongClicked(convert(src, 0, path ?: emptyList(), shallow = true), pkg, t, snap, path)) }
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> e.source?.let { src ->
+                    // Password fields are never recorded (isPassword or a password input type).
+                    if (!src.isPassword) {
+                        val (snap, path) = locate(src)
+                        rec.add(RecordedEvent.TextChanged(convert(src, 0, path ?: emptyList(), shallow = true), pkg, src.text?.toString() ?: "", t, snap, path))
+                    }
+                }
+                AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                    val dir = if (Build.VERSION.SDK_INT >= 28 && e.scrollDeltaY == 0 && e.scrollDeltaX != 0) (if (e.scrollDeltaX < 0) "left" else "right")
+                        else if (Build.VERSION.SDK_INT >= 28 && e.scrollDeltaY < 0) "up" else "down"
+                    if (dir == "up" || dir == "down") rec.add(RecordedEvent.Scrolled(pkg, dir, t, e.source?.viewIdResourceName ?: ""))
+                }
             }
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> rec.add(RecordedEvent.Scrolled(pkg, if (e.scrollDeltaY < 0) "up" else "down", t))
         }
+    }
+
+    /** Phase 6.2: Back / Enter keys while recording (key filtering is switched on only during a recording). */
+    override fun onKeyEvent(event: android.view.KeyEvent?): Boolean {
+        val rec = recorder ?: return false
+        val k = event ?: return false
+        if (k.action != android.view.KeyEvent.ACTION_UP) return false
+        val pkg = lastForegroundPackage ?: ""
+        when (k.keyCode) {
+            android.view.KeyEvent.KEYCODE_BACK -> rec.add(RecordedEvent.GlobalBack(System.currentTimeMillis()))
+            android.view.KeyEvent.KEYCODE_ENTER, android.view.KeyEvent.KEYCODE_NUMPAD_ENTER, android.view.KeyEvent.KEYCODE_SEARCH -> rec.add(RecordedEvent.ImeEnter(pkg, System.currentTimeMillis()))
+        }
+        return false // never consume: the app still gets the key
+    }
+
+    /** Turns key-event filtering on only while recording (so normal use is untouched). */
+    fun setKeyFiltering(on: Boolean) {
+        runCatching {
+            val info = serviceInfo ?: return
+            info.flags = if (on) info.flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+                else info.flags and android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS.inv()
+            serviceInfo = info
+        }
+    }
+
+    @Volatile private var lastSeen = 0L
+    @Volatile private var lastActivity: Pair<String, String>? = null
+    private fun activityFor(pkg: String) = lastActivity?.takeIf { it.first == pkg }?.second ?: ""
+
+    /** The whole active window right now, with child-index paths (for recording targets and fingerprints). */
+    private fun liveSnapshot(): ScreenSnapshot? {
+        val root = rootInActiveWindow ?: return null
+        val pkg = root.packageName?.toString() ?: return null
+        if (pkg == packageName) return null
+        val title = if (Build.VERSION.SDK_INT >= 24) runCatching { root.window?.title?.toString() }.getOrNull().orEmpty() else ""
+        return ScreenSnapshot(pkg, convert(root, 0, emptyList()), pkg, activityFor(pkg), title)
+    }
+
+    /** Snapshot + the child-index path of [src] in it (walks up the parents; null when it cannot be placed). */
+    private fun locate(src: AccessibilityNodeInfo): Pair<ScreenSnapshot?, List<Int>?> {
+        val snap = liveSnapshot() ?: return null to null
+        val path = ArrayList<Int>()
+        var n: AccessibilityNodeInfo = src
+        var guard = 0
+        while (guard++ < MAX_DEPTH + 2) {
+            val parent = n.parent ?: break
+            val idx = (0 until parent.childCount).firstOrNull { i -> parent.getChild(i)?.let { it == n } == true } ?: return snap to null
+            path.add(0, idx)
+            n = parent
+        }
+        return snap to path
+    }
+
+    /** Phase 6.2: is a password / one-time-code field focused, or the window secure? (overlays must not cover it) */
+    fun sensitiveScreen(): Pair<Boolean, Float> {
+        val root = rootInActiveWindow ?: return false to -1f
+        val focus = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        val h = resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        if (focus != null && (focus.isPassword || isOtpLike(focus))) {
+            val r = Rect().also { focus.getBoundsInScreen(it) }
+            return true to (r.centerY().toFloat() / h).coerceIn(0f, 1f)
+        }
+        val app = application as? OfflineAgentApp
+        val secure = app?.let { runCatching { it.onyx.screen.lastSecure(root.packageName?.toString() ?: "") }.getOrNull() } ?: false
+        return secure to (if (secure) 0.5f else -1f)
+    }
+
+    private fun isOtpLike(n: AccessibilityNodeInfo): Boolean {
+        val t = ((if (Build.VERSION.SDK_INT >= 26) n.hintText?.toString() else "") + " " + n.viewIdResourceName + " " + n.contentDescription).lowercase()
+        return listOf("otp", "one-time", "verification code", "pin", "cvv", "ओटीपी", "ఓటీపీ").any { it in t }
     }
 
     // ------------------------------------------------------------ reading the screen
@@ -102,7 +191,8 @@ class OfflineAccessibilityService : AccessibilityService(), ScreenDriver {
             return@withContext ScreenSnapshot(pkg, ScreenNode(), "Offline Agent")
         }
         val label = runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
-        ScreenSnapshot(pkg, convert(root, 0, emptyList()), label)
+        val title = if (Build.VERSION.SDK_INT >= 24) runCatching { root.window?.title?.toString() }.getOrNull().orEmpty() else ""
+        ScreenSnapshot(pkg, convert(root, 0, emptyList()), label, activityFor(pkg), title)
     }
 
     private fun resolve(path: List<Int>): AccessibilityNodeInfo? {
@@ -134,8 +224,20 @@ class OfflineAccessibilityService : AccessibilityService(), ScreenDriver {
                 if (ok && a.submit && Build.VERSION.SDK_INT >= 30) node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
                 ok
             }
+            is ScreenAction.LongPress -> {
+                val el = s.element(a.element) ?: return@withContext false
+                var target = resolve(el.node.path)
+                while (target != null && !target.isLongClickable) target = target.parent
+                if (target != null && target.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) true
+                else gesture(Path().apply { moveTo(el.node.bounds.centerX.toFloat(), el.node.bounds.centerY.toFloat()) }, 700)
+            }
+            is ScreenAction.Enter -> {
+                val el = s.element(a.element) ?: return@withContext false
+                val node = resolve(el.node.path) ?: return@withContext false
+                Build.VERSION.SDK_INT >= 30 && node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            }
             is ScreenAction.Scroll -> {
-                val scrollable = s.elements.firstOrNull { it.node.scrollable }?.let { resolve(it.node.path) }
+                val scrollable = (s.element(a.element)?.takeIf { it.node.scrollable } ?: s.elements.firstOrNull { it.node.scrollable })?.let { resolve(it.node.path) }
                 val act = if (a.direction == "up") AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
                 if (scrollable != null && scrollable.performAction(act)) true else swipe(a.direction == "up")
             }
@@ -284,10 +386,16 @@ class AutomationOverlay(private val service: AccessibilityService) {
         buttons("Stop & save" to onSave, "Cancel" to onCancel)
     }
 
-    fun showDone(text: String) = ui.execute {
+    /** [report] = a failed run's debug report: offered as "Copy debug report" (Sai can paste it into chat). */
+    fun showDone(text: String, report: String? = null) = ui.execute {
         ensure(); focusable(false)
-        title.text = "Offline Agent — finished"; body.text = text; input.visibility = View.GONE
-        buttons("Close" to { hide() })
+        title.text = "ONYX — finished"; body.text = text; input.visibility = View.GONE
+        if (report != null) buttons("Copy debug report" to {
+            val cm = service.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("ONYX debug report", report))
+            body.text = "$text\n\nDebug report copied — paste it into chat."
+        }, "Close" to { hide() })
+        else buttons("Close" to { hide() })
     }
 
     fun hide() = ui.execute { root?.let { runCatching { wm.removeView(it) } }; root = null }

@@ -38,6 +38,13 @@ class ScreenSession(
     private val extracted = LinkedHashMap<String, String>()
     val lastExtract: Map<String, String> get() = extracted
 
+    /** Phase 6.2: refs carried over to a changed screen (stable refs). */
+    var relocations = 0
+        private set
+    /** Phase 6.2: the last screen_task run, as a copyable debug report. */
+    var lastTaskReport: TaskReport? = null
+        private set
+
     private data class LastAct(val key: String, val at: Long, val desc: String, val before: ScreenView, val element: ScreenElement?)
     private var lastAct: LastAct? = null
 
@@ -244,9 +251,17 @@ class ScreenSession(
         val snapId = m.groupValues[1].ifBlank { null }
         val base = refView ?: return null to err("NO_SNAPSHOT", "take a screen_snapshot first", true)
         if (snapId != null && views.none { it.id == snapId }) return null to err("STALE_REF", "$ref belongs to an old snapshot; take a new screen_snapshot", true)
-        if (snapId != null && snapId != base.id) return null to err("STALE_REF", "$ref is from $snapId but the screen is now ${live.id}; take a new screen_snapshot", true)
-        if (base.signature != live.signature) return null to err("STALE_REF", "the screen changed since ${base.id}; take a new screen_snapshot (refs are snapshot-scoped)", true)
-        val el = live.element(m.groupValues[2].toInt()) ?: return null to err("NOT_FOUND", "$ref is not on screen ${live.id}", true)
+        val n = m.groupValues[2].toInt()
+        // Phase 6.2 (RefStabilizer idea): the element the ref named is still clearly the same one → keep using it.
+        fun relocated(from: ScreenView): ScreenElement? = from.element(n)?.let { StableRefs.relocate(from, it, live, policy) }
+        if (snapId != null && snapId != base.id) {
+            val from = views.firstOrNull { it.id == snapId }
+            return (from?.let(::relocated)?.also { relocations++ } ?: return null to err("STALE_REF", "$ref is from $snapId but the screen is now ${live.id}; take a new screen_snapshot", true)) to null
+        }
+        if (base.signature != live.signature) {
+            return (relocated(base)?.also { relocations++ } ?: return null to err("STALE_REF", "the screen changed since ${base.id}; take a new screen_snapshot (refs are snapshot-scoped)", true)) to null
+        }
+        val el = live.element(n) ?: return null to err("NOT_FOUND", "$ref is not on screen ${live.id}", true)
         return el to null
     }
 
@@ -267,11 +282,13 @@ class ScreenSession(
         }
         val refView = latest
         val (live, e) = safeView(); if (live == null) return e!!
+        var liveOverride: ScreenView? = null
         val needsTarget = action in setOf("tap", "long_press", "type")
         val element: ScreenElement? = when {
             ref.isNotBlank() -> resolveRef(ref, live, refView).let { (el, er) -> el ?: return er!! }
             target.isNotBlank() -> {
-                val ms = Grounding.find(live, target, if (action == "type") "input" else null)
+                var ms = Grounding.find(live, target, if (action == "type") "input" else null)
+                if (ms.isEmpty() && needsTarget) ms = scrollToFind(target, if (action == "type") "input" else null)?.let { (v, found) -> liveOverride = v; found } ?: ms
                 when (ms.size) {
                     1 -> ms.single().element
                     0 -> if (needsTarget) return err("NOT_FOUND", "nothing labelled \"${ScreenData.label(target)}\" on ${live.id}", true) else null
@@ -283,8 +300,36 @@ class ScreenSession(
             needsTarget -> return err("NO_TARGET", "give a ref or a target label")
             else -> null
         }
-        return actOn(live, element, action, resolvedText, expectText, key, args, tool)
+        return actOn(liveOverride ?: live, element, action, resolvedText, expectText, key, args, tool)
     }
+
+    /**
+     * Phase 6.2 scroll-to-find: the named target is not on screen but a list is → scroll down (up to [max]) then up
+     * (up to 2x[max]) until exactly one element matches. Returns the view it was found on and the matches.
+     */
+    internal suspend fun scrollToFind(target: String, role: String?, max: Int = 6): Pair<ScreenView, List<Grounding.Match>>? {
+        var v = current() ?: return null
+        for ((op, limit) in listOf(NodeOp.SCROLL_FORWARD to max, NodeOp.SCROLL_BACKWARD to max * 2)) {
+            var prevSig = v.signature
+            for (i in 0 until limit) {
+                if (kill.engaged()) return null
+                val list = v.elements.filter { it.node.scrollable }.maxByOrNull { it.node.bounds.width.toLong() * it.node.bounds.height } ?: return null
+                host.preview(if (op == NodeOp.SCROLL_FORWARD) "Scroll down to find \"${ScreenData.label(target, 30)}\"" else "Scroll up to find \"${ScreenData.label(target, 30)}\"")
+                val ok = port.perform(list.node, op)
+                scrolls++
+                port.awaitIdle(config().settleMs)
+                v = current() ?: return null
+                val ms = Grounding.find(v, target, role)
+                if (ms.isNotEmpty()) return v to ms
+                if (!ok || v.signature == prevSig) break
+                prevSig = v.signature
+            }
+        }
+        return null
+    }
+
+    var scrolls = 0
+        private set
 
     internal suspend fun actOn(live: ScreenView, element: ScreenElement?, action: String, text: String, expect: String, key: String, args: JsonObject, tool: String): ToolResult {
         val n = element?.node
@@ -354,8 +399,9 @@ class ScreenSession(
             else -> "\nThe step switched to ${port.appLabel(after.pkg)}; operating it needs your OK."
         } else ""
         val sg = met?.let { subgoal(it, if (it) "" else "expected \"${ScreenData.label(expect)}\" after \"$d\" but it is not on screen") }
+        val effect = when { after.pkg != before.pkg -> "new_app"; after.signature != before.signature || !diff.isEmpty -> "changed"; else -> "none" }
         return ToolResult.Ok(buildJsonObject {
-            put("done", d); put("snapshot", after.id); put("package", after.pkg); put("reverified", reverified)
+            put("done", d); put("snapshot", after.id); put("package", after.pkg); put("reverified", reverified); put("effect", effect)
             putJsonObject("diff") { put("appeared", diff.appeared.size); put("gone", diff.disappeared.size); put("changed", diff.changed.size); diff.appChanged?.let { put("app", it) } }
             if (sg != null) put("subgoal", sg)
         }, (if (reverified) "Re-checked (not repeated): " else "Did: ") + d + " → screen ${after.id}\n" + ScreenData.wrap(after.pkg, diff.render()) + note +
@@ -455,48 +501,110 @@ class ScreenSession(
      */
     suspend fun task(goal: String, app: String, maxSteps: Int, key: String, args: JsonObject): ToolResult {
         guard()?.let { return it }
-        val model = llm() ?: return err("NO_MODEL", "load a chat model so I can work inside the app")
+        val model = llm()
+        val (clauses0, wholeGoalParsed) = FastSteps.parseAll(goal, port.appLabel(resolveTarget(app) ?: ""))
+        if (model == null && clauses0.isEmpty()) return err("NO_MODEL", "load a chat model so I can work inside the app")
+        val t0 = clock()
+        val rep = TaskReport(goal, app, t0)
+        lastTaskReport = rep
         if (app.isNotBlank()) {
             val target = resolveTarget(app)
             val now = current()?.pkg
             if (target == null || now == null || now != target || (SettingsPages.isSettingsRequest(app) && !SettingsPages.isSettingsApp(now))) {
                 val r = openApp(app)
-                if (r is ToolResult.Error) return r
+                if (r is ToolResult.Error) { rep.finish(false, r.message, clock()); return r }
+                rep.notes += "opened ${port.appLabel(resolveTarget(app) ?: app)}"
             }
         }
         val commitAllowed = InAppGoal.allowsCommit(goal)
+        val clauses = ArrayDeque(clauses0)
+        val guards = TaskGuards()
         val actions = ArrayList<String>()
-        val seen = HashMap<String, Int>()
         var modelDone = false
+        var fastDone = false
         var stoppedBefore: String? = null
         var misses = 0
         var failures = 0
-        fun fail(code: String, msg: String): ToolResult.Error =
-            err(code, msg + if (actions.isEmpty()) "" else " (done before that: ${actions.joinToString("; ")})", retry = actions.isEmpty())
+        var handoffs = 0
+        var nudge: String? = null
+        val scrolls0 = scrolls
+        suspend fun fail(code: String, msg: String): ToolResult.Error {
+            val full = msg + if (actions.isEmpty()) "" else " (done before that: ${actions.joinToString("; ")})"
+            rep.guards += guards.fired.map { "${it.code} ${it.level}: ${it.message}" }
+            rep.scrolls = scrolls - scrolls0
+            rep.finish(false, "$code: $full", clock(), current()?.let { it.pkg + " / " + it.snapshot.activity.substringAfterLast('.') })
+            return err(code, full, retry = actions.isEmpty())
+        }
         for (i in 1..maxSteps.coerceIn(1, 25)) {
             if (kill.engaged()) return fail("STOPPED", kill.reason())
-            val (live, e) = safeView(); if (live == null) return if (actions.isEmpty()) e!! else fail("STOPPED", e!!.message)
-            val history = if (actions.isEmpty()) "(nothing yet)" else actions.mapIndexed { j, a -> "${j + 1}. $a" }.joinToString("\n")
-            val user = "Goal: ${goal.take(300)}\nDone so far:\n$history\n" + live.full(cards.get(live.pkg), 3000, policy) + "\nNext action:"
-            val (d, out) = decide(model, TASK_SYSTEM, user, live, 48)
-            if (d == null) { if (++misses >= 2) return fail("NO_ACTION", "the model did not name a valid step: \"${out.take(80)}\""); continue }
-            if (d.action == "done") { modelDone = true; break }
-            if ((d.action == "tap" || d.action == "long_press" || d.action == "type") && d.element == null) {
-                if (++misses >= 3) return fail("NOT_FOUND", "could not find \"${ScreenData.label(d.label)}\" on screen")
-                actions += "(could not find \"${ScreenData.label(d.label, 40)}\")"
+            val (live0, e) = safeView(); if (live0 == null) return if (actions.isEmpty()) e!!.also { rep.finish(false, it.message, clock()) } else fail("STOPPED", e!!.message)
+            var live: ScreenView = live0
+            // Hand-off: password, one-time code, UPI / payment PIN, CAPTCHA, secure window → "Your turn".
+            val h = HandoffDetector.check(live)
+            if (h != null) {
+                rep.handoffs += "${h.kind.name} (${h.cause})"
+                audit.record("take over requested", "app=${live.pkg} ${h.kind.name}", Risk.HIGH)
+                if (++handoffs > 3) return fail("TAKEN_OVER", "the screen still needs you (${h.kind.words})")
+                if (!host.takeOver(h.reason)) return fail("TAKEN_OVER", "stopped: ${h.reason}")
+                port.awaitIdle(config().settleMs)
                 continue
             }
-            val n = d.element?.node
-            val commits = d.action == "enter" || ((d.action == "tap" || d.action == "long_press") && n != null && policy.isIrreversible(n))
-            if (commits && !commitAllowed) { stoppedBefore = desc(d.action, d.element, d.text); break }
-            val loopKey = live.signature + "|" + d.action + "|" + (n?.path ?: "") + "|" + d.text
-            if ((seen.merge(loopKey, 1, Int::plus) ?: 0) >= 3) return fail("STUCK", "the same step keeps repeating without progress")
-            val r = actOn(live, d.element, d.action, d.text, "", "$key#$i", args, "screen_task")
+            val stepStart = clock()
+            // Deterministic fast step: a clause of the goal whose target is on screen exactly once (no model call).
+            var d: GroundedExit.Decision? = null
+            var viaFast = false
+            while (clauses.isNotEmpty() && d == null) {
+                val c = clauses.first()
+                val r = fastDecision(c, live)
+                if (r != null) { d = r.first; live = r.second; viaFast = true; clauses.removeFirst() }
+                else { rep.notes += "fast step \"${c.action}\" not found on screen; the model takes over"; clauses.clear() }
+            }
+            if (d == null) {
+                if (model == null) { if (actions.isEmpty()) return fail("NO_MODEL", "load a chat model so I can work inside the app"); break }
+                val history = if (actions.isEmpty()) "(nothing yet)" else actions.mapIndexed { j, a -> "${j + 1}. $a" }.joinToString("\n")
+                val user = "Goal: ${goal.take(300)}\nDone so far:\n$history\n" + (nudge?.let { "Warning: $it\n" } ?: "") +
+                    CompactScreen.render(live, policy, config().maxSnapshotChars.coerceAtMost(2000), cards.get(live.pkg)) + "\nNext action:"
+                nudge = null
+                rep.modelCalls++
+                val (md, out) = decide(model, TASK_SYSTEM, user, live, 48)
+                if (md == null) { if (++misses >= 2) return fail("NO_ACTION", "the model did not name a valid step: \"${out.take(80)}\""); continue }
+                d = md
+                if ((md.action == "tap" || md.action == "long_press" || md.action == "type") && md.element == null) {
+                    // Not on screen: scroll a list to find it before giving up on this label.
+                    val found = if (md.label.isNotBlank() && Grounding.find(live, md.label).isEmpty()) scrollToFind(md.label, if (md.action == "type") "input" else null) else null
+                    val one = found?.second?.singleOrNull()
+                    if (one != null) { live = found.first; d = md.copy(element = one.element) }
+                    else {
+                        if (++misses >= 3) return fail("NOT_FOUND", "could not find \"${ScreenData.label(md.label)}\" on screen")
+                        actions += "(could not find \"${ScreenData.label(md.label, 40)}\")"
+                        nudge = "\"${ScreenData.label(md.label, 40)}\" is not on this screen — use a label exactly as listed"
+                        continue
+                    }
+                }
+            }
+            val dd = d ?: continue
+            if (dd.action == "done") { modelDone = true; break }
+            val n = dd.element?.node
+            val commits = dd.action == "enter" || ((dd.action == "tap" || dd.action == "long_press") && n != null && policy.isIrreversible(n))
+            if (commits && !commitAllowed) { stoppedBefore = desc(dd.action, dd.element, dd.text); break }
+            val state = guards.state(com.offlineagent.core.runtime.phone.ScreenFingerprint.of(live.snapshot))
+            guards.beforeAction(state, dd.action + "|" + (n?.path ?: "") + "|" + dd.text)?.let { v -> if (v.level == GuardLevel.STOP) return fail("STUCK", v.message) }
+            val r = actOn(live, dd.element, dd.action, dd.text, "", "$key#$i", args, "screen_task")
             if (r is ToolResult.Error) {
+                rep.steps += TaskStep(desc(dd.action, dd.element, dd.text), viaFast, "error: " + r.message.substringBefore(':'), clock() - stepStart)
                 if (!r.retryable || ++failures >= 3) return fail(r.message.substringBefore(':').ifBlank { "FAILED" }, r.message.substringAfter(": "))
                 continue
             }
-            actions += desc(d.action, d.element, d.text)
+            val dsc = desc(dd.action, dd.element, dd.text)
+            actions += dsc
+            val effect = ((r as ToolResult.Ok).json["effect"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "changed"
+            rep.steps += TaskStep(dsc, viaFast, effect, clock() - stepStart)
+            if (viaFast) rep.fastSteps++
+            val after = current()
+            val v = guards.afterAction(effect != "none", guards.state(com.offlineagent.core.runtime.phone.ScreenFingerprint.of(after?.snapshot)))
+            if (v?.level == GuardLevel.STOP) return fail("STUCK", v.message)
+            if (v?.level == GuardLevel.WARN) nudge = v.message
+            if (viaFast && clauses.isEmpty() && wholeGoalParsed) { fastDone = true; break }
         }
         val after = current()
         val passed = actions.any { !it.startsWith("(") }
@@ -506,7 +614,7 @@ class ScreenSession(
             stoppedBefore != null -> "stopped before \"$stoppedBefore\" without doing anything else"
             else -> "no in-app step was performed within $maxSteps tries"
         }
-        audit.record("screen_task", "app=${after?.pkg.orEmpty()} actions=${actions.size} done=$modelDone stopped_before=${stoppedBefore != null}", Risk.HIGH)
+        audit.record("screen_task", "app=${after?.pkg.orEmpty()} actions=${actions.size} done=$modelDone fast=${rep.fastSteps} model_calls=${rep.modelCalls} stopped_before=${stoppedBefore != null}", Risk.HIGH)
         val summary = buildString {
             append(if (passed) "Did in ${after?.let { port.appLabel(it.pkg) } ?: "the app"}: " else "Did not complete the in-app steps. ")
             if (actions.isNotEmpty()) append(actions.joinToString("; ")).append('.')
@@ -514,12 +622,39 @@ class ScreenSession(
             if (!passed) append("\n").append(issue)
             after?.let { append("\n").append(ScreenData.wrap(it.pkg, "Now on screen: " + it.elements.take(12).joinToString(" · ") { el -> ScreenData.label(el.node.label, 30) })) }
         }
+        rep.guards += guards.fired.map { "${it.code} ${it.level}: ${it.message}" }
+        rep.scrolls = scrolls - scrolls0
+        rep.stoppedBefore = stoppedBefore
+        rep.finish(passed, issue, clock(), after?.let { it.pkg + " / " + it.snapshot.activity.substringAfterLast('.') })
         return ToolResult.Ok(buildJsonObject {
-            put("finished", modelDone); put("steps", actions.size); after?.let { put("package", it.pkg); put("snapshot", it.id) }
+            put("finished", modelDone || fastDone); put("steps", actions.size); after?.let { put("package", it.pkg); put("snapshot", it.id) }
             stoppedBefore?.let { put("stopped_before", it) }
             put("actions", buildJsonArray { actions.forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) } })
+            put("model_calls", rep.modelCalls); put("fast_steps", rep.fastSteps)
             put("subgoal", subgoal(passed, issue))
         }, summary)
+    }
+
+    /** A fast-step clause → a grounded decision (scrolling a list to find the target when needed), or null. */
+    private suspend fun fastDecision(c: FastSteps.Clause, live: ScreenView): Pair<GroundedExit.Decision, ScreenView>? {
+        when (c.action) {
+            "scroll_down", "scroll_up" -> return GroundedExit.Decision(c.action) to live
+            "type", "search" -> {
+                val field = if (c.target.isNotBlank()) Grounding.find(live, c.target, "input").singleOrNull()?.element
+                    else live.elements.filter { it.node.editable && it.node.focused }.singleOrNull() ?: live.elements.filter { it.node.editable && !it.node.password }.singleOrNull()
+                    ?: if (c.action == "search") Grounding.find(live, "search", "input").singleOrNull()?.element else null
+                if (field == null || policy.needsUserInput(field.node) != null) return null
+                return GroundedExit.Decision("type", c.target, c.text, field) to live
+            }
+            else -> {
+                var view = live
+                var ms = Grounding.find(view, c.target)
+                if (ms.isEmpty()) scrollToFind(c.target, null)?.let { (v, found) -> view = v; ms = found }
+                val m = ms.singleOrNull() ?: ms.filter { it.exact }.singleOrNull() ?: return null
+                if (policy.isIrreversible(m.element.node)) return null // commits are never fast steps
+                return GroundedExit.Decision("tap", c.target, "", m.element) to view
+            }
+        }
     }
 
     companion object {

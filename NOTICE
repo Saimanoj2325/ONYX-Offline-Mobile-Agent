@@ -1,0 +1,20 @@
+ONYX Offline Mobile Agent
+Copyright 2026 Sai Manoj Kura
+
+This product includes ideas and designs adapted from third-party software:
+
+Mika (https://github.com/wangzan101/Mika)
+Copyright 2026 wangzan101
+Licensed under the Apache License, Version 2.0 (see licenses/Mika-APACHE-2.0.txt).
+
+Phase 6.2 adapts the following Mika concepts, re-written in Kotlin for ONYX (no files copied verbatim):
+  - RefStabilizer (stable element refs across screen re-reads)
+      -> core/screen/.../ScreenReliability.kt (StableRefs), ScreenSession.resolveRef
+  - OperationGuards / Fingerprints (no-effect, revisit and cycle guards; screen fingerprints)
+      -> core/screen/.../ScreenReliability.kt (TaskGuards), core/runtime/.../phone/MacroMatch.kt (ScreenFingerprint)
+  - ScreenDiagnosis (screens that need a human: password, verification code, payment, captcha, protected)
+      -> core/screen/.../ScreenReliability.kt (HandoffDetector)
+  - ActionEffect / UntilWait / BatchRunner (code-checked waits and action effects, step batches)
+      -> core/runtime/.../phone/MacroReplay.kt (MacroPlayer), ScreenSession action "effect"
+
+Third-party native code (llama.cpp, KleidiAI) keeps its own license files under third_party/.

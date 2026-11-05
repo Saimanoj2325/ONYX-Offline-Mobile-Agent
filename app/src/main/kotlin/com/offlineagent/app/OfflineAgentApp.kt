@@ -141,6 +141,7 @@ class OfflineAgentApp : Application() {
         super.onCreate()
         // P0 crash safety first: crash handler, previous-crash detection, compatibility CPU kernels.
         com.offlineagent.app.diag.Diagnostics.init(this)
+        com.offlineagent.app.automation.ForegroundTracker.install(this) // Phase 6.2: in-app sheet vs overlay routing
         if (BuildConfig.DEBUG) enableStrictMode()
         com.offlineagent.engine.llamacpp.LlamaNative.cpuVariant = com.offlineagent.app.diag.Diagnostics.compatVariant()
         val startup = runCatching { com.offlineagent.app.diag.Diagnostics.startupCheck() }.getOrNull()
