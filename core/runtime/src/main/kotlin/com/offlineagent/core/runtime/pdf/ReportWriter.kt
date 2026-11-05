@@ -47,10 +47,15 @@ class ReportWriter(
         )), minItems = 2, maxItems = 12),
     ))
 
-    suspend fun outline(topic: String, sections: Int, notes: String = ""): ReportOutline {
+    /**
+     * [conversation]: 0.6.2.1 — the chat session (earlier turns / summary). A request like "make a detailed pdf on it"
+     * is about the earlier exchange, so the outline and every section see it.
+     */
+    suspend fun outline(topic: String, sections: Int, notes: String = "", conversation: String = ""): ReportOutline {
         val sys = "You plan well-structured reports. Produce a title, a one-line subtitle and $sections sections " +
-            "(each with 2-4 key points to cover). Reply as JSON."
-        val user = "Topic / request: $topic" + if (notes.isNotBlank()) "\nSource notes:\n${notes.take(3000)}" else ""
+            "(each with 2-4 key points to cover). If the request refers to the earlier conversation (\"it\", \"this\"), the report is about that. Reply as JSON."
+        val user = (if (conversation.isNotBlank()) "${conversation.takeLast(4000)}\n\n" else "") +
+            "Topic / request: $topic" + if (notes.isNotBlank()) "\nSource notes:\n${notes.take(3000)}" else ""
         val raw = llm.complete(sys, user, Gbnf.of(outlineSchema), 700)
         return parseOutline(raw) ?: ReportOutline(topic.take(100), "", listOf(ReportSection("Overview", listOf(topic)), ReportSection("Details", listOf(topic))))
     }
@@ -74,6 +79,7 @@ class ReportWriter(
         notes: String = "",
         onProgress: (ReportProgress) -> Unit = {},
         onSection: suspend (index: Int, markdown: String) -> Unit = { _, _ -> },
+        conversation: String = "",
     ): String {
         val digests = ArrayList<String>()
         val sb = StringBuilder()
@@ -84,6 +90,7 @@ class ReportWriter(
             val sys = "You write one section of a report in Markdown. Write 2-5 substantial paragraphs; use bullet lists or a " +
                 "small table where it helps. Do NOT write the section heading itself and do not repeat earlier sections."
             val user = buildString {
+                if (conversation.isNotBlank()) append(conversation.takeLast(2500)).append("\n\n")
                 append("Report: ").append(outline.title).append('\n')
                 append("Request: ").append(topic.take(600)).append('\n')
                 append("Outline:\n").append(plan).append('\n')

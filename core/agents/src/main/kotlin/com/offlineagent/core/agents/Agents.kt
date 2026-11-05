@@ -111,7 +111,7 @@ class PlannerAgent(private val deps: AgentDeps) {
         val known = if (deps.memory.enabled) runCatching { deps.memory.profile(request, 100) }.getOrDefault("") else ""
         val user = "Tools:\n" + specs.joinToString("\n") { "- ${it.name}: ${it.description.take(110)}" } + "\n\n" +
             (if (known.isNotBlank()) "$known\n\n" else "") +
-            (if (board.conversation.isBlank()) "Request: $request" else "Earlier conversation:\n${board.conversation.takeLast(1200)}\n\nRequest: $request")
+            (if (board.conversation.isBlank()) "Request: $request" else "Earlier conversation:\n${board.conversation.takeLast(PLANNER_SESSION_CHARS)}\n\nRequest (latest message): $request")
         val out = modelCall(deps, board, AgentRole.PLANNER, "plan", InferenceQueue.Priority.PLANNING, "planner", system, user, Gbnf.of(schema), 300, PlanPreview::readable)
         val steps = (AgentJson.parseToJsonElement(out).jsonObject["steps"] as? JsonArray) ?: return emptyList()
         return steps.mapIndexedNotNull { i, el ->
@@ -124,6 +124,8 @@ class PlannerAgent(private val deps: AgentDeps) {
     }
 
     companion object {
+        /** 0.6.2.1: the planner sees the tail of the session (the latest exchange first of all). */
+        const val PLANNER_SESSION_CHARS = 2400
         fun assemble(request: String, middle: List<Step>, source: String, screen: Boolean = false): TaskPlan {
             val roots = listOf(
                 TaskNode("ctx", AgentRole.CONTEXT, if (screen) "Read device state and the screen" else "Read device state", verify = false),
@@ -176,7 +178,7 @@ class MemoryAgent(private val deps: AgentDeps) : Agent {
     override val role = AgentRole.MEMORY
     override suspend fun handle(node: TaskNode, board: Blackboard, attempt: Int, lastError: String?): NodeOutcome {
         if (!deps.memory.enabled) { board.fact("memory", "(memory is turned off by the user)"); return NodeOutcome.Ok("Memory is off") }
-        val hits = deps.memory.recall(if (node.goal.startsWith("Recall related")) board.request else node.goal, 6)
+        val hits = deps.memory.recall(if (node.goal.startsWith("Recall related")) board.recallQuery() else node.goal, 6)
         // Phase 6: token budget for what the Writer gets (~300 tokens), best hits first.
         var used = 0
         val text = hits.mapNotNull { h ->
@@ -201,6 +203,8 @@ class ContextAgent(private val deps: AgentDeps) : Agent {
 
 // ------------------------------------------------------------------------------------------------ Device / Executor
 
+internal const val ARGS_SESSION_CHARS = 4000
+
 /** Fills a tool's arguments: given args if valid, else the model under the tool's exact input grammar. */
 internal suspend fun fillArgs(deps: AgentDeps, node: TaskNode, spec: ToolSpec, board: Blackboard, lastError: String?): Result<JsonObject> {
     if (node.args.isNotEmpty() && spec.input.validate(node.args, "args").isEmpty()) return Result.success(node.args)
@@ -209,7 +213,10 @@ internal suspend fun fillArgs(deps: AgentDeps, node: TaskNode, spec: ToolSpec, b
     val facts = board.facts().entries.joinToString("\n") { (k, v) -> "$k: ${v.take(500)}" }
     // Phase 6: static system prompt (one cached KV prefix for every tool); the tool goes into the user message.
     val system = "Fill the arguments for a phone tool from the user's request and the facts. Output only JSON."
-    val user = "Tool: ${spec.name}: ${spec.description}\nRequest: ${board.request}\nStep: ${node.goal}\nFacts:\n$facts" + (lastError?.let { "\nThe previous attempt failed: $it. Fix the arguments." } ?: "")
+    // 0.6.2.1: the session goes in too — "make it as a pdf" / "send that to Mom" need the earlier answer, not just the
+    // latest message (filling create_pdf from the bare request is what produced an unrelated PDF).
+    val session = if (board.conversation.isBlank()) "" else "\nEarlier conversation (resolve \"it\", \"that\", \"the same\" from it):\n${board.conversation.takeLast(ARGS_SESSION_CHARS)}"
+    val user = "Tool: ${spec.name}: ${spec.description}\nRequest: ${board.request}\nStep: ${node.goal}\nFacts:\n$facts$session" + (lastError?.let { "\nThe previous attempt failed: $it. Fix the arguments." } ?: "")
     val out = modelCall(deps, board, node.agent, node.id, InferenceQueue.Priority.INTERACTIVE, "args:${spec.name}", system, user, Gbnf.of(spec.input), 256)
     val obj = runCatching { AgentJson.parseToJsonElement(out).jsonObject }.getOrElse { return Result.failure(IllegalArgumentException("model returned invalid JSON")) }
         .let { ArgRepair.fix(spec, it, board.request) }
@@ -278,6 +285,7 @@ class ExecutionAgent(private val deps: AgentDeps) : Agent {
 // ------------------------------------------------------------------------------------------------ Writer / Verifier
 
 class WriterAgent(private val deps: AgentDeps) : Agent {
+    companion object { const val WRITER_SESSION_CHARS = 6000 }
     override val role = AgentRole.WRITER
     override suspend fun handle(node: TaskNode, board: Blackboard, attempt: Int, lastError: String?): NodeOutcome {
         val st = board.state.value
@@ -293,7 +301,8 @@ class WriterAgent(private val deps: AgentDeps) : Agent {
             else "You are ONYX, an offline phone assistant. Answer the user briefly and helpfully using ONLY the facts and step results. " +
                 "Never claim an action happened unless its step is DONE. Mention queued (offline) or declined steps honestly."
         val user = buildString {
-            if (board.conversation.isNotBlank()) append("Earlier conversation:\n").append(board.conversation.takeLast(1500)).append("\n\n")
+            // 0.6.2.1: the whole session block (already within the chat's token budget), not a 1500-char tail.
+            if (board.conversation.isNotBlank()) append("Earlier conversation:\n").append(board.conversation.takeLast(WRITER_SESSION_CHARS)).append("\n\n")
             append("Request: ${board.request}\nFacts:\n")
             append(st.facts.filterKeys { it == "context" || it == "memory" }.entries.joinToString("\n") { "${it.key}: ${it.value.take(1300)}" })
             append("\nStep results:\n").append(results.ifBlank { "(no tools used)" })
@@ -367,6 +376,7 @@ class VerificationAgent(private val deps: AgentDeps, private val llmCheck: Boole
         val res = try {
             modelCall(deps, board, AgentRole.VERIFIER, "verify:${node.id}", InferenceQueue.Priority.NORMAL, "verifier",
                 "Check an assistant answer. ok=true if it answers the request and does not contradict the step results.",
+                (if (board.conversation.isNotBlank()) "Earlier conversation (tail): ${board.conversation.takeLast(600)}\n" else "") +
                 "Request: ${board.request}\nStep results: ${board.state.value.nodes.values.filter { it.id.startsWith("s") }.joinToString { "${it.goal}=${it.status}" }}\nAnswer: ${outcome.output.take(1500)}",
                 Gbnf.of(schema), 60)
         } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { return rules }

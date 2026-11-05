@@ -21,6 +21,16 @@ class Blackboard(
     /** Minimum gap between published live-thought updates per key (UI throttle; the final text is always published). */
     private val streamThrottleMs: Long = 50,
 ) {
+    /**
+     * 0.6.2.1: memory query for a follow-up. "and its disadvantages?" alone recalls nothing useful, so a short request
+     * is joined with the last user message of the session.
+     */
+    fun recallQuery(): String {
+        if (conversation.isBlank() || request.split(Regex("\\s+")).size > 6) return request
+        val lastUser = conversation.lineSequence().lastOrNull { it.startsWith("User: ") }?.removePrefix("User: ")?.take(200) ?: return request
+        return "$lastUser $request"
+    }
+
     data class State(
         val status: TaskStatus = TaskStatus.PLANNING,
         val plan: TaskPlan? = null,

@@ -1,5 +1,6 @@
 package com.offlineagent.app.data
 
+import com.offlineagent.core.data.storedMessages
 import com.offlineagent.core.data.AgentDao
 import com.offlineagent.core.data.ChatDao
 import com.offlineagent.core.data.MemoryEntity
@@ -491,7 +492,8 @@ class AgentService(
     }
 
     /** Starts a run; [onFinished] gets the final checkpoint (also on failure). Returns the run id or null if busy. */
-    fun start(chatId: Long?, request: String, skill: Skill?, onFinished: suspend (RunCheckpoint) -> Unit): String? {
+    /** [conversation]: 0.6.2.1 — the chat session (turns + summary + memory) the run continues; see SessionContext. */
+    fun start(chatId: Long?, request: String, skill: Skill?, conversation: String = "", onFinished: suspend (RunCheckpoint) -> Unit): String? {
         if (isRunning) return null
         val runId = UUID.randomUUID().toString()
         activeRunId = runId
@@ -500,7 +502,7 @@ class AgentService(
             onLongTask(runId, "Starting…")
             val result = try {
                 engine.ensure(ModelRole.CHAT)
-                loopFor(chatId).start(runId, chatId, request, skill)
+                loopFor(chatId).start(runId, chatId, request, skill, conversation)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 store.load(runId)?.let { onFinished(it) }
                 throw e
@@ -518,17 +520,25 @@ class AgentService(
         return runId
     }
 
-    fun resume(runId: String, onFinished: suspend (RunCheckpoint) -> Unit): Boolean {
+    fun resume(runId: String, conversation: String = "", onFinished: suspend (RunCheckpoint) -> Unit): Boolean {
         if (isRunning) return false
         activeRunId = runId
         job = scope.launch {
             cachedAllowed = settings.current().alwaysAllowedTools
             onLongTask(runId, "Resuming…")
             val cp = store.load(runId) ?: run { onLongTask(runId, null); return@launch }
+            // 0.6.2.1: the session is not stored with the run; after a restart it is rebuilt from the chat's rows.
+            val session = conversation.ifBlank {
+                cp.chatId?.let { id -> runCatching {
+                    val rows = chats.storedMessages(id)
+                    com.offlineagent.core.runtime.chat.SessionContext.build(com.offlineagent.core.runtime.chat.SessionHistory.turns(rows, dropTrailingUser = false),
+                        com.offlineagent.core.runtime.chat.SessionHistory.latestSummary(rows), "", 1100).text
+                }.getOrDefault("") }.orEmpty()
+            }
             val skill = cp.skillId?.let { id -> skills.parsed().firstOrNull { it.id == id } }
             val result = try {
                 engine.ensure(ModelRole.CHAT)
-                loopFor(cp.chatId).resume(runId, skill)
+                loopFor(cp.chatId).resume(runId, skill, session)
             } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Throwable) {
                 cp.copy(status = com.offlineagent.core.runtime.agent.RunStatus.FAILED, error = e.message).also { store.save(it) }
             } finally { _live.update { it - runId }; _partial.update { it - runId }; activeRunId = null; onLongTask(runId, null) }

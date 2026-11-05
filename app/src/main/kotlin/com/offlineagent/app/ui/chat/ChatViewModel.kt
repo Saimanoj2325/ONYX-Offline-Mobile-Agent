@@ -12,6 +12,7 @@ import com.offlineagent.core.data.AppSettings
 import com.offlineagent.core.data.CanvasVersionEntity
 import com.offlineagent.core.data.ChatEntity
 import com.offlineagent.core.data.MessageEntity
+import com.offlineagent.core.data.storedMessages
 import com.offlineagent.core.inference.BusyException
 import com.offlineagent.core.inference.ChatMessage
 import com.offlineagent.core.inference.EngineState
@@ -374,6 +375,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun respond(chatId: Long, text: String, images: List<File>, mode: com.offlineagent.core.runtime.chat.ComposerMode, thinkOverride: Boolean? = null) {
         if (turnStartedAt == 0L) turnStartedAt = System.currentTimeMillis()
+        // 0.6.2.1: "make it as a pdf" / "export this" (any mode, any route) → a PDF of the earlier answer's text, titled
+        // from its question; nothing is regenerated. "make a detailed pdf on it" → the report writer, with the session.
+        if (images.isEmpty() && text.isNotBlank()) {
+            val fu = com.offlineagent.core.runtime.chat.FollowUp.plan(text, turns(chatId))
+            when (fu.kind) {
+                com.offlineagent.core.runtime.chat.FollowUp.Kind.EXPORT -> { exportAnswerPdf(chatId, fu); return }
+                com.offlineagent.core.runtime.chat.FollowUp.Kind.REWRITE_EXPORT -> { runReport(chatId, text); return }
+                else -> Unit
+            }
+        }
         // Phase 6.1: with the Screen agent on, an in-app request ("open WhatsApp and type hi to Mom") always goes to the
         // ONYX orchestrator, whose screen route runs screen_open_app → screen_task. The legacy chat agent and plain chat
         // only had intent openers (app_open), so they opened the app and stopped.
@@ -428,7 +439,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Runs the multi-agent orchestrator for a chat turn; the trace and the streaming answer render inside the message. */
     private suspend fun runOnyx(chatId: Long, text: String) {
-        val conversation = turns(chatId).takeLast(6).joinToString("\n") { t -> (if (t.role == Role.USER) "User: " else "ONYX: ") + t.text.take(500) }
+        // 0.6.2.1: the whole session (recent turns verbatim, rolling summary, memory block) within the token budget —
+        // it used to be the last 6 turns cut to 500 characters each, without memory or summary.
+        val conversation = session(chatId, text).text
         val msgId = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = KIND_ONYX, createdAt = System.currentTimeMillis()))
         val done = kotlinx.coroutines.CompletableDeferred<com.offlineagent.core.agents.TaskCheckpoint>()
         val temporary = runCatching { g.onyx.longMemory.isTemporary(chatId) }.getOrDefault(false)
@@ -529,7 +542,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun runAutomation(chatId: Long, goal: String) {
         val started = System.currentTimeMillis()
         val id = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = KIND_AUTOMATION, reasoning = "Automation: ${goal.take(60)}", createdAt = started))
-        val result = try { g.automation.runTask(goal, "") } catch (e: CancellationException) { "Stopped." } catch (e: Throwable) { "Could not run: ${e.message}" }
+        val conv = runCatching { session(chatId, goal, budgetTokens = 300).text }.getOrDefault("")
+        val result = try { g.automation.runTask(com.offlineagent.core.runtime.chat.SessionContext.goalWithContext(goal, conv), "") } catch (e: CancellationException) { "Stopped." } catch (e: Throwable) { "Could not run: ${e.message}" }
         val log = g.automationLog.recent.value.filter { it.time >= started }.joinToString("\n") { "${it.step}. ${it.app}: ${it.action} → ${it.outcome}" }
         chats.message(id)?.let { chats.updateMessage(it.copy(text = result, uiJson = log)) }
     }
@@ -566,28 +580,64 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         rag.forEachIndexed { i, r -> add(buildJsonObject { put("n", i + 1); put("title", r.candidate.documentTitle); put("text", r.candidate.text); put("documentId", r.candidate.documentId) }) }
     }.toString()
 
-    /** Live turns of the chat (oldest first) for the context manager, without the request just added. */
-    private suspend fun turns(chatId: Long): List<com.offlineagent.core.runtime.context.Turn> {
-        val msgs = chats.messages(chatId).filter { it.error == null && it.kind != KIND_SUMMARY }
-        return msgs.dropLast(1).mapNotNull { m ->
-            when {
-                m.role == "user" -> com.offlineagent.core.runtime.context.Turn(m.id, Role.USER, m.text.ifBlank { "(photo)" })
-                m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed a canvas: ${m.text})")
-                m.kind == "canvas" && m.uiJson != null -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(I showed this UI:)\n" + com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.uiJson?.let { j -> com.offlineagent.core.runtime.ui.OpenUiBridge.toOpenUiSource(j) } ?: m.text).take(1500))
-                m.kind == KIND_AUTOMATION -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, "(automation) ${m.text}".take(600))
-                m.kind == KIND_ONYX && (m.reasoning.isNotBlank() || m.text.isNotBlank()) -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT, m.reasoning.ifBlank { m.text }.take(2000))
-                m.text.isNotBlank() -> com.offlineagent.core.runtime.context.Turn(m.id, Role.ASSISTANT,
-                    // OpenUI blocks cost many tokens: older answers are shown to the model as their visible text.
-                    (if (com.offlineagent.core.openui.OpenUiMessage.hasProgram(m.text)) com.offlineagent.core.openui.OpenUiMessage.toPlainText(m.text) else m.text).take(4000))
-                else -> null
-            }
-        }
-    }
+    /**
+     * Live turns of the chat (oldest first), without the request just added. 0.6.2.1: always rebuilt from Room (never
+     * from the engine's KV cache), so the conversation survives a model reload, an idle unload and an app restart.
+     */
+    private suspend fun turns(chatId: Long): List<com.offlineagent.core.runtime.context.Turn> =
+        com.offlineagent.core.runtime.chat.SessionHistory.turns(chats.storedMessages(chatId))
 
     private suspend fun latestSummary(chatId: Long): com.offlineagent.core.runtime.context.ConversationSummary? =
-        chats.messages(chatId).lastOrNull { it.kind == KIND_SUMMARY }?.let { m ->
-            com.offlineagent.core.runtime.context.ConversationSummary(m.text, m.runId?.removePrefix("upTo:")?.toLongOrNull() ?: 0)
+        com.offlineagent.core.runtime.chat.SessionHistory.latestSummary(chats.storedMessages(chatId))
+
+    private fun contextLength(): Int = (g.inference.state.value as? EngineState.Ready)?.model?.contextLength ?: 4096
+
+    /**
+     * 0.6.2.1: the session block for every route that builds its own prompt (agents, tool agent, report, canvas,
+     * automation): recent turns verbatim, the rolling summary once the window fills (persisted like the chat path's),
+     * and the saved-memory / chat-history block (none in a temporary chat).
+     */
+    private suspend fun session(chatId: Long, request: String, budgetTokens: Int? = null): com.offlineagent.core.runtime.chat.SessionContext.Result {
+        val s = g.settings.current()
+        val ctx = contextLength()
+        val budget = budgetTokens ?: com.offlineagent.core.runtime.chat.SessionContext.budgetFor(ctx)
+        val temporary = runCatching { g.onyx.longMemory.isTemporary(chatId) }.getOrDefault(false)
+        val mem = if (temporary) "" else runCatching { g.onyx.longMemory.contextFor(request, chatId, budgetTokens = if (ctx <= 4096) 200 else 320).text }.getOrDefault("")
+        val rows = chats.storedMessages(chatId)
+        val llm = com.offlineagent.core.runtime.agent.InferenceAgentLlm(g.inference)
+        val loaded = g.inference.state.value is EngineState.Ready
+        val res = com.offlineagent.core.runtime.chat.SessionContext.build(
+            com.offlineagent.core.runtime.chat.SessionHistory.turns(rows), com.offlineagent.core.runtime.chat.SessionHistory.latestSummary(rows), mem, budget,
+            counter = { t -> g.inference.countTokens(t) ?: com.offlineagent.core.runtime.context.TokenCounter.estimate(t) },
+            // Summarising needs the model; without one loaded the newest turns that fit are kept (nothing is lost: Room keeps all).
+            summarizer = if (s.autoSummarize && loaded) com.offlineagent.core.runtime.context.ConversationSummarizer { prev, ts, words ->
+                val (sys, user) = com.offlineagent.core.runtime.context.ContextManager.summaryPrompt(prev, ts, words)
+                llm.complete(sys, user, null, words * 2)
+            } else null,
+        )
+        if (res.summaryChanged) res.summary?.let { sum ->
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "system", text = sum.text, kind = KIND_SUMMARY,
+                runId = com.offlineagent.core.runtime.chat.SessionHistory.summaryRunId(sum), createdAt = System.currentTimeMillis()))
         }
+        return res
+    }
+
+    /** 0.6.2.1: "make it as a pdf" → the referenced answer, as written, in a PDF titled from its question. */
+    private suspend fun exportAnswerPdf(chatId: Long, plan: com.offlineagent.core.runtime.chat.FollowUp.Plan) {
+        _ui.update { it.copy(streaming = Streaming(AnswerMode.MARKDOWN, phase = "Rendering PDF…")) }
+        try {
+            val out = com.offlineagent.core.runtime.chat.AnswerPdfExporter(g.pdf, g.pdf::imageResolver) { t -> com.offlineagent.app.pdf.PdfExporter.safeName(t) + ".pdf" }.export(plan)
+                ?: throw IllegalStateException("there is no earlier answer to export")
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = out.chatMessage(), statsText = "pdf · from the earlier answer", createdAt = System.currentTimeMillis()))
+            chats.touch(chatId, System.currentTimeMillis())
+            _ui.update { it.copy(pdf = g.pdf.last) }
+        } catch (e: CancellationException) { throw e } catch (e: Throwable) {
+            chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", error = "PDF export failed: ${e.message}", createdAt = System.currentTimeMillis()))
+        } finally {
+            turnStartedAt = 0L
+            _ui.update { it.copy(streaming = null) }
+        }
+    }
 
     private fun contextManager(s: AppSettings, temporary: Boolean = false): com.offlineagent.core.runtime.context.ContextManager {
         val llm = com.offlineagent.core.runtime.agent.InferenceAgentLlm(g.inference)
@@ -674,8 +724,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Canvas mode: the whole answer is one OpenUI program (llama.cpp grammar keeps the syntax valid), versioned per chat. */
     private suspend fun answerCanvasOpenUi(chatId: Long, text: String, rag: List<RetrievedChunk>) {
         val current = currentCanvasSource(chatId)
+        val sess = session(chatId, text, budgetTokens = 700).text
         val user = buildString {
             if (rag.isNotEmpty()) append(RagPrompt.context(rag, 500)).append("\n\n")
+            if (sess.isNotBlank()) append(sess).append("\n\nLatest request:\n")
             if (current != null) append(com.offlineagent.core.openui.OpenUiPrompt.updateUser(text, current))
             else append(text)
         }
@@ -769,8 +821,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 },
                 onPrompt = { done, total -> _ui.update { it.copy(streaming = it.streaming?.copy(promptDone = done, promptTotal = total)) } },
             ))
-            val outline = writer.outline(request, 6, notes)
-            val md = writer.write(request, outline, notes, onProgress = { p ->
+            // 0.6.2.1: the report sees the session ("make a detailed pdf on it" is about the earlier exchange).
+            val conv = session(chatId, request).text
+            val outline = writer.outline(request, 6, notes, conv)
+            val md = writer.write(request, outline, notes, conversation = conv, onProgress = { p ->
                 val msg = "Section ${p.section}/${p.total}: ${p.phase}"
                 _ui.update { it.copy(streaming = it.streaming?.copy(phase = msg, text = "", promptDone = 0, promptTotal = 0)) }
                 com.offlineagent.app.work.LongTasks.update(g, com.offlineagent.app.work.LongTask(taskId, "Writing your report", msg, p.section.toFloat() / p.total))
@@ -795,8 +849,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val effectiveMode = if (current == null) AnswerMode.CANVAS_NEW else mode
         val ctx = buildString {
             if (rag.isNotEmpty()) append(RagPrompt.context(rag, 500))
-            val prev = history(chatId, 3).joinToString("\n") { (if (it.role == Role.USER) "User: " else "Assistant: ") + it.content.take(300) }
-            if (prev.isNotBlank() && effectiveMode == AnswerMode.CANVAS_NEW) append("\nEarlier conversation:\n").append(prev)
+            val prev = session(chatId, text, budgetTokens = 700).text
+            if (prev.isNotBlank()) append("\n").append(prev)
         }
         val user = if (effectiveMode == AnswerMode.CANVAS_UPDATE) CanvasPrompts.updateUser(text, current!!, ctx) else CanvasPrompts.newCanvasUser(text, ctx)
         _ui.update { it.copy(streaming = Streaming(effectiveMode, phase = if (effectiveMode == AnswerMode.CANVAS_UPDATE) "Updating canvas…" else "Designing canvas…"), canvasOpen = true) }
@@ -876,7 +930,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun runAgent(chatId: Long, request: String, skill: Skill?) {
         val msgId = chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", kind = "agent",
             reasoning = skill?.name ?: "Agent", createdAt = System.currentTimeMillis()))
-        val runId = g.agents.start(chatId, request, skill) { cp -> finishAgentMessage(msgId, cp) }
+        val conv = session(chatId, request).text
+        val runId = g.agents.start(chatId, request, skill, conv) { cp -> finishAgentMessage(msgId, cp) }
         if (runId == null) {
             chats.message(msgId)?.let { chats.updateMessage(it.copy(error = "Another agent run is in progress.")) }
             return
@@ -901,7 +956,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val chatId = cp.chatId
             if (chatId != null && chats.chat(chatId) != null) openChat(chatId)
             val msg = chatId?.let { id -> chats.messages(id).lastOrNull { it.runId == cp.runId } }
-            val ok = g.agents.resume(cp.runId) { done -> if (msg != null) finishAgentMessage(msg.id, done) }
+            val conv = if (chatId != null && chats.chat(chatId) != null) runCatching { session(chatId, cp.request).text }.getOrDefault("") else ""
+            val ok = g.agents.resume(cp.runId, conv) { done -> if (msg != null) finishAgentMessage(msg.id, done) }
             if (!ok) notice("Another run is in progress.")
         }
     }

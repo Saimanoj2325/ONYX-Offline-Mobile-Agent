@@ -63,6 +63,11 @@ data class RunCheckpoint(
     val error: String? = null,
     val createdAt: Long = 0,
     val updatedAt: Long = 0,
+    /**
+     * 0.6.2.1: the chat session this run continues (earlier turns verbatim + rolling summary + memory block), so a
+     * follow-up ("do the same for BERT") is resolved. Not stored in Room: on resume the app rebuilds it from the chat.
+     */
+    val conversation: String = "",
 )
 
 // ---------------------------------------------------------------- ports
@@ -101,6 +106,8 @@ data class AgentLimits(
     val composeTokens: Int = 1200,
     val observationChars: Int = 700,
     val llmTimeoutMs: Long = 180_000,
+    /** 0.6.2.1: max characters of the chat session added to the plan / action / compose prompts. */
+    val sessionChars: Int = 3500,
 )
 
 /**
@@ -125,16 +132,16 @@ class AgentLoop(
 ) {
     private val json = Json { isLenient = true }
 
-    suspend fun start(runId: String, chatId: Long?, request: String, skill: Skill?): RunCheckpoint {
+    suspend fun start(runId: String, chatId: Long?, request: String, skill: Skill?, conversation: String = ""): RunCheckpoint {
         val now = clock()
-        val cp = RunCheckpoint(runId, chatId, skill?.id, request, RunStatus.PLANNING, createdAt = now, updatedAt = now)
+        val cp = RunCheckpoint(runId, chatId, skill?.id, request, RunStatus.PLANNING, createdAt = now, updatedAt = now, conversation = conversation)
         save(cp)
         return drive(cp, skill)
     }
 
     /** Continues a non-terminal run from its last checkpoint (after process death or an app restart). */
-    suspend fun resume(runId: String, skill: Skill?): RunCheckpoint {
-        val cp = store.load(runId) ?: error("run $runId not found")
+    suspend fun resume(runId: String, skill: Skill?, conversation: String = ""): RunCheckpoint {
+        val cp = (store.load(runId) ?: error("run $runId not found")).let { if (it.conversation.isBlank() && conversation.isNotBlank()) it.copy(conversation = conversation) else it }
         if (cp.status.isTerminal) return cp
         // A pending approval is asked again: the previous answer (if any) was lost with the process.
         return drive(cp.copy(status = if (cp.plan.isEmpty()) RunStatus.PLANNING else RunStatus.RUNNING), skill)
@@ -159,7 +166,7 @@ class AgentLoop(
             if (cp.status == RunStatus.PLANNING) {
                 onEvent(AgentEvent.Thinking("Planning"))
                 val t0 = clock()
-                val plan = makePlan(cp.request, skill, tools)
+                val plan = makePlan(withSession(cp), skill, tools)
                 cp = cp.copy(
                     status = RunStatus.RUNNING, plan = plan,
                     steps = cp.steps + StepRecord(cp.steps.size, StepKind.PLAN, output = plan.joinToString("\n"), startedAt = t0, durationMs = clock() - t0),
@@ -310,7 +317,7 @@ class AgentLoop(
         onEvent(AgentEvent.Thinking("Building the canvas"))
         val t0 = clock()
         val types = skill.output.ifEmpty { UiSchema.ALL_TYPES }
-        val ctxText = "Task: ${cp.request}\nFindings:\n" + observations(cp, 1500)
+        val ctxText = "Task: ${withSession(cp)}\nFindings:\n" + observations(cp, 1500)
         val raw = withTimeout(limits.llmTimeoutMs) {
             llm.complete(CanvasPrompts.system(types) + "\n\nSkill instructions:\n" + skill.instructions, ctxText, CanvasPrompts.grammar(types), limits.composeTokens)
         }
@@ -328,6 +335,11 @@ class AgentLoop(
     }
 
     // ---------------------------------------------------------------- prompts & schemas
+
+    /** The request, preceded by the chat session when there is one (never the latest message alone). */
+    private fun withSession(cp: RunCheckpoint): String =
+        if (cp.conversation.isBlank()) cp.request
+        else "${cp.conversation.takeLast(limits.sessionChars)}\n\nLatest message (the task; use the conversation above to resolve \"it\", \"that\", \"the same\"): ${cp.request}"
 
     private suspend fun makePlan(request: String, skill: Skill?, tools: List<ToolSpec>): List<String> {
         val schema = Schema.Obj(listOf("steps" to Schema.Arr(Schema.Str(maxLength = 160), minItems = 1, maxItems = 5)))
@@ -381,7 +393,7 @@ class AgentLoop(
     }
 
     private fun actionUser(cp: RunCheckpoint): String = buildString {
-        append("Task: ").append(cp.request).append('\n')
+        append("Task: ").append(withSession(cp)).append('\n')
         append("Plan:\n"); cp.plan.forEachIndexed { i, s -> append(i + 1).append(". ").append(s).append('\n') }
         val obs = observations(cp, limits.observationChars)
         append(if (obs.isBlank()) "No tool results yet.\n" else "Results so far:\n$obs\n")

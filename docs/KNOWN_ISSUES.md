@@ -195,3 +195,23 @@
 - **Overlay over secure screens**: approvals then go to a heads-up notification. If notifications are blocked for ONYX and
   the service is off, the request falls back to ONYX's own sheet (open ONYX to answer).
 - The legacy chat agent (explicit `/skill` runs) still uses its in-chat approval card.
+
+
+## 0.6.2.1 — follow-ups lost the conversation (fixed)
+- **Bug** (Sai, phone): "what are transformers" → answer → "make it as a pdf" produced an unrelated PDF. The PDF / report
+  route (PDF composer mode, `/write-report`) wrote the outline and every section from the bare request; on the agents
+  route "pdf" made the message task-like, and the planner saw only a 1200-character tail while the tool-argument filler
+  (`fillArgs`, which writes `create_pdf`'s markdown) saw **no** history at all. Earlier turns were also cut to 500
+  characters each (no summary, no memory block); the legacy tool agent, canvas and automation goals had no history.
+- **Fix**: one session block for every route that builds its own prompt (`SessionHistory` + `SessionContext` in
+  core:runtime): recent turns verbatim, the rolling summary once the window fills (persisted as a `summary` row), and
+  the saved-memory / chat-history block (none in a temporary chat). Plain chat keeps `ContextManager` over the same
+  turns. The session is always rebuilt from Room, so it survives a model reload, idle unload and app restart; a
+  resumed tool-agent run rebuilds it from the chat's rows.
+- **Export follow-ups** ("make it as a pdf", "export this", any mode): `FollowUp` resolves the referenced answer (the last
+  one, or a named one: "the transformers answer", "the first one") and `AnswerPdfExporter` renders that text as written,
+  titled from its question ("Transformers"). No model call. "make a detailed pdf on it" runs the report writer with the
+  session as context. Pronoun / ellipsis follow-ups ("and its disadvantages?", "do the same for BERT", "in Telugu") work
+  because every route sees the history; the resolver is only used for export.
+- **Limits**: the screen agent's step prompts get only a short session tail inside the goal; very long answers are cut
+  to fit the session budget on 2K–4K context models (the PDF export always uses the full stored answer).
