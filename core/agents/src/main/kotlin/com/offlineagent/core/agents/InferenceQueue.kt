@@ -25,7 +25,8 @@ import kotlin.coroutines.coroutineContext
  * the user before/after model calls, not inside them.
  */
 class InferenceQueue(private val llm: AgentLlm) {
-    enum class Priority(val weight: Int) { BACKGROUND(0), NORMAL(1), PLANNING(2), INTERACTIVE(3) }
+    /** [PREFILL] (0.6.2.3 typing-time read-ahead) is below everything and preemptible: see [tryRunPreemptible]. */
+    enum class Priority(val weight: Int) { PREFILL(-1), BACKGROUND(0), NORMAL(1), PLANNING(2), INTERACTIVE(3) }
 
     data class Stats(val completed: Int = 0, val queued: Int = 0, val running: Boolean = false, val prefixReuses: Int = 0,
                      val maxDepth: Int = 0, val paused: Boolean = false, val pausedReason: String? = null,
@@ -57,15 +58,49 @@ class InferenceQueue(private val llm: AgentLlm) {
                        onStart: () -> Unit = {}, onPartial: (String) -> Unit): String =
         run(priority, prefixKey, onStart) { it.stream(system, user, grammar, maxTokens, onPartial) }
 
+    /** Preempt hook of the read-ahead holding the model right now (null = none / a normal job). */
+    private var preemptHook: (() -> Unit)? = null
+
+    /** Read-aheads interrupted because a real job arrived (tests / diagnostics). */
+    @Volatile var preemptions = 0; private set
+
+    /**
+     * 0.6.2.3: runs a typing-time read-ahead at [Priority.PREFILL] ONLY when the model is free, the queue is not paused
+     * and nobody is waiting (else null: skipped, never queued). A job that arrives while it runs calls [onPreempt]
+     * (which aborts the engine work) and is granted as soon as [block] returns.
+     */
+    suspend fun <T> tryRunPreemptible(prefixKey: String?, onPreempt: () -> Unit, block: suspend () -> T): T? {
+        synchronized(lock) {
+            if (busy || paused || waiters.isNotEmpty()) return null
+            busy = true
+            preemptHook = onPreempt
+            grantOrder += prefixKey
+            _stats.value = _stats.value.copy(running = true, runningLabel = prefixKey)
+        }
+        try {
+            return block()
+        } finally {
+            synchronized(lock) {
+                busy = false
+                preemptHook = null
+                _stats.value = _stats.value.copy(running = false, runningLabel = null)
+                dispatchLocked()
+            }
+        }
+    }
+
     suspend fun <T> run(priority: Priority, prefixKey: String?, onStart: () -> Unit = {}, block: suspend (AgentLlm) -> T): T {
         if (coroutineContext[Holder]?.queue === this) { onStart(); return block(llm) } // re-entrant call: we already hold the model
         val w: Waiter
+        val preempt: (() -> Unit)?
         synchronized(lock) {
             w = Waiter(priority, prefixKey, seq++, CompletableDeferred())
             waiters += w
             _stats.value = _stats.value.copy(queued = waiters.size, maxDepth = maxOf(_stats.value.maxDepth, waiters.size))
+            preempt = preemptHook.also { if (it != null) { preemptHook = null; preemptions++ } }
             dispatchLocked()
         }
+        preempt?.invoke()
         try {
             w.gate.await()
         } catch (e: Throwable) {

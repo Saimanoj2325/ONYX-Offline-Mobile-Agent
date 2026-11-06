@@ -78,6 +78,7 @@ struct Session {
     mtmd_context *           mtmd = nullptr;
     llama_pos                n_past = 0;   // next position (== kv_tokens.size() for text-only prompts)
     bool                     kv_dirty = false; // KV holds image embeddings: no prefix reuse next turn
+    std::vector<llama_logit_bias> logit_bias;  // 0.6.2.3: reasoning-ahead meta-word bias (empty = none)
 
     int generated  = 0;
     int max_new    = 0;
@@ -400,6 +401,10 @@ static bool setup_sampling(Session * s, float temp, int top_k, float top_p, floa
     auto sp = llama_sampler_chain_default_params();
     sp.no_perf = true;
     s->sampler = llama_sampler_chain_init(sp);
+    if (!s->logit_bias.empty()) {
+        llama_sampler_chain_add(s->sampler, llama_sampler_init_logit_bias(llama_vocab_n_tokens(s->vocab),
+            (int32_t) s->logit_bias.size(), s->logit_bias.data()));
+    }
     if (repeat_penalty > 1.0f) {
         llama_sampler_chain_add(s->sampler,
             llama_sampler_init_penalties(llama_vocab_n_tokens(s->vocab), 64, repeat_penalty, 0.0f, 0.0f));
@@ -446,11 +451,21 @@ static jint eval_text(Session * s, const std::vector<llama_token> & tokens) {
         for (size_t j = i; j < end; j++) batch_add(s->batch, tokens[j], (llama_pos) j, j == tokens.size() - 1);
         const int rc = llama_decode(s->ctx, s->batch);
         if (rc != 0) {
+            if (rc == 2 || s->abort.load()) {
+                // 0.6.2.3 (typing-time prefill): an abort keeps every batch that finished (llama_decode leaves processed
+                // ubatches in memory; we trim anything past our mirror), so a preempted read-ahead or a cancelled
+                // prompt does not throw away the cached prefix.
+                if (!llama_memory_seq_rm(mem, 0, (llama_pos) s->kv_tokens.size(), -1)) {
+                    llama_memory_clear(mem, false);
+                    s->kv_tokens.clear();
+                }
+                s->n_past = (llama_pos) s->kv_tokens.size();
+                return BEGIN_ERR_ABORTED;
+            }
             // Whatever partially landed in the cache is unknown: drop it all to stay consistent.
             llama_memory_clear(mem, false);
             s->kv_tokens.clear();
             s->n_past = 0;
-            if (rc == 2 || s->abort.load()) return BEGIN_ERR_ABORTED;
             g_last_error = "llama_decode failed during prompt evaluation (code " + std::to_string(rc) + ")";
             return BEGIN_ERR_DECODE;
         }
@@ -838,6 +853,60 @@ Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeStats(JNIEnv * env, jobj
     jintArray arr = env->NewIntArray(6);
     env->SetIntArrayRegion(arr, 0, 6, v);
     return arr;
+}
+
+// 0.6.2.3 reading ahead: evaluates [prompt] into the KV cache (longest common prefix kept, only the tail computed) and
+// samples nothing. Returns [prompt tokens, reused from the cache, evaluated now] or [negative error code]. An abort keeps
+// the batches that finished (see eval_text), so a preempted prefill still saves work.
+JNIEXPORT jintArray JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativePrefill(JNIEnv * env, jobject, jlong h, jbyteArray jprompt, jint n_keep) {
+    auto * s = as_session(h);
+    s->abort.store(false);
+    s->pf_done.store(0); s->pf_total.store(0); s->pf_cached.store(0);
+    jint out[3] = {0, 0, 0};
+    std::vector<llama_token> tokens;
+    if (!tokenize(s->vocab, jbytes(env, jprompt), tokens) || tokens.empty()) out[0] = BEGIN_ERR_TOKENIZE;
+    else if ((int) tokens.size() + 8 > s->n_ctx) out[0] = BEGIN_ERR_TOO_LONG;
+    else {
+        size_t common = 0;
+        if (!s->kv_dirty) while (common < s->kv_tokens.size() && common < tokens.size() && s->kv_tokens[common] == tokens[common]) common++;
+        if (common == tokens.size()) {
+            out[0] = (jint) tokens.size(); out[1] = (jint) common; out[2] = 0;   // already there: nothing to do
+        } else {
+            const jint rc = eval_text(s, tokens);
+            out[0] = rc; out[1] = s->pf_cached.load(); out[2] = rc > 0 ? (jint) tokens.size() - out[1] : s->pf_done.load();
+        }
+    }
+    s->has_logits = false;              // nothing was set up for sampling: the next nativeBegin re-evaluates >= 1 token
+    s->n_keep = std::max(0, std::min((int) n_keep, (int) s->n_past - 1));
+    jintArray arr = env->NewIntArray(3);
+    env->SetIntArrayRegion(arr, 0, 3, out);
+    return arr;
+}
+
+// 0.6.2.3: token ids of a text (no BOS), for the reasoning-ahead logit bias.
+JNIEXPORT jintArray JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeTokenIds(JNIEnv * env, jobject, jlong h, jbyteArray jtext) {
+    auto * s = as_session(h);
+    const std::string text = jbytes(env, jtext);
+    int n = -llama_tokenize(s->vocab, text.data(), (int32_t) text.size(), nullptr, 0, false, true);
+    std::vector<llama_token> ids(std::max(0, n));
+    if (n > 0) llama_tokenize(s->vocab, text.data(), (int32_t) text.size(), ids.data(), n, false, true);
+    jintArray arr = env->NewIntArray((jsize) ids.size());
+    if (!ids.empty()) env->SetIntArrayRegion(arr, 0, (jsize) ids.size(), reinterpret_cast<const jint *>(ids.data()));
+    return arr;
+}
+
+// 0.6.2.3: logit bias applied by the samplers of the following nativeBegin calls (empty array = clear).
+JNIEXPORT void JNICALL
+Java_com_offlineagent_engine_llamacpp_LlamaNative_nativeSetLogitBias(JNIEnv * env, jobject, jlong h, jintArray jids, jfloat bias) {
+    auto * s = as_session(h);
+    s->logit_bias.clear();
+    if (jids == nullptr) return;
+    const jsize n = env->GetArrayLength(jids);
+    std::vector<jint> ids(n);
+    if (n > 0) env->GetIntArrayRegion(jids, 0, n, ids.data());
+    for (jint id : ids) if (id >= 0 && id < llama_vocab_n_tokens(s->vocab)) s->logit_bias.push_back(llama_logit_bias{(llama_token) id, bias});
 }
 
 // Exact token count of a text under this model's tokenizer (for the chat token counter and context budgeting).

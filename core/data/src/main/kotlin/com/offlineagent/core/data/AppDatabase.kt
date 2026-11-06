@@ -156,6 +156,11 @@ data class AppSettings(
     /** ChatGPT-style memory: (a) saved memories extracted from chats, (b) reference all past chats. */
     val savedMemories: Boolean = true,
     val referenceChatHistory: Boolean = true,
+    // ---- 0.6.2.3
+    /** Typing-time prefill: the prompt is read into the KV cache while the user types (prompt only, nothing generated). */
+    val readAhead: Boolean = true,
+    /** Thinking models only: start reasoning while the user types (≤ ~256 tokens per message). */
+    val reasonAhead: Boolean = false,
 ) {
     companion object {
         /** Groups that need no special access are on by default; everything sensitive is opt-in. */
@@ -208,6 +213,8 @@ class SettingsRepository(context: Context) {
         val idle = intPreferencesKey("idle_unload_min")
         val savedMem = booleanPreferencesKey("saved_memories")
         val chatRef = booleanPreferencesKey("reference_chat_history")
+        val readAhead = booleanPreferencesKey("read_ahead")
+        val reasonAhead = booleanPreferencesKey("reason_ahead")
     }
 
     /** A value of the wrong type (older app version, corrupted file) reads as "unset" instead of crashing. */
@@ -231,6 +238,7 @@ class SettingsRepository(context: Context) {
         richUi = p(K.richUi) ?: "AUTO", settingsVersion = p(K.version) ?: 0,
         ngramSpec = p(K.ngram) ?: true, ngramDraft = p(K.ngramDraft) ?: 8, idleUnloadMinutes = p(K.idle) ?: 10,
         savedMemories = p(K.savedMem) ?: true, referenceChatHistory = p(K.chatRef) ?: true,
+        readAhead = p(K.readAhead) ?: true, reasonAhead = p(K.reasonAhead) ?: false,
     )
 
     /** Never throws: an unreadable settings file yields defaults (and is overwritten on the next save). */
@@ -286,6 +294,7 @@ class SettingsRepository(context: Context) {
             p[K.large] = n.largeContext; p[K.safe] = n.safeMode; p[K.safeWhy] = n.safeModeReason; p[K.richUi] = n.richUi; p[K.version] = n.settingsVersion
             p[K.ngram] = n.ngramSpec; p[K.ngramDraft] = n.ngramDraft; p[K.idle] = n.idleUnloadMinutes
             p[K.savedMem] = n.savedMemories; p[K.chatRef] = n.referenceChatHistory
+            p[K.readAhead] = n.readAhead; p[K.reasonAhead] = n.reasonAhead
         }
     }
 

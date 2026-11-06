@@ -48,6 +48,18 @@ interface InferenceAdapter {
 
     /** Phase 6: live thread count / busy-poll (thermal & battery governor); applied between requests. */
     suspend fun setThreads(threads: Int, pollLevel: Int): Boolean = false
+
+    /**
+     * 0.6.2.3 reading ahead: evaluates the prompt [generate] would build for [request] into the KV cache, sampling
+     * nothing. Null when skipped (busy, nothing loaded, images, unsupported). A later [generate] interrupts it.
+     */
+    suspend fun prefill(request: GenerationRequest): PrefillResult? = null
+
+    /** 0.6.2.3 reasoning ahead (see [EngineInferenceAdapter.reasonAhead]); null when skipped. */
+    suspend fun reasonAhead(request: GenerationRequest, maxTokens: Int, biasWords: List<String> = emptyList(), bias: Float = 0f): AheadResult? = null
+
+    /** Interrupts a running read-ahead right away (its finished batches stay cached). Safe from any thread. */
+    fun preemptPrefill() {}
 }
 
 /**
@@ -89,6 +101,20 @@ interface TokenEngine {
      * saved state matches, otherwise evaluating and saving it. Returns 0/1/2 (see GenerationStats.prefixCache), <0 on error.
      */
     fun prefixCache(prefix: String, cacheFile: String?): Int = -1
+
+    /**
+     * 0.6.2.3 reading ahead: evaluates [prompt] into the KV cache (the longest common token prefix with what is cached
+     * is kept; only the tail is computed) and samples NOTHING. Returns [prompt tokens, reused, evaluated now]; null when
+     * the engine cannot do it (then reading ahead is skipped). Throws [GenerationAbortedException] when
+     * [requestAbort] interrupts it (finished batches stay cached), [PromptTooLongException], [InferenceException].
+     */
+    fun prefill(prompt: String, nKeep: Int): IntArray? = null
+
+    /** 0.6.2.3: token ids of [text] (no BOS), or null. */
+    fun tokenIds(text: String): IntArray? = null
+
+    /** 0.6.2.3: additive logit bias on [tokenIds] for the following completions (empty = clear). */
+    fun setLogitBias(tokenIds: IntArray, bias: Float): Boolean = false
 
     /** Phase 6: n-gram self-speculation (see [InferenceAdapter.setSpeculation]). */
     fun setNgram(minN: Int, maxN: Int, draftTokens: Int): Boolean = false

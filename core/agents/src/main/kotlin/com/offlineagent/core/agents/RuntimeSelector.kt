@@ -182,6 +182,26 @@ object PowerGovernor {
     }
 }
 
+/**
+ * 0.6.2.3: when typing-time read-ahead (prefill / reasoning ahead) may run. It is speculative work, so it is the first
+ * thing to go: never on battery saver, on a low battery (not charging), when the phone is warm or hotter, with the
+ * screen off or the app in the background. Returns the reason to skip, or null = allowed.
+ */
+object ReadAheadGate {
+    const val LOW_BATTERY = 20
+
+    fun check(thermal: Thermal, powerSave: Boolean, batteryPercent: Int?, charging: Boolean,
+              screenOn: Boolean = true, foreground: Boolean = true, safeMode: Boolean = false): String? = when {
+        safeMode -> "safe mode"
+        !screenOn -> "screen off"
+        !foreground -> "app in background"
+        powerSave -> "battery saver"
+        batteryPercent != null && batteryPercent <= LOW_BATTERY && !charging -> "battery low ($batteryPercent%)"
+        thermal >= Thermal.MODERATE -> "phone is ${thermal.name.lowercase()}"
+        else -> null
+    }
+}
+
 /** Phase 5 API kept for callers: same rules as [PowerGovernor] without the battery level. */
 object ThermalGovernor {
     data class Decision(val threads: Int, val pauseInference: Boolean, val notes: List<String>)

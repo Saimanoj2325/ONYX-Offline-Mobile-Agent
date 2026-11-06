@@ -45,6 +45,12 @@ object LlamaNative {
     /** Phase 4b: [evaluated, to evaluate, reused] for the prompt being evaluated (any thread). */
     external fun nativePrefillProgress(handle: Long): IntArray
     external fun nativeCountTokens(handle: Long, textUtf8: ByteArray): Int
+    /** 0.6.2.3 reading ahead: [prompt tokens, reused, evaluated] or [negative BEGIN_ERR_*]; nothing is sampled. */
+    external fun nativePrefill(handle: Long, promptUtf8: ByteArray, nKeep: Int): IntArray
+    /** 0.6.2.3: token ids of a text (no BOS). */
+    external fun nativeTokenIds(handle: Long, textUtf8: ByteArray): IntArray
+    /** 0.6.2.3: logit bias for the following samplers; null / empty clears it. */
+    external fun nativeSetLogitBias(handle: Long, ids: IntArray?, bias: Float)
     external fun nativePrefixCache(handle: Long, prefixUtf8: ByteArray, path: String, save: Boolean): Int
     external fun nativeAttachDraft(handle: Long, path: String?, nDraft: Int, nThreads: Int, typeK: Int): Boolean
     /** Phase 6: n-gram self-speculation; false when the model's memory cannot roll back (recurrent/hybrid). */

@@ -244,3 +244,37 @@
 - **Host numbers** (`Phase622Harness`, Qwen3 1.7B Q8_0, 2-vCPU sandbox, NOT a phone; cold = nothing cached):
   before: canvas prompt 2 371 tokens (system 1 994), 34.5 s cold / 7.0 s with the system prefix warm; after: the same
   question answered in chat 504 tokens, 5.4 s cold / 2.1 s warm; a real canvas request 663 tokens, 8.3 s cold / 3.7 s warm.
+
+## 0.6.2.3 — typing-time prefill ("read while I type") and optional reasoning ahead
+- **What**: while the user types in Chat, after a ~500 ms pause (or at least every 1.5 s of continuous typing) ONYX builds
+  the exact prompt Send would build (same route decision, static-first system prompt, session, memory, documents; one
+  shared builder, `markdownPrompt`) and prefills it into the KV cache (`EngineInferenceAdapter.prefill` →
+  `nativePrefill`). Each later change keeps the longest common token prefix and computes only the tail; Send then
+  evaluates only what is left. Idea from llama.cpp discussion #31250 / MAFDET (Apache-2.0, see NOTICE); no code copied.
+- **Safety**: prompt only. Nothing is sampled or decoded during a prefill, so no tool call can be parsed or run. Only the
+  plain chat route is read ahead (`ReadAheadRoute`): agents, Agent/Phone/Automation/PDF modes, skills, PDF follow-ups,
+  real canvases and screen tasks are never touched while typing. A prefill that would need the rolling summariser (a
+  model call + a DB write) is abandoned instead. Temporary chats are read ahead too, without memory.
+- **Priority / power**: lowest priority in the InferenceQueue (`tryRunPreemptible`: only when the model is free and
+  nobody waits; any queued job preempts it); any chat `generate` or `cancel` aborts it at once (finished batches stay
+  cached — the native abort path now keeps them instead of clearing the KV). Skipped on battery saver, battery ≤ 20 %
+  (not charging), thermal ≥ moderate, screen off, app in background, safe mode (`ReadAheadGate`). Ahead reasoning stops
+  after 60 s without a change. A model is warm-loaded for typing only when free RAM ≥ 1.5 × model + 768 MB; never a swap.
+- **Reasoning ahead** (Settings → Speed, default off; thinking models only): opens the think block with ONYX's frame
+  ("collect material … one line per key term, name or number already written"), adds `New words: "…"` lines as the
+  draft changes, a −2.5 logit bias on meta words (user/typing/unfinished…) only while reasoning ahead, ≤ 256 tokens per
+  message in 32-token chunks. On Send the notes follow the final message plus "The message is now complete…", and if
+  the model ends its turn inside the think block it is closed as the Qwen3 template does ("\n</think>\n\n") and the
+  model answers. Reasoning ahead is NOT exact (notes were written on partial drafts) and was not measured on host.
+- **Footer**: "prefilled while typing: N tok · rest M tok in X s" (+ "reasoned ahead: K tok"); a "read ahead: N tok" line
+  under the composer while typing.
+- **Host numbers** (`Phase623Harness`, Qwen3 1.7B Q8_0, 2-vCPU ARM sandbox, NOT a phone; 597-token prompt, 166-char
+  message typed at 6 chars/s, Enter right after the last character; 2 runs each): wait from Enter to the first token —
+  cold (nothing cached) 8.4 / 7.1 s → 0.45 / 0.39 s with reading ahead (594 tokens left after Enter → 15);
+  warm (system + earlier turns cached from the previous turn) 1.8 / 1.1 s → 0.47 / 0.34 s (66 → 16 tokens left).
+  Typing computed 752–766 tokens (cold) / 265 (warm) for a 597-token prompt: the re-computed tails are the cost.
+  Run 1 cold overlapped a second harness process for its first seconds; run 2 is the clean one.
+- **Limits**: canvas prompts are not read ahead yet; memory recall depends on the draft, so the memory block (inside the
+  final user message) can change while typing and is then re-read; messages that save a memory on Send ("remember …")
+  change the prompt after the prefill (only the shared prefix is reused); multimodal (image) prompts are skipped. Not
+  measured on the phone: battery cost and real tok/s on the Nord CE 3 are unknown.

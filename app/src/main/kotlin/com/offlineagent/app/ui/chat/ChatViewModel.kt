@@ -312,7 +312,82 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun onTextChanged(text: String) {
         val match = if (text.length > 6 && !text.startsWith("/")) SkillMatcher.match(text, parsedSkillsCache) else null
         if (_ui.value.skillSuggestion?.id != match?.skill?.id) _ui.update { it.copy(skillSuggestion = match?.skill) }
+        if (_ui.value.editing == null && !busy) typeAhead.onDraft(text)
     }
+
+    // ------------------------------------------------------------ 0.6.2.3: typing-time prefill (reading ahead)
+
+    /** Composer screen stopped (app in background / screen off) or started again. */
+    fun onComposerVisible(visible: Boolean) { composerVisible = visible; if (visible) typeAhead.resume() else typeAhead.pause() }
+
+    @Volatile private var pendingHandoff: com.offlineagent.core.inference.TypeAheadController.Handoff? = null
+
+    private fun supportsThinking(): Boolean {
+        val m = (g.inference.state.value as? EngineState.Ready)?.model ?: return false
+        return com.offlineagent.core.inference.ChatMlTemplate.hasHybridThinking(m.chatTemplate) && m.chatTemplate != null
+    }
+
+    /** Engine calls of the read-ahead: lowest queue priority, preempted by any agent job or chat request. */
+    private val aheadEngine = object : com.offlineagent.core.inference.AheadEngine {
+        override suspend fun prefill(request: GenerationRequest) =
+            g.onyx.queue.tryRunPreemptible("chat-prefill", onPreempt = { g.inference.preemptPrefill() }) { g.inference.prefill(request) }
+        override suspend fun reasonAhead(request: GenerationRequest, maxTokens: Int, biasWords: List<String>, bias: Float) =
+            g.onyx.queue.tryRunPreemptible("chat-prefill", onPreempt = { g.inference.preemptPrefill() }) { g.inference.reasonAhead(request, maxTokens, biasWords, bias) }
+    }
+
+    /** The request Send would build for [draft] when its route is the plain Markdown chat; null otherwise. */
+    private suspend fun prefillRequest(draft: String): GenerationRequest? {
+        val text = draft.trim()
+        val u = _ui.value
+        if (text.isEmpty() || u.pendingImages.isNotEmpty() || u.editing != null || busy) return null
+        val chatId = u.chatId
+        val route = com.offlineagent.core.runtime.chat.ReadAheadRoute.isPlainChat(
+            text = text, mode = u.mode,
+            followUp = com.offlineagent.core.runtime.chat.FollowUp.plan(text, if (chatId == null) emptyList() else turns(chatId)).kind,
+            screenTask = com.offlineagent.core.agents.ChatRouting.screenTask(text, u.mode, g.onyx.screen.enabled()),
+            agents = u.mode == com.offlineagent.core.runtime.chat.ComposerMode.CHAT && useAgents(text) && !com.offlineagent.core.agents.memory.PreviousChats.isAbout(text),
+            canvasInChat = u.mode == com.offlineagent.core.runtime.chat.ComposerMode.CANVAS &&
+                com.offlineagent.core.runtime.chat.CanvasRouting.answerInChat(text, hasCanvas = chatId != null && runCatching { currentCanvasSource(chatId) != null }.getOrDefault(false)),
+        )
+        if (!route) return null
+        val s = g.settings.current()
+        val rag = if (s.useDocuments && g.retriever.hasDocuments()) runCatching { g.retriever.search(text, 4).filter { it.score >= 0.25f } }.getOrDefault(emptyList()) else emptyList()
+        val thinking = (u.thinkOverride ?: s.thinking)
+        return try { markdownPrompt(chatId, text, emptyList(), rag, thinking, forPrefill = true).request }
+        catch (e: SkipPrefill) { null }
+    }
+
+    private fun aheadGate(): String? {
+        val s = settings.value
+        if (!s.readAhead) return "off in Settings"
+        val m = g.onyx.monitor
+        val (pct, charging) = runCatching { m.battery() }.getOrDefault(null to false)
+        val pm = getApplication<Application>().getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+        return com.offlineagent.core.agents.ReadAheadGate.check(m.thermal.value, m.powerSave.value, pct, charging,
+            screenOn = pm.isInteractive, foreground = composerVisible, safeMode = s.safeMode)
+    }
+
+    @Volatile private var composerVisible = true
+
+    /** A model for the read-ahead: the loaded chat model, or a warm load when RAM clearly allows it (never a swap). */
+    private suspend fun warmForTyping(): Boolean {
+        val st = g.inference.state.value
+        if (st is EngineState.Ready) return g.engineController.loaded.value?.role == "CHAT"
+        if (st !is EngineState.Unloaded) return false
+        val want = runCatching { g.models.active(ModelRole.CHAT) }.getOrNull() ?: return false
+        val am = getApplication<Application>().getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val mi = android.app.ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        val size = java.io.File(want.path).length()
+        if (mi.lowMemory || mi.availMem < size * 3 / 2 + 768L * 1024 * 1024) return false
+        return runCatching { g.engineController.ensure(ModelRole.CHAT); true }.getOrDefault(false)
+    }
+
+    private val typeAhead = com.offlineagent.core.inference.TypeAheadController(
+        scope = viewModelScope, clock = System::currentTimeMillis, engine = aheadEngine,
+        build = { d -> prefillRequest(d) }, gate = { aheadGate() }, ensureModel = { warmForTyping() },
+        config = { val s = settings.value; com.offlineagent.core.inference.TypeAheadController.Config(enabled = s.readAhead && !s.safeMode, reasonAhead = s.reasonAhead && supportsThinking()) },
+    )
+    val typeAheadStatus get() = typeAhead.status
 
     private var parsedSkillsCache: List<Skill> = emptyList()
     init { viewModelScope.launch { skills.collect { parsedSkillsCache = g.skills.parsed() } } }
@@ -334,6 +409,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         lastSent = text to now0
         sending = true
         turnStartedAt = now0
+        pendingHandoff = typeAhead.onSend(text)
         val think = _ui.value.thinkOverride
         _ui.update { it.copy(pendingImages = emptyList(), skillSuggestion = null, thinkOverride = null) }
         genJob = viewModelScope.launch {
@@ -427,6 +503,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             chats.insertMessage(MessageEntity(chatId = chatId, role = "assistant", text = "", error = msg, createdAt = System.currentTimeMillis()))
         } finally {
             turnStartedAt = 0L
+            pendingHandoff = null
             _ui.update { it.copy(streaming = null) }
         }
     }
@@ -665,7 +742,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    private suspend fun answerMarkdown(chatId: Long, text: String, images: List<File>, rag: List<RetrievedChunk>, thinking: Boolean, note: String? = null) {
+    /** 0.6.2.3: the chat prompt, built ONE way for Send and for typing-time prefill (so the KV prefix matches). */
+    private class MdPrompt(val request: GenerationRequest, val built: com.offlineagent.core.runtime.context.ContextPlanResult, val ctx: Int, val temporary: Boolean)
+
+    /** Thrown by the prefill-time summariser: Send would fold old turns first (a model call), so do not read ahead now. */
+    private class SkipPrefill : RuntimeException()
+
+    /**
+     * Builds the exact [GenerationRequest] the Markdown chat route sends. [forPrefill] = typing-time read-ahead: nothing is
+     * persisted, no summary model call is made (the build is abandoned instead), and [chatId] may be null (new chat).
+     */
+    private suspend fun markdownPrompt(chatId: Long?, text: String, images: List<File>, rag: List<RetrievedChunk>, thinking: Boolean, forPrefill: Boolean): MdPrompt {
         val s = g.settings.current()
         // Phase 4b: short, stable system prompt (cheat sheet; the full OpenUI library only when the user asks for UI) so
         // it is cheap to prefill and its KV cache is reused turn after turn. Document passages go into the user turn.
@@ -676,7 +763,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val maxOut = if (thinking) g.engineController.maxOutput(s, plan, ctx).coerceAtLeast(1536) else g.engineController.maxOutput(s, plan, ctx)
         val imgs = withContext(Dispatchers.Default) { images.map { toImageData(it) } }
         // Phase 6: saved memories + snippets from other chats (token budget), nothing in a temporary chat.
-        val temporary = runCatching { g.onyx.longMemory.isTemporary(chatId) }.getOrDefault(false)
+        val temporary = if (chatId == null) _ui.value.temporary else runCatching { g.onyx.longMemory.isTemporary(chatId) }.getOrDefault(false)
         // 0.6.2.2: device-aware memory budget (part of the new, uncached prompt); questions about earlier chats get the
         // Threads summaries of recent chats instead of BM25 snippets (which share no words with "our previous chats").
         val dyn = com.offlineagent.core.runtime.chat.PromptBudget.dynamicTokens(promptTier(s), prefillMeter.tokensPerSecond)
@@ -685,8 +772,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { g.onyx.longMemory.previousChats(text, chatId, budgetTokens = minOf(if (ctx <= 4096) 450 else 700, (dyn * 0.6).toInt())).text }.getOrDefault("")
         else if (temporary) "" else runCatching { g.onyx.longMemory.contextFor(text, chatId, budgetTokens = memBudget).text }.getOrDefault("")
         val extra = listOf(memBlock, if (rag.isNotEmpty()) RagPrompt.context(rag) else "").filter { it.isNotBlank() }.joinToString("\n\n")
-        val built = contextManager(s, temporary).build(system, turns(chatId), latestSummary(chatId), text.ifBlank { "Describe this image." }, ctx, maxOut,
-            extraContext = extra)
+        val cm = if (forPrefill) prefillContextManager(s, temporary) else contextManager(s, temporary)
+        val built = cm.build(system, if (chatId == null) emptyList() else turns(chatId), if (chatId == null) null else latestSummary(chatId),
+            text.ifBlank { "Describe this image." }, ctx, maxOut, extraContext = extra)
+        val msgs = built.messages.toMutableList()
+        if (imgs.isNotEmpty()) msgs[msgs.size - 1] = msgs.last().copy(images = imgs)
+        return MdPrompt(GenerationRequest(msgs, thinking = thinking && images.isEmpty(), maxNewTokens = maxOut), built, ctx, temporary)
+    }
+
+    /** Same as [contextManager] but read-only: no summary call (it aborts the read-ahead) and no "Summarising…" status. */
+    private fun prefillContextManager(s: AppSettings, temporary: Boolean): com.offlineagent.core.runtime.context.ContextManager =
+        com.offlineagent.core.runtime.context.ContextManager(
+            counter = { t -> g.inference.countTokens(t) ?: com.offlineagent.core.runtime.context.TokenCounter.estimate(t) },
+            summarizer = if (s.autoSummarize) com.offlineagent.core.runtime.context.ConversationSummarizer { _, _, _ -> throw SkipPrefill() } else null,
+            memory = if (s.longTermMemory && !temporary) g.chatMemory else null,
+            config = com.offlineagent.core.runtime.context.ContextConfig(memoryPages = 2, memoryMaxTokens = 320),
+        )
+
+    private suspend fun answerMarkdown(chatId: Long, text: String, images: List<File>, rag: List<RetrievedChunk>, thinking: Boolean, note: String? = null) {
+        val s = g.settings.current()
+        val mp = markdownPrompt(chatId, text, images, rag, thinking, forPrefill = false)
+        val built = mp.built
+        val ctx = mp.ctx
+        val temporary = mp.temporary
         if (built.summaryChanged) built.summary?.let { sum ->
             chats.insertMessage(MessageEntity(chatId = chatId, role = "system", text = sum.text, kind = KIND_SUMMARY, runId = "upTo:${sum.upToId}", createdAt = System.currentTimeMillis()))
             if (s.longTermMemory && !temporary) viewModelScope.launch { runCatching { g.chatMemory.add("summary of \"${chats.chat(chatId)?.title}\"", sum.text, emptySet()) } }
@@ -695,9 +803,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 com.offlineagent.core.agents.memory.MemoryScope.NORMAL) } }
         }
         _ui.update { it.copy(contextUsed = built.promptTokens, contextSize = ctx) }
-        val msgs = built.messages.toMutableList()
-        if (imgs.isNotEmpty()) msgs[msgs.size - 1] = msgs.last().copy(images = imgs)
-        val req = GenerationRequest(msgs, thinking = thinking && images.isEmpty(), maxNewTokens = maxOut)
+        // 0.6.2.3: what the composer read (and, optionally, reasoned) while the user typed this message.
+        val handoff = pendingHandoff.also { pendingHandoff = null }
+        var req = mp.request
+        val notes = handoff?.reasoning
+        if (notes != null && req.thinking && supportsThinking()) {
+            req = req.copy(assistantPrefix = notes.finalPrefix(text), assistantPrefixShown = notes.shownFor(text), closeThinkOnEarlyEnd = true)
+        }
         val status = if (images.isNotEmpty()) "Looking at the image…" else "Reading prompt…"
         _ui.update { it.copy(streaming = Streaming(AnswerMode.MARKDOWN, phase = status)) }
         // Phase 4b: every event goes through the streaming reducer; the bubble shows prompt progress, then the live
@@ -716,10 +828,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         val v = turn.current
         val st = stats
+        val aheadLine = if (st != null && handoff != null) com.offlineagent.core.runtime.chat.ReadAheadFooter.line(
+            handoff.prefilledWhileTyping(st.reusedTokens), st.promptTokens - st.reusedTokens, st.promptMillis, notes?.tokens ?: 0) else ""
+        if (st != null && handoff != null) android.util.Log.i("OfflineAgent", "read-ahead: ${handoff.prefilledWhileTyping(st.reusedTokens)} tok while typing " +
+            "(evaluated ${handoff.evaluatedWhileTyping}), rest ${st.promptTokens - st.reusedTokens} tok in ${st.promptMillis} ms, ahead notes ${notes?.tokens ?: 0}")
         chats.insertMessage(MessageEntity(
             chatId = chatId, role = "assistant", text = v.answer.trim(), reasoning = v.reasoning,
             citationsJson = if (rag.isNotEmpty()) citationsJson(rag) else null,
-            statsText = st?.let { statsLine(v, prepMs, note, guard.stopped) } ?: note,
+            statsText = st?.let { listOf(statsLine(v, prepMs, note, guard.stopped), aheadLine).filter { x -> x.isNotBlank() }.joinToString(" · ") } ?: note,
             error = if (st?.stopReason == StopReason.ERROR) "Generation stopped because of an engine error." else null,
             createdAt = System.currentTimeMillis(),
         ))

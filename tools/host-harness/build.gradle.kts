@@ -81,3 +81,12 @@ tasks.register<JavaExec>("runPhase622") {
     jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
     args(nativeDir)
 }
+
+// 0.6.2.3: wait after Enter with / without typing-time prefill (real-time typing). Env: MODEL, THREADS, CTX, CPS, REPS.
+tasks.register<JavaExec>("runPhase623") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.offlineagent.tools.Phase623HarnessKt")
+    val nativeDir = providers.gradleProperty("nativeDir").orNull ?: ""
+    jvmArgs("-Djava.library.path=$nativeDir", "-Xmx1g")
+    args(nativeDir)
+}

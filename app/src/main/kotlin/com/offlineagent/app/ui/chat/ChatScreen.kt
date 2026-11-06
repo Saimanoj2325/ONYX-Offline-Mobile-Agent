@@ -100,6 +100,9 @@ fun ChatScreen(vm: ChatViewModel, onShare: (String) -> Unit, onOpenSettings: () 
     var sheet by rememberSaveable { mutableStateOf<Sheet?>(null) }
     val onboardingDismissed by app.onyx.onboardingDismissed.collectAsStateWithLifecycle()
     val busy = ui.streaming != null || live.isNotEmpty() || vm.busy
+    // 0.6.2.3: typing-time prefill stops while the chat is not on screen (background, screen off).
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_START) { vm.onComposerVisible(true) }
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_STOP) { vm.onComposerVisible(false) }
 
     // First launch with no chat model: the onboarding sheet recommends one by RAM.
     LaunchedEffect(chatModels.isEmpty(), downloads.values.any { it.active }) {
@@ -580,6 +583,11 @@ private fun Composer(vm: ChatViewModel, ui: ChatUi, busy: Boolean, thinkingDefau
             }
             if (ui.pendingImages.isNotEmpty()) Row { ui.pendingImages.forEach { f -> Thumbnail(f, 64) { vm.removePendingImage(f) } } }
             ui.skillSuggestion?.let { s -> AssistChip(onClick = { vm.runSkill(s, text); text = "" }, label = { Text("Run skill: ${s.name}") }) }
+            // 0.6.2.3 debug line: what the composer has already read (and reasoned) while typing.
+            val ahead by vm.typeAheadStatus.collectAsStateWithLifecycle()
+            if (text.isNotBlank() && ahead.cachedTokens > 0) Text(
+                "read ahead: ${ahead.cachedTokens} tok" + (if (ahead.aheadTokens > 0) " · notes ${ahead.aheadTokens} tok" else "") + (if (ahead.state == "reading" || ahead.state == "reasoning") " …" else ""),
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 52.dp))
             Row(verticalAlignment = Alignment.Bottom) {
                 IconButton(onClick = onPlus, enabled = !busy) { Icon(Icons.Filled.Add, "Attach") }
                 OutlinedTextField(

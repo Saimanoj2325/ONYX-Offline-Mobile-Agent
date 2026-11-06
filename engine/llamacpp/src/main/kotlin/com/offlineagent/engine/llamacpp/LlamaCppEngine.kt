@@ -163,6 +163,27 @@ class LlamaCppEngine(private val nativeLibDir: String) : TokenEngine {
         return LlamaNative.nativeCountTokens(h, text.toByteArray(Charsets.UTF_8))
     }
 
+    override fun prefill(prompt: String, nKeep: Int): IntArray? {
+        val h = handle.takeIf { it != 0L } ?: throw NotLoadedException()
+        val r = LlamaNative.nativePrefill(h, prompt.toByteArray(Charsets.UTF_8), nKeep)
+        return when (r.getOrElse(0) { 0 }) {
+            LlamaNative.BEGIN_ERR_TOO_LONG -> throw PromptTooLongException(-1, -1)
+            LlamaNative.BEGIN_ERR_ABORTED -> throw GenerationAbortedException()
+            LlamaNative.BEGIN_ERR_DECODE, LlamaNative.BEGIN_ERR_TOKENIZE -> throw InferenceException(LlamaNative.nativeLastError())
+            else -> r
+        }
+    }
+
+    override fun tokenIds(text: String): IntArray? {
+        val h = handle.takeIf { it != 0L } ?: return null
+        return runCatching { LlamaNative.nativeTokenIds(h, text.toByteArray(Charsets.UTF_8)) }.getOrNull()
+    }
+
+    override fun setLogitBias(tokenIds: IntArray, bias: Float): Boolean {
+        val h = handle.takeIf { it != 0L } ?: return false
+        return runCatching { LlamaNative.nativeSetLogitBias(h, tokenIds, bias); true }.getOrDefault(false)
+    }
+
     override fun prefixCache(prefix: String, cacheFile: String?): Int {
         val h = handle.takeIf { it != 0L } ?: return -1
         cacheFile?.let { File(it).parentFile?.mkdirs() }

@@ -17,4 +17,18 @@ Phase 6.2 adapts the following Mika concepts, re-written in Kotlin for ONYX (no 
   - ActionEffect / UntilWait / BatchRunner (code-checked waits and action effects, step batches)
       -> core/runtime/.../phone/MacroReplay.kt (MacroPlayer), ScreenSession action "effect"
 
+MAFDET (https://github.com/TheLastOxygen/mafdet, also https://github.com/Mafdet-AI/mafdet) and llama.cpp discussion #31250
+Copyright the MAFDET authors (TheLastOxygen / Mafdet-AI)
+Licensed under the Apache License, Version 2.0.
+
+0.6.2.3 adapts the following MAFDET ideas, re-written in Kotlin/C++ for ONYX (no code or text copied):
+  - Reading ahead: the KV cache follows the draft while the user types (longest common token prefix kept, only the
+    changed tail computed), so Send only evaluates what is left
+      -> core/inference/.../TypeAhead.kt (PrefixMath, TypeAheadController), EngineInferenceAdapter.prefill,
+         engine/llamacpp/src/main/cpp/llama_jni.cpp (nativePrefill; aborted prefill keeps its finished batches)
+  - Reasoning ahead: a think-block frame that asks for material per key term / name / number, a "New words" line per
+    change, a "message is complete" sentence on Enter, a small negative logit bias on meta words, and closing the
+    think block the way the chat template does when the model ends its turn inside it
+      -> core/inference/.../TypeAhead.kt (ReasoningAhead, ReasoningAheadSession), EngineInferenceAdapter.reasonAhead
+
 Third-party native code (llama.cpp, KleidiAI) keeps its own license files under third_party/.

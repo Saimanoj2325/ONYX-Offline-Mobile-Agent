@@ -239,6 +239,8 @@ private fun PerformancePage(app: OfflineAgentApp, notify: (String) -> Unit) {
             if (s.speculative) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(4, 6, 8).forEach { n -> FilterChip(selected = s.draftTokens == n, onClick = { upd { it.copy(draftTokens = n) } }, label = { Text("$n draft tokens") }) } }
             SwitchRow("Prompt cache", "Keeps the system prompt's KV cache in memory and on disk, so the first answer after a restart starts much faster.", s.prefixCache) { v -> upd { it.copy(prefixCache = v) } }
             SwitchRow("Keep model warm", "Stays loaded in the background; freed only when Android is short of memory.", s.keepWarm) { v -> upd { it.copy(keepWarm = v) } }
+            SwitchRow("Read while I type", "Reads your message into the model while you type, so the answer starts sooner after Send. Prompt only: nothing is generated and no tool runs. Skipped on battery saver, low battery, when the phone is warm, or with the screen off.", s.readAhead) { v -> upd { it.copy(readAhead = v) } }
+            SwitchRow("Reason while I type (thinking models)", "Qwen3 with thinking on starts collecting notes for the answer before you press Send (at most ~256 tokens per message). Uses more battery; the notes are shown in Thinking.", s.reasonAhead, enabled = s.readAhead) { v -> upd { it.copy(reasonAhead = v) } }
             Section("Answers & memory")
             SwitchRow("Thinking", "Qwen3 reasons first (shown live in a collapsible \"Thinking…\" section), then answers. Better answers, a little slower. Change it per message with the Think chip.", s.thinking) { v -> upd { it.copy(thinking = v) } }
             Text("Rich answers (OpenUI components: tables, charts, forms…)", style = MaterialTheme.typography.bodyLarge)

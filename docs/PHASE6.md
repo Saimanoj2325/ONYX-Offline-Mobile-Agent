@@ -349,3 +349,19 @@ working perfectly." Also: approvals forced him to switch back to ONYX every time
    screen: it must scroll to her.
 5. Start a screen-agent task, leave ONYX: the approval card should appear over WhatsApp. Try Allow for this task.
 6. If anything fails: tap **Copy debug report** on the card (or Settings → Automation → Debug reports) and paste it in chat.
+
+## 6.2.3 — typing-time prefill (read ahead), optional reasoning ahead (0.6.2.3-phase6, versionCode 11)
+Details, safety rules, host numbers and limits: docs/KNOWN_ISSUES.md "0.6.2.3". Code: `core/inference/.../TypeAhead.kt`
+(PrefixMath, ReasoningAhead, ReasoningAheadSession, TypeAheadController), `EngineInferenceAdapter.prefill/reasonAhead`
+(preemption by any real request), `nativePrefill` / `nativeTokenIds` / `nativeSetLogitBias` in `llama_jni.cpp`,
+`InferenceQueue.tryRunPreemptible` (Priority.PREFILL), `ReadAheadGate`, `ReadAheadRoute`, `ReadAheadFooter`,
+Settings → Speed: "Read while I type" (on) and "Reason while I type (thinking models)" (off).
+0.6.3 stays reserved for intelligent routing.
+
+### On the phone after installing 0.6.2.3
+1. Chat mode, a chat with a few turns, type a 2–3 line question slowly. A "read ahead: N tok" line appears under the
+   composer. Send: the footer should show "prefilled while typing: N tok · rest M tok in X s" with M small.
+2. Turn on battery saver and type again: no "read ahead" line (skipped). Same with the screen off / app in background.
+3. While typing, start an agent task from Home: it must start at once (the prefill is preempted).
+4. Optional: Settings → Speed → Reason while I type, Qwen3 with thinking on: the Thinking panel opens with notes written
+   before Send; compare the wait and the answer quality with it off.

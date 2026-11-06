@@ -143,7 +143,32 @@ data class GenerationRequest(
      * used for Canvas UI JSON and agent tool calls so the output always parses.
      */
     val grammar: String? = null,
+    /**
+     * 0.6.2.3 reasoning ahead: raw text appended after the rendered prompt (the open `<think>` block written while the
+     * user typed, plus the "message is complete" line). Generation continues from it.
+     */
+    val assistantPrefix: String? = null,
+    /** What of [assistantPrefix] the user sees (emitted as the first token; the frame is left out). */
+    val assistantPrefixShown: String? = null,
+    /** When the model ends its turn inside a continued think block, close it as the chat template does and go on once. */
+    val closeThinkOnEarlyEnd: Boolean = false,
 )
+
+/** 0.6.2.3 reading ahead: what one prefill did. [prompt] is the exact text evaluated (identical to what Send builds). */
+data class PrefillResult(
+    val prompt: String,
+    val promptTokens: Int,
+    /** Tokens already in the KV cache (longest common prefix) before this prefill. */
+    val reusedTokens: Int,
+    /** Tokens computed by this prefill. */
+    val evaluatedTokens: Int,
+    val millis: Long,
+    /** Interrupted by a real request / cancel (finished batches stay cached). */
+    val aborted: Boolean,
+)
+
+/** 0.6.2.3 reasoning ahead: notes written while the user typed. */
+data class AheadResult(val text: String, val tokens: Int, val millis: Long, val stop: StopReason)
 
 enum class StopReason { END_OF_TURN, MAX_TOKENS, CONTEXT_FULL, CANCELLED, ERROR }
 
